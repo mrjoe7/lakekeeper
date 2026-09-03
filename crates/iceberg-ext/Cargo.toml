@@ -18,25 +18,22 @@ axum = ['dep:axum']
 
 [dependencies]
 axum = { workspace = true, optional = true }
-chrono = { workspace = true }
 heck = { workspace = true }
 http = { workspace = true }
 iceberg = { workspace = true }
 lakekeeper-io = { path = "../io", default-features = false }
-paste = { workspace = true }
-reqwest = { workspace = true }
+pastey = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_with = { workspace = true }
-strum = { workspace = true, features = ["derive"] }
 strum_macros = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+tracing = { workspace = true, features = ["attributes", "valuable"] }
 typed-builder = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
+valuable = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

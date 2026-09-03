@@ -1,22 +1,29 @@
-use axum::{response::IntoResponse, Json};
+use std::sync::Arc;
+
+use axum::{Json, response::IntoResponse};
 use iceberg_ext::catalog::rest::ErrorModel;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{
+        ApiContext,
         iceberg::v1::{PageToken, PaginationQuery},
         management::v1::ApiServer,
-        ApiContext,
     },
     request_metadata::RequestMetadata,
     service::{
-        authz::{AuthZServerOps, Authorizer, CatalogServerAction, CatalogUserAction},
         CatalogStore, CreateOrUpdateUserResponse, Result, SecretStore, State, Transaction, UserId,
+        UserUpsertMode,
+        authz::{
+            AuthZServerOps, AuthZUserOps, Authorizer, CatalogServerAction, CatalogUserAction,
+            RequireServerActionError,
+        },
+        events::{APIEventContext, GrantsChangedEvent, context::ServerActionSearchUsers},
     },
 };
 
 /// How the user was last updated
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum UserLastUpdatedWith {
@@ -26,6 +33,8 @@ pub enum UserLastUpdatedWith {
     ConfigCallCreation,
     /// The user was updated by one of the dedicated update endpoints
     UpdateEndpoint,
+    /// The user was last updated by a `RoleProvider`
+    RoleProvider,
 }
 
 /// Type of a User
@@ -69,6 +78,21 @@ pub struct User {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the user was last updated
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Response of the `whoami` endpoint: the catalog user for the current token,
+/// plus request-scoped privilege not stored on the user record.
+#[derive(Debug, Serialize, Clone)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct WhoamiResponse {
+    #[serde(flatten)]
+    pub user: User,
+    /// Whether the authenticated principal is an instance admin (configured via
+    /// `LAKEKEEPER__INSTANCE_ADMINS`). Instance admins may modify the spec of
+    /// warehouses marked `managed-by: instance-admin`. Only ever `true` for a
+    /// principal acting directly; role-assumed requests do not inherit it.
+    pub is_instance_admin: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -273,7 +297,7 @@ pub(crate) fn parse_create_user_request(
 }
 
 #[async_trait::async_trait]
-pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
+pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
     async fn create_user(
         context: ApiContext<State<A, C, S>>,
         request_metadata: RequestMetadata,
@@ -282,19 +306,38 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
 
-        let acting_user_id = request_metadata.user_id();
+        let mut event_ctx = APIEventContext::for_server(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            CatalogServerAction::ProvisionUsers,
+            authorizer.server_id(),
+        );
+        let acting_user_id = event_ctx.request_metadata().user_id();
 
         let self_provision = is_self_provisioning(acting_user_id, request.id.as_ref());
-        if !self_provision {
-            authorizer
-                .require_server_action(&request_metadata, CatalogServerAction::CanProvisionUsers)
-                .await?;
-        }
+        let event_ctx = if self_provision {
+            event_ctx.push_extra_context("self-provisioning", "true");
+            event_ctx
+                .emit_authz::<_, RequireServerActionError>(Ok(()))?
+                .0
+        } else {
+            event_ctx.push_extra_context("self-provisioning", "false");
+
+            let authz_result = authorizer
+                .require_server_action(
+                    event_ctx.request_metadata(),
+                    None,
+                    CatalogServerAction::ProvisionUsers,
+                )
+                .await;
+            event_ctx.emit_authz(authz_result)?.0
+        };
+        let request_metadata = event_ctx.request_metadata();
 
         // ------------------- Business Logic -------------------
         let update_if_exists = request.update_if_exists;
         let (creation_user_id, name, user_type, email) =
-            parse_create_user_request(&request_metadata, Some(request))?;
+            parse_create_user_request(request_metadata, Some(request))?;
 
         let mut t = C::Transaction::begin_write(context.v1_state.catalog).await?;
         let user = C::create_or_update_user(
@@ -303,6 +346,7 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
             email.as_deref(),
             UserLastUpdatedWith::CreateEndpoint,
             user_type,
+            UserUpsertMode::Overwrite,
             t.transaction(),
         )
         .await?;
@@ -330,7 +374,18 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
     ) -> Result<SearchUserResponse> {
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
-        authorizer.require_search_users(&request_metadata).await?;
+
+        let event_ctx = APIEventContext::for_server(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            ServerActionSearchUsers {},
+            authorizer.server_id(),
+        );
+
+        let authz_result = authorizer
+            .require_search_users(event_ctx.request_metadata())
+            .await;
+        event_ctx.emit_authz(authz_result)?;
 
         // ------------------- Business Logic -------------------
         let SearchUserRequest { mut search } = request;
@@ -347,9 +402,18 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
     ) -> Result<User> {
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_user_action(&request_metadata, &user_id, CatalogUserAction::CanRead)
-            .await?;
+
+        let event_ctx = APIEventContext::for_user(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            Arc::new(user_id.clone()),
+            CatalogUserAction::Read,
+        );
+
+        let authz_result = authorizer
+            .require_user_action(event_ctx.request_metadata(), &user_id, *event_ctx.action())
+            .await;
+        event_ctx.emit_authz(authz_result)?;
 
         // ------------------- Business Logic -------------------
         let filter_user_id = Some(vec![user_id.clone()]);
@@ -381,9 +445,22 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
     ) -> Result<ListUsersResponse> {
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_server_action(&request_metadata, CatalogServerAction::CanListUsers)
-            .await?;
+
+        let event_ctx = APIEventContext::for_server(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            CatalogServerAction::ListUsers,
+            authorizer.server_id(),
+        );
+
+        let authz_result = authorizer
+            .require_server_action(
+                event_ctx.request_metadata(),
+                None,
+                event_ctx.action().clone(),
+            )
+            .await;
+        event_ctx.emit_authz(authz_result)?;
 
         // ------------------- Business Logic -------------------
         let filter_user_id = None;
@@ -410,9 +487,18 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         }
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_user_action(&request_metadata, &user_id, CatalogUserAction::CanUpdate)
-            .await?;
+
+        let event_ctx = APIEventContext::for_user(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            Arc::new(user_id.clone()),
+            CatalogUserAction::Update,
+        );
+
+        let authz_result = authorizer
+            .require_user_action(event_ctx.request_metadata(), &user_id, *event_ctx.action())
+            .await;
+        event_ctx.emit_authz(authz_result)?;
 
         // ------------------- Business Logic -------------------
         let email = request.email.as_deref().filter(|e| !e.is_empty());
@@ -423,6 +509,7 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
             email,
             UserLastUpdatedWith::UpdateEndpoint,
             request.user_type,
+            UserUpsertMode::Overwrite,
             t.transaction(),
         )
         .await?;
@@ -442,23 +529,65 @@ pub(crate) trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
     ) -> Result<()> {
         // ------------------- AuthZ -------------------
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_user_action(&request_metadata, &user_id, CatalogUserAction::CanDelete)
-            .await?;
+        let events = context.v1_state.events.clone();
+
+        let event_ctx = APIEventContext::for_user(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            Arc::new(user_id.clone()),
+            CatalogUserAction::Delete,
+        );
+
+        let authz_result = authorizer
+            .require_user_action(event_ctx.request_metadata(), &user_id, *event_ctx.action())
+            .await;
+        let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
 
         // ------------------- Business Logic -------------------
         let mut t = C::Transaction::begin_write(context.v1_state.catalog).await?;
-        let deleted = C::delete_user(user_id.clone(), t.transaction()).await?;
-        if deleted.is_none() {
+        // Soft-deletes the user AND removes their role assignments; returns the
+        // roles whose member lists changed (for cache eviction below).
+        let Some(affected_roles) = C::delete_user(user_id.clone(), t.transaction()).await? else {
             return Err(ErrorModel::not_found(
                 format!("User with id {} not found.", user_id.clone()),
                 "UserNotFound",
                 None,
             )
             .into());
+        };
+        // Grants are not covered by the soft delete: the user row survives, so the
+        // grant foreign key never cascades, and the same `UserId` returns on re-login.
+        // Remove them in the same transaction. Authorizers that keep grants in their
+        // own store clean them up in `delete_user` below, leaving nothing to do here.
+        let revoked_grants = C::delete_grants_for_user_impl(&user_id, t.transaction()).await?;
+
+        // Keep authz cleanup pre-commit and propagating (unlike object deletes):
+        // a `UserId` returns on re-login and has no `create_user` `require_no_relations`
+        // guard, so best-effort cleanup could leave grants a re-provisioned user inherits.
+        authorizer
+            .delete_user(event_ctx.request_metadata(), user_id.clone())
+            .await?;
+        t.commit().await?;
+
+        // One event, not one per grant: a user can hold an unbounded number.
+        if !revoked_grants.is_empty() {
+            events
+                .grants_changed(GrantsChangedEvent::new(
+                    revoked_grants,
+                    Vec::new(),
+                    event_ctx.request_metadata_arc(),
+                ))
+                .await;
         }
-        authorizer.delete_user(&request_metadata, user_id).await?;
-        t.commit().await
+
+        // Post-commit (infallible, in-memory): the user's assignments were
+        // removed, so their effective-roles entry and each affected role's
+        // member-list entry are now stale.
+        for role_id in &affected_roles {
+            crate::service::role_assignments_cache::role_members_cache_invalidate(*role_id).await;
+        }
+        crate::service::role_assignments_cache::user_assignments_cache_invalidate(&user_id).await;
+        Ok(())
     }
 }
 

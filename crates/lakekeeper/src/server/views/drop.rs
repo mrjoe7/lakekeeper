@@ -1,28 +1,34 @@
 use std::sync::Arc;
 
+use http::StatusCode;
+use iceberg_ext::catalog::rest::ErrorModel;
+
 use crate::{
     api::{
-        iceberg::{types::DropParams, v1::ViewParameters},
-        management::v1::{warehouse::TabularDeleteProfile, DeleteKind},
         ApiContext,
+        endpoints::EndpointFlat,
+        iceberg::{types::DropParams, v1::ViewParameters},
+        management::v1::{DeleteKind, warehouse::TabularDeleteProfile},
     },
     request_metadata::RequestMetadata,
     server::{require_warehouse_id, tables::validate_table_or_view_ident},
     service::{
-        authz::{AuthZViewOps, Authorizer, AuthzWarehouseOps, CatalogViewAction},
+        AuthZViewInfo as _, CatalogIdempotencyOps, CatalogStore, CatalogTabularOps, NamedEntity,
+        Result, SecretStore, State, TabularId, TabularListFlags, Transaction,
+        authz::{AuthZViewOps, Authorizer, CatalogViewAction},
         contract_verification::ContractVerification,
+        events::{APIEventContext, context::ResolvedView},
+        idempotency::IdempotencyInfo,
         tasks::{
+            ScheduleTaskMetadata, TaskEntity, WarehouseTaskEntityId,
             tabular_expiration_queue::{TabularExpirationPayload, TabularExpirationTask},
             tabular_purge_queue::{TabularPurgePayload, TabularPurgeTask},
-            EntityId, TaskMetadata,
         },
-        AuthZViewInfo as _, CatalogStore, CatalogTabularOps, CatalogWarehouseOps, NamedEntity,
-        Result, SecretStore, State, TabularId, TabularListFlags, Transaction,
     },
 };
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+pub async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
     parameters: ViewParameters,
     DropParams {
         purge_requested,
@@ -36,30 +42,55 @@ pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretS
     let warehouse_id = require_warehouse_id(prefix.as_ref())?;
     validate_table_or_view_ident(view)?;
 
-    // ------------------- AUTHZ -------------------
-    let authorizer = state.v1_state.authz;
+    // ------------------- AUDIT CONTEXT -------------------
+    // Built before the idempotency check so a served replay can be audited.
+    let idempotency_key = request_metadata.idempotency_key().copied();
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(request_metadata),
+        state.v1_state.events,
+        warehouse_id,
+        view.clone(),
+        CatalogViewAction::Drop {
+            force,
+            purge: purge_requested,
+        },
+    );
 
-    let (warehouse, view_info) = tokio::join!(
-        C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()),
-        C::get_view_info(
+    // ------------------- IDEMPOTENCY CHECK -------------------
+    if let Some(ref key) = idempotency_key {
+        let check = C::check_idempotency_key(
             warehouse_id,
-            view.clone(),
-            TabularListFlags::active(),
+            key,
+            EndpointFlat::CatalogV1DropView,
             state.v1_state.catalog.clone(),
         )
-    );
-    let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-
-    let view_info = authorizer
-        .require_view_action(
-            &request_metadata,
-            warehouse_id,
-            view.clone(),
-            view_info,
-            CatalogViewAction::CanDrop,
-        )
         .await?;
+        if check.is_replay() {
+            event_ctx.emit_idempotent_replay(*key);
+            return Ok(());
+        }
+    }
+
+    // ------------------- AUTHZ + BUSINESS LOGIC -------------------
+    let authorizer = state.v1_state.authz;
+
+    let authz_context = authorizer
+        .load_and_authorize_view_operation::<C>(
+            event_ctx.request_metadata(),
+            event_ctx.user_provided_entity(),
+            TabularListFlags::active(),
+            event_ctx.action().clone(),
+            state.v1_state.catalog.clone(),
+        )
+        .await;
+
+    let (event_ctx, (warehouse, _namespace, view_info)) = event_ctx.emit_authz(authz_context)?;
+
     let view_id = view_info.view_id();
+    let event_ctx = event_ctx.resolve(ResolvedView {
+        warehouse: warehouse.clone(),
+        view: Arc::new(view_info),
+    });
 
     // ------------------- BUSINESS LOGIC -------------------
     state
@@ -70,18 +101,29 @@ pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretS
         .into_result()?;
 
     let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
-    match warehouse.tabular_delete_profile {
+
+    let delete_profile = if force {
+        TabularDeleteProfile::Hard {}
+    } else {
+        warehouse.tabular_delete_profile
+    };
+    let project_id = &warehouse.project_id;
+
+    match delete_profile {
         TabularDeleteProfile::Hard {} => {
             let location = C::drop_tabular(warehouse_id, view_id, force, t.transaction()).await?;
 
             if purge_requested {
                 TabularPurgeTask::schedule_task::<C>(
-                    TaskMetadata {
-                        warehouse_id,
-                        entity_id: EntityId::View(view_id),
+                    ScheduleTaskMetadata {
+                        project_id: project_id.clone(),
                         parent_task_id: None,
-                        schedule_for: None,
-                        entity_name: view.clone().into_name_parts(),
+                        scheduled_for: None,
+                        entity: TaskEntity::EntityInWarehouse {
+                            warehouse_id,
+                            entity_id: WarehouseTaskEntityId::View { view_id },
+                            entity_name: view.clone().into_name_parts(),
+                        },
                     },
                     TabularPurgePayload {
                         tabular_location: location.to_string(),
@@ -91,27 +133,22 @@ pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretS
                 .await?;
                 tracing::debug!(
                     "Queued purge task for dropped view '{}' in warehouse {warehouse_id}.",
-                    view_info.view_ident()
+                    event_ctx.resolved().view.view_ident()
                 );
             }
-            t.commit().await?;
-
-            authorizer
-                .delete_view(warehouse_id, view_id)
-                .await
-                .inspect_err(|e| {
-                    tracing::error!(?e, "Failed to delete view from authorizer: {}", e.error);
-                })
-                .ok();
+            // authorizer cleanup happens after commit (below)
         }
         TabularDeleteProfile::Soft { expiration_seconds } => {
             let _ = TabularExpirationTask::schedule_task::<C>(
-                TaskMetadata {
-                    entity_id: EntityId::View(view_info.view_id()),
-                    warehouse_id,
+                ScheduleTaskMetadata {
+                    project_id: project_id.clone(),
                     parent_task_id: None,
-                    schedule_for: Some(chrono::Utc::now() + expiration_seconds),
-                    entity_name: view.clone().into_name_parts(),
+                    scheduled_for: Some(chrono::Utc::now() + expiration_seconds),
+                    entity: TaskEntity::EntityInWarehouse {
+                        warehouse_id,
+                        entity_id: WarehouseTaskEntityId::View { view_id },
+                        entity_name: view.clone().into_name_parts(),
+                    },
                 },
                 TabularExpirationPayload {
                     deletion_kind: if purge_requested {
@@ -125,7 +162,7 @@ pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretS
             .await?;
             C::mark_tabular_as_deleted(
                 warehouse_id,
-                TabularId::View(view_info.view_id()),
+                TabularId::View(view_id),
                 force,
                 t.transaction(),
             )
@@ -133,295 +170,49 @@ pub(crate) async fn drop_view<C: CatalogStore, A: Authorizer + Clone, S: SecretS
 
             tracing::debug!(
                 "Queued expiration task for dropped view '{}' with id '{view_id}' in warehouse {warehouse_id}.",
-                view_info.view_ident()
+                event_ctx.resolved().view.view_ident()
             );
-            t.commit().await?;
         }
     }
 
-    state
-        .v1_state
-        .hooks
-        .drop_view(
+    // Insert idempotency key and commit — shared across both delete profiles.
+    if let Some(ref key) = idempotency_key
+        && !C::try_insert_idempotency_key(
             warehouse_id,
-            parameters,
-            DropParams {
-                purge_requested,
-                force,
-            },
-            view_id,
-            Arc::new(request_metadata),
+            &IdempotencyInfo::builder()
+                .key(*key)
+                .endpoint(EndpointFlat::CatalogV1DropView)
+                .http_status(StatusCode::NO_CONTENT)
+                .build(),
+            t.transaction(),
         )
-        .await;
+        .await?
+    {
+        t.rollback()
+            .await
+            .inspect_err(|e| {
+                tracing::warn!("Rollback failed after idempotency conflict: {e}");
+            })
+            .ok();
+        return Err(ErrorModel::request_in_progress().into());
+    }
+    t.commit().await?;
+
+    // Post-commit: best-effort authz cleanup for hard deletes
+    if matches!(delete_profile, TabularDeleteProfile::Hard {}) {
+        authorizer
+            .delete_view(warehouse_id, view_id)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(?e, "Failed to delete view from authorizer: {}", e.error);
+            })
+            .ok();
+    }
+
+    event_ctx.emit_view_dropped_async(DropParams {
+        purge_requested,
+        force,
+    });
 
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-    use http::StatusCode;
-    use iceberg::TableIdent;
-    use iceberg_ext::catalog::rest::CreateViewRequest;
-    use sqlx::PgPool;
-
-    use crate::{
-        api::{
-            iceberg::{
-                types::{DropParams, Prefix},
-                v1::ViewParameters,
-            },
-            management::v1::{
-                tasks::{ListTasksRequest, Service},
-                view::ViewManagementService,
-                ApiServer as ManagementApiServer,
-            },
-        },
-        request_metadata::RequestMetadata,
-        server::views::{
-            create::test::create_view, drop::drop_view, load::test::load_view, test::setup,
-        },
-        service::tasks::TaskEntity,
-        tests::{create_view_request, random_request_metadata},
-        WarehouseId,
-    };
-
-    #[sqlx::test]
-    async fn test_drop_view(pool: PgPool) {
-        let (api_context, namespace, whi) = setup(pool, None).await;
-
-        let view_name = "my-view";
-        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
-
-        let prefix = &whi.to_string();
-        let created_view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            rq,
-            Some(prefix.into()),
-        ))
-        .await
-        .unwrap();
-        let mut table_ident = namespace.clone().inner();
-        table_ident.push(view_name.into());
-
-        let loaded_view = load_view(
-            api_context.clone(),
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect("View should be loadable");
-        assert_eq!(loaded_view.metadata, created_view.metadata);
-        drop_view(
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-            DropParams {
-                purge_requested: true,
-                force: false,
-            },
-            api_context.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .expect("View should be droppable");
-
-        let error = load_view(
-            api_context.clone(),
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect_err("View should no longer exist");
-
-        assert_eq!(error.error.code, StatusCode::NOT_FOUND);
-
-        // Load expiration task
-        let entity = TaskEntity::View {
-            view_id: loaded_view.metadata.uuid().into(),
-        };
-        let expiration_tasks = ManagementApiServer::list_tasks(
-            whi,
-            ListTasksRequest::builder()
-                .entities(Some(vec![TaskEntity::View {
-                    view_id: loaded_view.metadata.uuid().into(),
-                }]))
-                .build(),
-            api_context,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(expiration_tasks.tasks.len(), 1);
-        let task = &expiration_tasks.tasks[0];
-        assert_eq!(task.entity, entity);
-    }
-
-    #[sqlx::test]
-    async fn test_cannot_drop_protected_view(pool: PgPool) {
-        let (api_context, namespace, whi) = setup(pool, None).await;
-
-        let view_name = "my-view";
-        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
-
-        let prefix = &whi.to_string();
-        let created_view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            rq,
-            Some(prefix.into()),
-        ))
-        .await
-        .unwrap();
-        let mut table_ident = namespace.clone().inner();
-        table_ident.push(view_name.into());
-
-        let loaded_view = load_view(
-            api_context.clone(),
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect("View should be loadable");
-        assert_eq!(loaded_view.metadata, created_view.metadata);
-
-        ManagementApiServer::set_view_protection(
-            loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
-            true,
-            api_context.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        let e = drop_view(
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-            DropParams {
-                purge_requested: true,
-                force: false,
-            },
-            api_context.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .expect_err("Protected View should not be droppable");
-
-        assert_eq!(e.error.code, StatusCode::CONFLICT);
-
-        ManagementApiServer::set_view_protection(
-            loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
-            false,
-            api_context.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        drop_view(
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-            DropParams {
-                purge_requested: true,
-                force: false,
-            },
-            api_context.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .expect("Unprotected View should be droppable");
-
-        let error = load_view(
-            api_context,
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect_err("View should no longer exist");
-
-        assert_eq!(error.error.code, StatusCode::NOT_FOUND);
-    }
-
-    #[sqlx::test]
-    async fn test_can_force_drop_protected_view(pool: PgPool) {
-        let (api_context, namespace, whi) = setup(pool, None).await;
-
-        let view_name = "my-view";
-        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
-
-        let prefix = &whi.to_string();
-        let created_view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            rq,
-            Some(prefix.into()),
-        ))
-        .await
-        .unwrap();
-        let mut table_ident = namespace.clone().inner();
-        table_ident.push(view_name.into());
-
-        let loaded_view = load_view(
-            api_context.clone(),
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect("View should be loadable");
-        assert_eq!(loaded_view.metadata, created_view.metadata);
-
-        ManagementApiServer::set_view_protection(
-            loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
-            true,
-            api_context.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        drop_view(
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(&table_ident).unwrap(),
-            },
-            DropParams {
-                purge_requested: true,
-                force: true,
-            },
-            api_context.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .expect("Protected View should be droppable via force");
-
-        let error = load_view(
-            api_context,
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(table_ident).unwrap(),
-            },
-        )
-        .await
-        .expect_err("View should no longer exist");
-
-        assert_eq!(error.error.code, StatusCode::NOT_FOUND);
-    }
 }

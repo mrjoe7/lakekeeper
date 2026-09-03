@@ -1,6 +1,8 @@
-use lakekeeper::{
-    implementations::postgres::{get_reader_pool, migrations::MigrationState},
-    tokio, tracing, CONFIG,
+use lakekeeper::{tokio, tracing};
+use lakekeeper_storage_postgres::{
+    config::CONFIG as PG_CONFIG,
+    get_writer_pool,
+    migrations::{MigrationState, check_migration_status},
 };
 
 use crate::healthcheck::db_health_check;
@@ -24,9 +26,10 @@ pub(crate) async fn wait_for_db(
                 tracing::error!("DB is not up.");
                 anyhow::bail!("DB is not up.");
             }
-            tracing::info!(?details,
-                        "DB not up yet, sleeping for {backoff}s before next retry. Retry: {counter}/{retries}",
-                    );
+            tracing::info!(
+                ?details,
+                "DB not up yet, sleeping for {backoff}s before next retry. Retry: {counter}/{retries}",
+            );
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         }
     }
@@ -34,20 +37,47 @@ pub(crate) async fn wait_for_db(
     if check_migrations {
         let mut counter = 0;
         loop {
-            let opts = CONFIG
-                .to_pool_opts()
-                .acquire_timeout(std::time::Duration::from_secs(CONFIG.pg_acquire_timeout));
-
-            let read_pool = get_reader_pool(opts).await?;
-            let migrations =
-                lakekeeper::implementations::postgres::migrations::check_migration_status(
-                    &read_pool,
-                )
-                .await;
+            // Read migration status from the PRIMARY, not a read replica: a
+            // lagging replica may not yet carry the `_sqlx_migrations` rows a
+            // newer binary just committed to the primary, which would hide an
+            // `Ahead` database (and mis-report `Complete`) and let an older
+            // binary start against an incompatible schema.
+            let write_pool = get_writer_pool(PG_CONFIG.to_pool_opts()).await?;
+            let migrations = check_migration_status(&write_pool).await;
             match migrations {
                 Ok(MigrationState::Complete) => {
                     tracing::info!("Database is up to date with binary.");
                     break;
+                }
+                Ok(MigrationState::Ahead) => {
+                    // The DB was migrated by a newer Lakekeeper. Retrying never
+                    // resolves this (the DB won't get older), so fail fast
+                    // instead of looping until the retry budget is exhausted.
+                    tracing::error!(
+                        "Database has been migrated by a NEWER Lakekeeper than this binary. \
+                         Refusing to start to avoid running against an incompatible schema. \
+                         Use a binary at least as new as the one that last migrated the database. \
+                         To start anyway (e.g. an emergency rollback, accepting the risk of \
+                         schema incompatibility), run `serve --force-start`."
+                    );
+                    anyhow::bail!(
+                        "Database is newer than this binary (migrated by a newer Lakekeeper); refusing to start."
+                    );
+                }
+                Ok(MigrationState::SchemaMismatch) => {
+                    // A search_path that does not resolve to the configured
+                    // schema is a misconfiguration, so retrying never fixes it.
+                    // Fail fast like `Ahead` rather than spending the retry
+                    // budget. `check_migration_status` has already logged which
+                    // schema was reached and how to correct it.
+                    tracing::error!(
+                        "This session does not resolve to the schema set in LAKEKEEPER__PG_SCHEMA. \
+                         Refusing to start to avoid running against a different schema's data. See \
+                         the preceding warning for how to fix it."
+                    );
+                    anyhow::bail!(
+                        "Session does not resolve to the configured Postgres schema; refusing to start."
+                    );
                 }
                 unready => {
                     tracing::info!(?unready, "Database is not up to date with binary.");
@@ -56,12 +86,16 @@ pub(crate) async fn wait_for_db(
 
             counter += 1;
             if counter > retries {
-                tracing::error!("Database is not up to date with binary, make sure to run the migrate command before starting the server.");
-                anyhow::bail!("Database is not up to date with binary, make sure to run the migrate command before starting the server.");
+                tracing::error!(
+                    "Database is not up to date with binary, make sure to run the migrate command before starting the server."
+                );
+                anyhow::bail!(
+                    "Database is not up to date with binary, make sure to run the migrate command before starting the server."
+                );
             }
             tracing::info!(
-                        "DB not up to date with binary yet, sleeping for {backoff}s before next retry. Retry: {counter}/{retries}",
-                    );
+                "DB not up to date with binary yet, sleeping for {backoff}s before next retry. Retry: {counter}/{retries}",
+            );
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         }
     }

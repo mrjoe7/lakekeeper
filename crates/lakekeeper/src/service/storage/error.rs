@@ -1,11 +1,9 @@
-use std::error::Error;
-
 use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
 use lakekeeper_io::{
-    adls::{InvalidADLSAccountName, InvalidADLSFilesystemName, InvalidADLSHost},
-    gcs::InvalidGCSBucketName,
     DeleteError, IOError, InitializeClientError, InternalError, InvalidLocationError,
     RetryableErrorKind,
+    adls::{InvalidADLSAccountName, InvalidADLSFilesystemName, InvalidADLSHost},
+    gcs::InvalidGCSBucketName,
 };
 
 use crate::server::{compression_codec::UnsupportedCompressionCodec, io::IOErrorExt};
@@ -14,8 +12,6 @@ use crate::server::{compression_codec::UnsupportedCompressionCodec, io::IOErrorE
 pub enum ValidationError {
     #[error("{0}")]
     IoOperationFailed(#[from] Box<IOError>),
-    #[error("Validation of STS credentials with Iceberg FileIO failed: {0}")]
-    IcebergFileIoError(#[from] Box<IcebergFileIoError>),
     #[error(transparent)]
     Credentials(#[from] Box<CredentialsError>),
     #[error(transparent)]
@@ -83,12 +79,6 @@ impl From<InvalidGCSBucketName> for ValidationError {
 impl From<InvalidLocationError> for ValidationError {
     fn from(value: InvalidLocationError) -> Self {
         ValidationError::InvalidLocation(Box::new(value))
-    }
-}
-
-impl From<IcebergFileIoError> for ValidationError {
-    fn from(value: IcebergFileIoError) -> Self {
-        ValidationError::IcebergFileIoError(Box::new(value))
     }
 }
 
@@ -168,18 +158,11 @@ impl From<ValidationError> for ErrorModel {
     fn from(value: ValidationError) -> Self {
         let msg = value.to_string();
         match value {
-            ValidationError::IoOperationFailed(e) => {
-                tracing::debug!(
-                    "Validation failed with IO error: {e}. Source: {:?}",
-                    e.source()
-                );
-                ErrorModel::bad_request(
-                    format!("IO Operation failed during Validation: {e}"),
-                    "IoOperationFailed",
-                    None,
-                )
-                .append_details(e.context().iter().map(ToString::to_string))
-            }
+            ValidationError::IoOperationFailed(e) => ErrorModel::from_io_error_with_code(
+                *e,
+                http::StatusCode::BAD_REQUEST,
+                "IO Operation Failed during validation.",
+            ),
             ValidationError::Credentials(e) => {
                 if matches!(e.as_ref(), CredentialsError::UnexpectedStorageType(_)) {
                     ErrorModel::bad_request(e.to_string(), "UnexpectedStorageProfileType", Some(e))
@@ -214,8 +197,6 @@ impl From<ValidationError> for ErrorModel {
                 "FileDecompressionError",
                 Some(e),
             ),
-            ValidationError::IcebergFileIoError(e) => ErrorModel::from(*e)
-                .append_detail("Validating Vended Credentials Access with Iceberg FileIO failed."),
         }
     }
 }
@@ -225,54 +206,6 @@ impl From<ValidationError> for IcebergErrorResponse {
         ErrorModel::from(value).into()
     }
 }
-
-#[derive(thiserror::Error, Debug)]
-pub enum IcebergFileIoError {
-    #[error("Action not supported: {0}")]
-    UnsupportedAction(String),
-    #[error(transparent)]
-    IcebergError(#[from] iceberg::Error),
-    #[error(transparent)]
-    Credentials(#[from] CredentialsError),
-}
-
-impl From<IcebergFileIoError> for ErrorModel {
-    fn from(err: IcebergFileIoError) -> Self {
-        match err {
-            IcebergFileIoError::UnsupportedAction(ref action) => ErrorModel::not_implemented(
-                err.to_string(),
-                format!("{action}NotSupported"),
-                Some(Box::new(err)),
-            ),
-            IcebergFileIoError::IcebergError(e) => ErrorModel::precondition_failed(
-                format!("Iceberg FileIO returned an error: {e}"),
-                "IcebergFileIOError",
-                Some(Box::new(e)),
-            ),
-            IcebergFileIoError::Credentials(cred_e) => cred_e.into(),
-        }
-    }
-}
-
-// #[derive(thiserror::Error, Debug)]
-// pub enum IOCreationError {
-//     #[error(transparent)]
-//     Credentials(#[from] CredentialsError),
-// }
-
-// impl From<IOCreationError> for ErrorModel {
-//     fn from(value: IOCreationError) -> Self {
-//         match value {
-//             IOCreationError::Credentials(e) => e.into(),
-//         }
-//     }
-// }
-
-// impl From<IOCreationError> for IcebergErrorResponse {
-//     fn from(value: IOCreationError) -> Self {
-//         ErrorModel::from(value).into()
-//     }
-// }
 
 #[derive(thiserror::Error, Debug)]
 pub enum TableConfigError {
@@ -315,9 +248,15 @@ pub enum UpdateError {
     IncompatibleProfiles(String, String),
 }
 
+impl From<UpdateError> for ErrorModel {
+    fn from(value: UpdateError) -> Self {
+        ErrorModel::bad_request(value.to_string(), "UpdateError", None)
+    }
+}
+
 impl From<UpdateError> for IcebergErrorResponse {
     fn from(value: UpdateError) -> Self {
-        ErrorModel::bad_request(value.to_string(), "UpdateError", None).into()
+        ErrorModel::from(value).into()
     }
 }
 

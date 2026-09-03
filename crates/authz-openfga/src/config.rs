@@ -40,14 +40,12 @@ fn get_config() -> DynAppConfig {
         config = config.merge(env);
     }
 
-    let config = match config.extract::<DynAppConfig>() {
+    match config.extract::<DynAppConfig>() {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to extract OpenFGA config: {e}");
         }
-    };
-
-    config
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -200,6 +198,7 @@ where
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Redact)]
+#[allow(clippy::result_large_err)]
 struct OpenFGAConfigSerde {
     /// GRPC Endpoint Url
     endpoint: Url,
@@ -237,6 +236,7 @@ fn default_openfga_max_batch_check_size() -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod test {
     use super::*;
 

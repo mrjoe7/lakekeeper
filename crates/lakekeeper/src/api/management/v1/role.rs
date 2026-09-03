@@ -1,22 +1,86 @@
-use axum::{response::IntoResponse, Json};
+use std::{collections::HashSet, sync::Arc};
+
+use axum::{Json, response::IntoResponse};
 use iceberg_ext::catalog::rest::ErrorModel;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    ProjectId,
     api::{
-        iceberg::{types::PageToken, v1::PaginationQuery},
-        management::v1::ApiServer,
         ApiContext,
+        iceberg::{types::PageToken, v1::PaginationQuery},
+        management::v1::{ApiServer, impl_arc_into_response},
     },
     request_metadata::RequestMetadata,
     service::{
-        authz::{AuthZProjectOps, Authorizer, CatalogProjectAction, CatalogRoleAction},
-        CatalogStore, Result, RoleId, SecretStore, State, Transaction,
+        ArcProjectId, ArcRole, ArcRoleIdent, CachePolicy, CatalogBackendError,
+        CatalogCreateRoleRequest, CatalogListRolesByIdFilter, CatalogRoleOps, CatalogStore,
+        CreateRoleError, DeleteRoleError, ManagedRoleImmutable, Result, RoleId, RoleProviderId,
+        RoleSourceId, SecretStore, State, SystemRoleImmutable, Transaction, UpdateRoleError,
+        authz::{
+            AuthZError, AuthZProjectOps, AuthZRoleOps, Authorizer, CatalogProjectAction,
+            CatalogRoleAction, RoleSourceSystem, SourceSystemTarget,
+        },
+        events::{APIEventContext, context::Unresolved},
+        role_assignments_cache,
     },
-    ProjectId,
 };
 
-#[derive(Debug, Deserialize)]
+/// Rejects a `provider_id` **supplied in a request body** that is not writable
+/// through the role-management API: the catalog-managed `system` namespace (see
+/// [`crate::service::SYSTEM_ROLE_PROVIDER_ID`]), or any namespace owned by a
+/// configured role provider (`managed`, from
+/// [`Authorizer::managed_role_provider_ids`]) whose roles are maintained by
+/// provider sync. Used as a pre-authz check on endpoints that accept a provider
+/// in the request body (create, source-system rebind target). To guard the
+/// provider of an *already-resolved* role, use [`reject_managed_role`].
+fn reject_managed_provider(
+    provider_id: &RoleProviderId,
+    managed: &HashSet<RoleProviderId>,
+) -> Result<()> {
+    if provider_id.is_system() {
+        return Err(ErrorModel::bad_request(
+            "provider_id `system` is reserved for catalog-managed roles \
+             and cannot be used in role-management requests.",
+            "RoleProviderIdReserved",
+            None,
+        )
+        .into());
+    }
+    if managed.contains(provider_id) {
+        return Err(ErrorModel::from(ManagedRoleImmutable::new(provider_id.to_string())).into());
+    }
+    Ok(())
+}
+
+/// Rejects mutating an **already-resolved role** whose provider namespace is
+/// owned by a configured role provider (from
+/// [`Authorizer::managed_role_provider_ids`]) — such roles are maintained by
+/// provider sync and must not be changed through the API. The caller's error
+/// type is produced via its `From<ManagedRoleImmutable>` conversion (e.g.
+/// [`DeleteRoleError`], [`UpdateRoleError`], or [`ErrorModel`]).
+///
+/// Complements [`reject_managed_provider`], which guards a provider taken from a
+/// request body. The reserved `system` namespace is **not** checked here: the
+/// mutate-existing-role sites (delete, update, source-system rebind) reject it
+/// separately with an `is_system()` check yielding `SystemRoleImmutable`, while
+/// the membership sites guard it separately — writes to a `system`-provider
+/// role's membership require an instance admin and never accept a role-type
+/// member (see `reject_system_role_membership` in `role_membership.rs`).
+/// `lakekeeper`-provider roles remain manually assignable without restriction.
+pub(crate) fn reject_managed_role<A, E>(authorizer: &A, role: &ArcRole) -> Result<(), E>
+where
+    A: Authorizer,
+    E: From<ManagedRoleImmutable>,
+{
+    let provider_id = role.ident.provider_id();
+    if authorizer.managed_role_provider_ids().contains(provider_id) {
+        return Err(ManagedRoleImmutable::new(provider_id.to_string()).into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, typed_builder::TypedBuilder)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub struct CreateRoleRequest {
@@ -24,40 +88,122 @@ pub struct CreateRoleRequest {
     pub name: String,
     /// Description of the role
     #[serde(default)]
+    #[builder(default)]
     pub description: Option<String>,
     /// Project ID in which the role is created.
     /// Deprecated: Please use the `x-project-id` header instead.
     #[serde(default)]
+    #[builder(default)]
     #[cfg_attr(feature = "open-api", schema(value_type=Option::<String>))]
     pub project_id: Option<ProjectId>,
+    /// Provider that owns this role (e.g. `"lakekeeper"`, `"oidc"`).
+    /// Must be provided together with `source-id`. Omit both to let the server
+    /// assign `provider-id = "lakekeeper"` and a fresh UUIDv7 `source-id`.
+    #[serde(default)]
+    #[builder(default)]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<String>))]
+    pub provider_id: Option<RoleProviderId>,
+    /// Identifier of the role in the provider.
+    /// Must be provided together with `provider-id`.
+    #[serde(default)]
+    #[builder(default)]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<String>))]
+    pub source_id: Option<RoleSourceId>,
 }
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub struct Role {
-    /// Globally unique id of this role
-    #[cfg_attr(feature = "open-api", schema(value_type=uuid::Uuid))]
+    /// Globally unique UUID identifier
+    #[cfg_attr(feature = "open-api", schema(value_type = uuid::Uuid))]
     pub id: RoleId,
+    /// Composite project-scoped identifier (`provider~source_id`).
+    /// Unique within a project.
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub ident: ArcRoleIdent,
+    /// Provider that owns this role (e.g. `"lakekeeper"`, `"oidc"`).
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub provider_id: RoleProviderId,
+    /// Identifier of the role in the provider.
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub source_id: RoleSourceId,
     /// Name of the role
     pub name: String,
     /// Description of the role
     pub description: Option<String>,
     /// Project ID in which the role is created.
     #[cfg_attr(feature = "open-api", schema(value_type=String))]
-    pub project_id: ProjectId,
+    pub project_id: ArcProjectId,
     /// Timestamp when the role was created
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the role was last updated
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl From<crate::service::Role> for Role {
+    fn from(value: crate::service::Role) -> Self {
+        Self {
+            id: value.id,
+            provider_id: value.ident.provider_id().clone(),
+            source_id: value.ident.source_id().clone(),
+            ident: value.ident,
+            name: value.name,
+            description: value.description,
+            project_id: value.project_id,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+/// Metadata of a role with reduced information.
+/// Returned for cross-project role references.
+pub struct RoleMetadata {
+    /// Globally unique UUID identifier
+    #[cfg_attr(feature = "open-api", schema(value_type = uuid::Uuid))]
+    pub id: RoleId,
+    /// Composite project-scoped identifier (`provider~source_id`).
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub ident: ArcRoleIdent,
+    /// Provider that owns this role (e.g. `"lakekeeper"`, `"oidc"`).
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub provider_id: RoleProviderId,
+    /// Identifier of the role in the provider.
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub source_id: RoleSourceId,
+    /// Name of the role
+    pub name: String,
+    /// Project ID in which the role is created.
+    #[cfg_attr(feature = "open-api", schema(value_type=String))]
+    pub project_id: ArcProjectId,
+}
+
+impl_arc_into_response!(RoleMetadata);
+
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 pub struct SearchRoleResponse {
-    /// List of users matching the search criteria
+    /// List of roles matching the search criteria
     pub roles: Vec<Role>,
 }
+
+impl From<crate::service::SearchRoleResponse> for SearchRoleResponse {
+    fn from(value: crate::service::SearchRoleResponse) -> Self {
+        Self {
+            roles: value
+                .roles
+                .into_iter()
+                .map(|r| (*r).clone().into())
+                .collect(),
+        }
+    }
+}
+
+impl_arc_into_response!(SearchRoleResponse);
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
@@ -70,6 +216,18 @@ pub struct UpdateRoleRequest {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UpdateRoleSourceSystemRequest {
+    /// New Source ID / External ID of the role.
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub source_id: RoleSourceId,
+    /// New Provider ID of the role.
+    #[cfg_attr(feature = "open-api", schema(value_type = String))]
+    pub provider_id: RoleProviderId,
+}
+
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
@@ -78,6 +236,21 @@ pub struct ListRolesResponse {
     #[serde(alias = "next_page_token")]
     pub next_page_token: Option<String>,
 }
+
+impl From<crate::service::ListRolesResponse> for ListRolesResponse {
+    fn from(value: crate::service::ListRolesResponse) -> Self {
+        Self {
+            roles: value
+                .roles
+                .into_iter()
+                .map(|r| (*r).clone().into())
+                .collect(),
+            next_page_token: value.next_page_token,
+        }
+    }
+}
+
+impl_arc_into_response!(ListRolesResponse);
 
 impl IntoResponse for ListRolesResponse {
     fn into_response(self) -> axum::response::Response {
@@ -103,9 +276,6 @@ pub struct SearchRoleRequest {
 #[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
 #[serde(rename_all = "camelCase")]
 pub struct ListRolesQuery {
-    /// Search for a specific role name
-    #[serde(default)]
-    pub name: Option<String>,
     /// Next page token
     #[serde(default)]
     pub page_token: Option<String>,
@@ -116,8 +286,20 @@ pub struct ListRolesQuery {
     /// Project ID from which roles should be listed
     /// Deprecated: Please use the `x-project-id` header instead.
     #[serde(default)]
-    #[cfg_attr(feature = "open-api", param(value_type=Option::<String>))]
+    #[cfg_attr(feature = "open-api", param(value_type=Option<String>))]
     pub project_id: Option<ProjectId>,
+    /// Filter by role IDs
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(value_type=Option<Vec<uuid::Uuid>>))]
+    pub role_ids: Option<Vec<RoleId>>,
+    /// Filter by source IDs
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(value_type=Option<Vec<String>>))]
+    pub source_ids: Option<Vec<RoleSourceId>>,
+    /// Filter by provider IDs
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(value_type=Option<Vec<String>>))]
+    pub provider_ids: Option<Vec<RoleProviderId>>,
 }
 
 impl ListRolesQuery {
@@ -160,37 +342,41 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
             )
             .into());
         }
+        if let Some(p) = &request.provider_id {
+            reject_managed_provider(p, context.v1_state.authz.managed_role_provider_ids())?;
+        }
+        match (&request.provider_id, &request.source_id) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => {
+                return Err(ErrorModel::bad_request(
+                    "provider-id and source-id must be provided together, or both omitted",
+                    "InvalidRoleIdentifier",
+                    None,
+                )
+                .into());
+            }
+        }
 
-        let project_id = request_metadata.require_project_id(request.project_id)?;
+        let authorizer = context.v1_state.authz;
+        let project_id = request_metadata.require_project_id(request.project_id.clone())?;
 
         // -------------------- AUTHZ --------------------
-        let authorizer = context.v1_state.authz;
-        authorizer
-            .require_project_action(
-                &request_metadata,
-                &project_id,
-                CatalogProjectAction::CanCreateRole,
-            )
-            .await?;
-
-        // -------------------- Business Logic --------------------
-        let description = request.description.filter(|d| !d.is_empty());
-        let role_id = RoleId::new_random();
-        let mut t: <C as CatalogStore>::Transaction =
-            C::Transaction::begin_write(context.v1_state.catalog).await?;
-        let user = C::create_role(
-            role_id,
-            &project_id,
-            &request.name,
-            description.as_deref(),
-            t.transaction(),
-        )
-        .await?;
-        authorizer
-            .create_role(&request_metadata, role_id, project_id)
-            .await?;
-        t.commit().await?;
-        Ok(user)
+        let event_ctx = APIEventContext::for_project_arc(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            project_id.clone(),
+            Arc::new(CatalogProjectAction::CreateRole {
+                name: Some(request.name.clone()),
+            }),
+        );
+        let catalog_state = context.v1_state.catalog;
+        let authz_result =
+            authorize_create_role::<A, C>(authorizer, catalog_state, &event_ctx, request).await;
+        let (event_ctx, role) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role);
+        let result = (**event_ctx.resolved()).clone().into();
+        event_ctx.emit_role_created();
+        Ok(result)
     }
 
     async fn list_roles(
@@ -202,26 +388,18 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         let project_id = request_metadata.require_project_id(query.project_id.clone())?;
 
         // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_project_arc(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            project_id.clone(),
+            Arc::new(CatalogProjectAction::ListRoles),
+        );
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_project_action(
-                &request_metadata,
-                &project_id,
-                CatalogProjectAction::CanListRoles,
-            )
-            .await?;
-
-        // -------------------- Business Logic --------------------
-        let filter_role_id = None;
-        let pagination_query = query.pagination_query();
-        C::list_roles(
-            Some(project_id),
-            filter_role_id,
-            query.name,
-            pagination_query,
-            context.v1_state.catalog,
-        )
-        .await
+        let catalog_state = context.v1_state.catalog;
+        let authz_result =
+            authorize_list_roles::<A, C>(authorizer, catalog_state, &event_ctx, query).await;
+        let (_event_ctx, roles) = event_ctx.emit_authz(authz_result)?;
+        Ok(roles.into())
     }
 
     async fn get_role(
@@ -229,32 +407,51 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         request_metadata: RequestMetadata,
         role_id: RoleId,
     ) -> Result<Role> {
-        // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_role(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            role_id,
+            CatalogRoleAction::Read,
+        );
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_role_action(&request_metadata, role_id, CatalogRoleAction::CanRead)
-            .await?;
 
-        // -------------------- Business Logic --------------------
-        let roles = C::list_roles(
-            None,
-            Some(vec![role_id]),
-            None,
-            PaginationQuery {
-                page_size: Some(1),
-                page_token: PageToken::NotSpecified,
-            },
+        let role = C::get_role_by_id_cache_aware(
+            &event_ctx.request_metadata().require_project_id(None)?,
+            role_id,
+            CachePolicy::Skip,
             context.v1_state.catalog,
         )
-        .await?;
+        .await;
 
-        let role = roles.roles.into_iter().next().ok_or(ErrorModel::not_found(
-            format!("Role with id {role_id} not found."),
-            "RoleNotFound",
-            None,
-        ))?;
+        let authz_result = authorizer
+            .require_role_action(event_ctx.request_metadata(), role, CatalogRoleAction::Read)
+            .await;
 
-        Ok(role)
+        let (event_ctx, role) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role);
+
+        Ok((**event_ctx.resolved()).clone().into())
+    }
+
+    async fn get_role_metadata(
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+        role_id: RoleId,
+    ) -> Result<Arc<RoleMetadata>> {
+        // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_role(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            role_id,
+            CatalogRoleAction::ReadMetadata,
+        );
+        let authorizer = context.v1_state.authz;
+        let catalog_state = context.v1_state.catalog;
+        let authz_result =
+            authorize_get_role_metadata::<A, C>(authorizer, catalog_state, &event_ctx).await;
+        let (event_ctx, role_metadata) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role_metadata);
+        Ok(event_ctx.resolved().clone())
     }
 
     async fn search_role(
@@ -262,27 +459,21 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         request_metadata: RequestMetadata,
         request: SearchRoleRequest,
     ) -> Result<SearchRoleResponse> {
-        let SearchRoleRequest {
-            mut search,
-            project_id,
-        } = request;
-        let project_id = request_metadata.require_project_id(project_id)?;
+        let project_id = request_metadata.require_project_id(request.project_id.clone())?;
 
-        // ------------------- AuthZ -------------------
+        // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_project_arc(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            project_id.clone(),
+            Arc::new(CatalogProjectAction::SearchRoles),
+        );
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_project_action(
-                &request_metadata,
-                &project_id,
-                CatalogProjectAction::CanSearchRoles,
-            )
-            .await?;
-
-        // ------------------- Business Logic -------------------
-        if search.chars().count() > 64 {
-            search = search.chars().take(64).collect();
-        }
-        C::search_role(&search, context.v1_state.catalog).await
+        let catalog_state = context.v1_state.catalog;
+        let authz_result =
+            authorize_search_role::<A, C>(authorizer, catalog_state, &event_ctx, request).await;
+        let (_event_ctx, response) = event_ctx.emit_authz(authz_result)?;
+        Ok(response.into())
     }
 
     async fn delete_role(
@@ -290,24 +481,23 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
         request_metadata: RequestMetadata,
         role_id: RoleId,
     ) -> Result<()> {
-        let authorizer = context.v1_state.authz;
-        authorizer
-            .require_role_action(&request_metadata, role_id, CatalogRoleAction::CanDelete)
-            .await?;
+        let project_id = request_metadata.require_project_id(None)?;
 
-        // ------------------- Business Logic -------------------
-        let mut t = C::Transaction::begin_write(context.v1_state.catalog).await?;
-        let deleted = C::delete_role(role_id, t.transaction()).await?;
-        if deleted.is_none() {
-            return Err(ErrorModel::not_found(
-                format!("Role with id {role_id} not found."),
-                "RoleNotFound",
-                None,
-            )
-            .into());
-        }
-        authorizer.delete_role(&request_metadata, role_id).await?;
-        t.commit().await
+        // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_role(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            role_id,
+            CatalogRoleAction::Delete,
+        );
+        let authorizer = context.v1_state.authz;
+        let catalog_state = context.v1_state.catalog;
+        let authz_result =
+            authorized_delete_role::<A, C>(authorizer, catalog_state, &event_ctx, project_id).await;
+        let (event_ctx, role) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role);
+        event_ctx.emit_role_deleted();
+        Ok(())
     }
 
     async fn update_role(
@@ -326,34 +516,419 @@ pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
             .into());
         }
 
+        let project_id = request_metadata.require_project_id(None)?;
+
         // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_role(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            role_id,
+            CatalogRoleAction::Update,
+        );
         let authorizer = context.v1_state.authz;
-        authorizer
-            .require_role_action(&request_metadata, role_id, CatalogRoleAction::CanUpdate)
+        let catalog_state = context.v1_state.catalog;
+        let authz_result = authorize_update_role::<A, C>(
+            authorizer,
+            catalog_state,
+            &event_ctx,
+            project_id,
+            request,
+        )
+        .await;
+        let (event_ctx, role) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role);
+        let result = (**event_ctx.resolved()).clone().into();
+        event_ctx.emit_role_updated();
+        Ok(result)
+    }
+
+    async fn update_role_source_system(
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+        role_id: RoleId,
+        request: UpdateRoleSourceSystemRequest,
+    ) -> Result<Role> {
+        // -------------------- VALIDATIONS --------------------
+        // Reject rebinding any role into the catalog-managed `system` namespace
+        // or into a namespace owned by a configured role provider. The check on
+        // the *current* role (cannot rebind a system- or provider-managed role
+        // to a different provider) lives inside the authz helper because it
+        // needs the role resolved.
+        reject_managed_provider(
+            &request.provider_id,
+            context.v1_state.authz.managed_role_provider_ids(),
+        )?;
+
+        let project_id = request_metadata.require_project_id(None)?;
+
+        // -------------------- AUTHZ --------------------
+        let event_ctx = APIEventContext::for_role(
+            request_metadata.into(),
+            context.v1_state.events.clone(),
+            role_id,
+            CatalogRoleAction::UpdateSourceSystem {
+                target: SourceSystemTarget::To(RoleSourceSystem {
+                    provider_id: request.provider_id.clone(),
+                    source_id: request.source_id.clone(),
+                }),
+            },
+        );
+        let authorizer = context.v1_state.authz;
+        let catalog_state = context.v1_state.catalog;
+        let authz_result = authorize_update_role_source_system::<A, C>(
+            authorizer,
+            catalog_state,
+            &event_ctx,
+            project_id,
+            request,
+        )
+        .await;
+        let (event_ctx, role) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(role);
+        let result = (**event_ctx.resolved()).clone().into();
+        event_ctx.emit_role_updated();
+        Ok(result)
+    }
+}
+
+async fn authorize_create_role<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<ProjectId, Unresolved, CatalogProjectAction>,
+    request: CreateRoleRequest,
+) -> Result<ArcRole, AuthZError> {
+    let project_id = event_ctx.user_provided_entity_arc_ref();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+    authorizer
+        .require_project_action(request_metadata, project_id, action.clone())
+        .await?;
+
+    // -------------------- Business Logic --------------------
+    let description = request.description.filter(|d| !d.is_empty());
+    let role_id = RoleId::new_random();
+    let mut t: <C as CatalogStore>::Transaction =
+        C::Transaction::begin_write(catalog_state.clone())
+            .await
+            .map_err(|e| CatalogBackendError::new_unexpected(e.error))
+            .map_err(CreateRoleError::from)?;
+
+    let source_id = request
+        .source_id
+        .unwrap_or_else(|| RoleSourceId::new_from_role_id(role_id));
+    // No provider in the request → the catalog itself is the system of
+    // record for this role (i.e. the `lakekeeper` provider). Not the
+    // catalog-managed `system` provider — those are seeded internally and
+    // never accepted via this endpoint (see `reject_managed_provider`).
+    let provider_id = request
+        .provider_id
+        .unwrap_or_else(RoleProviderId::lakekeeper);
+    let catalog_create_role_request = CatalogCreateRoleRequest {
+        role_id,
+        role_name: &request.name,
+        description: description.as_deref(),
+        source_id: &source_id,
+        provider_id: &provider_id,
+    };
+    let role = C::create_role(project_id, catalog_create_role_request, t.transaction()).await?;
+    authorizer
+        .create_role(request_metadata, role_id, project_id.clone())
+        .await
+        .map_err::<CreateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    t.commit()
+        .await
+        .map_err::<CreateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    Ok(role)
+}
+
+async fn authorize_list_roles<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<ProjectId, Unresolved, CatalogProjectAction>,
+    query: ListRolesQuery,
+) -> Result<crate::service::ListRolesResponse, AuthZError> {
+    let project_id = event_ctx.user_provided_entity_arc();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+    authorizer
+        .require_project_action(request_metadata, &project_id, action.clone())
+        .await?;
+
+    // -------------------- Business Logic --------------------
+    let pagination_query = query.pagination_query();
+    let provider_ids = query
+        .provider_ids
+        .as_ref()
+        .map(|v| v.iter().collect::<Vec<_>>());
+    let source_ids = query
+        .source_ids
+        .as_ref()
+        .map(|v| v.iter().collect::<Vec<_>>());
+    let roles = C::list_roles(
+        project_id,
+        CatalogListRolesByIdFilter::builder()
+            .role_ids(query.role_ids.as_deref())
+            .source_ids(source_ids.as_deref())
+            .provider_ids(provider_ids.as_deref())
+            .build(),
+        pagination_query,
+        catalog_state,
+    )
+    .await?;
+    Ok(roles)
+}
+
+async fn authorize_get_role_metadata<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<RoleId, Unresolved, CatalogRoleAction>,
+) -> Result<Arc<RoleMetadata>, AuthZError> {
+    let role_id = *event_ctx.user_provided_entity();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+
+    let role =
+        C::get_role_by_id_across_projects_cache_aware(role_id, CachePolicy::Use, catalog_state)
             .await?;
 
-        // -------------------- Business Logic --------------------
-        let description = request.description.filter(|d| !d.is_empty());
-
-        let mut t = C::Transaction::begin_write(context.v1_state.catalog).await?;
-        let role = C::update_role(
-            role_id,
-            &request.name,
-            description.as_deref(),
-            t.transaction(),
-        )
+    let role = authorizer
+        .require_role_action(request_metadata, Ok(role), action.clone())
         .await?;
-        if let Some(role) = role {
-            t.commit().await?;
-            Ok(role)
-        } else {
-            t.rollback().await?;
-            Err(ErrorModel::not_found(
-                format!("Role with id {role_id} not found."),
-                "RoleNotFound",
-                None,
-            )
-            .into())
-        }
+
+    let role_metadata = RoleMetadata {
+        id: role.id,
+        source_id: role.source_id().clone(),
+        provider_id: role.provider_id().clone(),
+        ident: role.ident.clone(),
+        name: role.name.clone(),
+        project_id: role.project_id.clone(),
+    };
+
+    Ok(role_metadata.into())
+}
+
+async fn authorize_search_role<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<ProjectId, Unresolved, CatalogProjectAction>,
+    request: SearchRoleRequest,
+) -> Result<crate::service::SearchRoleResponse, AuthZError> {
+    let project_id = event_ctx.user_provided_entity_arc_ref();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+    authorizer
+        .require_project_action(request_metadata, project_id, action.clone())
+        .await?;
+
+    // -------------------- Business Logic --------------------
+    let mut search = request.search;
+    if search.chars().count() > 64 {
+        search = search.chars().take(64).collect();
+    }
+    let result = C::search_role(project_id, &search, catalog_state).await?;
+    Ok(result)
+}
+
+async fn authorized_delete_role<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<RoleId, Unresolved, CatalogRoleAction>,
+    project_id: ArcProjectId,
+) -> Result<ArcRole, AuthZError> {
+    let role_id = *event_ctx.user_provided_entity();
+    let request_metadata = event_ctx.request_metadata();
+
+    let role = C::get_role_by_id_cache_aware(
+        &project_id,
+        role_id,
+        CachePolicy::Skip,
+        catalog_state.clone(),
+    )
+    .await;
+    let action = event_ctx.action();
+
+    let role = authorizer
+        .require_role_action(request_metadata, role, action.clone())
+        .await?;
+
+    if role.ident.is_system() {
+        return Err(DeleteRoleError::from(SystemRoleImmutable::new()).into());
+    }
+    reject_managed_role::<_, DeleteRoleError>(&authorizer, &role)?;
+
+    let mut t = C::Transaction::begin_write(catalog_state)
+        .await
+        .map_err::<DeleteRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    // Read the affected-user closure PRE-commit: the `ON DELETE CASCADE` on
+    // `delete_role` erases the `role_assignment`/`role_membership` rows, so after
+    // the delete this walk would return nothing. These are exactly the users whose
+    // effective-role set loses `role_id` (direct assignees ∪ descendant-closure
+    // assignees). Mirrors `delete_user`'s pre-commit/post-commit eviction.
+    let affected_users = C::affected_users_for_membership_edges_impl(&[role_id], t.transaction())
+        .await
+        .map_err::<DeleteRoleError, _>(Into::into)?;
+    C::delete_role(&project_id, role_id, t.transaction()).await?;
+    t.commit()
+        .await
+        .map_err::<DeleteRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+
+    // Post-commit: best-effort authz cleanup. `create_role`'s `require_no_relations`
+    // guard blocks reuse of the id, so a leftover edge can't grant access.
+    authorizer
+        .delete_role(request_metadata, role_id)
+        .await
+        .inspect_err(|e| {
+            tracing::error!(?e, "Failed to delete role from authorizer: {}", e.error);
+        })
+        .ok();
+
+    // Post-commit (infallible, in-memory): the role and its assignments are gone,
+    // so each affected user's effective-roles entry and the deleted role's own
+    // direct-user-assignee list are stale. No parent eviction — `ROLE_MEMBERS_CACHE`
+    // stores a role's user-assignees only, never its member-roles (see G2 in the
+    // cache-hardening notes).
+    role_assignments_cache::user_assignments_cache_invalidate_many(&affected_users).await;
+    role_assignments_cache::role_members_cache_invalidate(role_id).await;
+    // The cascade also erased this role's `role_membership` edges, so it is no longer an
+    // ancestor of anything nested beneath it — a set cached per role, not per user.
+    role_assignments_cache::role_ancestors_cache_invalidate_all();
+    Ok(role)
+}
+
+async fn authorize_update_role<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<RoleId, Unresolved, CatalogRoleAction>,
+    project_id: ArcProjectId,
+    request: UpdateRoleRequest,
+) -> Result<ArcRole, AuthZError> {
+    let role_id = *event_ctx.user_provided_entity();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+
+    let role = C::get_role_by_id_cache_aware(
+        &project_id,
+        role_id,
+        CachePolicy::Skip,
+        catalog_state.clone(),
+    )
+    .await;
+
+    let role = authorizer
+        .require_role_action(request_metadata, role, action.clone())
+        .await?;
+
+    if role.ident.is_system() {
+        return Err(UpdateRoleError::from(SystemRoleImmutable::new()).into());
+    }
+    reject_managed_role::<_, UpdateRoleError>(&authorizer, &role)?;
+
+    // -------------------- Business Logic --------------------
+    let description = request.description.filter(|d| !d.is_empty());
+
+    let mut t = C::Transaction::begin_write(catalog_state)
+        .await
+        .map_err::<UpdateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    let role = C::update_role(
+        &project_id,
+        role_id,
+        &request.name,
+        description.as_deref(),
+        t.transaction(),
+    )
+    .await?;
+    t.commit()
+        .await
+        .map_err::<UpdateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    Ok(role)
+}
+
+async fn authorize_update_role_source_system<A: Authorizer, C: CatalogStore>(
+    authorizer: A,
+    catalog_state: C::State,
+    event_ctx: &APIEventContext<RoleId, Unresolved, CatalogRoleAction>,
+    project_id: ArcProjectId,
+    request: UpdateRoleSourceSystemRequest,
+) -> Result<ArcRole, AuthZError> {
+    let role_id = *event_ctx.user_provided_entity();
+    let request_metadata = event_ctx.request_metadata();
+    let action = event_ctx.action();
+
+    let role = C::get_role_by_id_cache_aware(
+        &project_id,
+        role_id,
+        CachePolicy::Skip,
+        catalog_state.clone(),
+    )
+    .await;
+
+    let role = authorizer
+        .require_role_action(request_metadata, role, action.clone())
+        .await?;
+
+    if role.ident.is_system() {
+        return Err(UpdateRoleError::from(SystemRoleImmutable::new()).into());
+    }
+    // Reject rebinding a role that is *currently* owned by a configured role
+    // provider — its identity is the provider's to manage. (Rebinding *into* a
+    // managed/`system` namespace is rejected on the request in the handler.)
+    reject_managed_role::<_, UpdateRoleError>(&authorizer, &role)?;
+
+    // -------------------- Business Logic --------------------
+    let mut t = C::Transaction::begin_write(catalog_state)
+        .await
+        .map_err::<UpdateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+    // A source-system rebind changes the role's `RoleIdent` (provider_id/source_id),
+    // which is cached per row in every assignee's USER_ASSIGNMENTS closure
+    // (`AssignedRole.role_ident`) and in this role's ROLE_MEMBERS entry. External
+    // authorizers key on the ident, so without eviction those closures evaluate the
+    // stale binding until TTL. Mirror `authorized_delete_role`: read the affected-user
+    // closure pre-commit on the txn (so a failed read rolls the rebind back), evict
+    // post-commit. Unlike delete, the assignment/membership rows are updated (not
+    // cascade-deleted), so the set is identical pre- and post-commit. ROLE_CACHE is
+    // refreshed separately by the `role_updated` event the handler emits.
+    let affected_users = C::affected_users_for_membership_edges_impl(&[role_id], t.transaction())
+        .await
+        .map_err::<UpdateRoleError, _>(Into::into)?;
+    let role = C::set_role_source_system(&project_id, role_id, &request, t.transaction()).await?;
+    t.commit()
+        .await
+        .map_err::<UpdateRoleError, _>(|e| CatalogBackendError::new_unexpected(e.error).into())?;
+
+    role_assignments_cache::user_assignments_cache_invalidate_many(&affected_users).await;
+    role_assignments_cache::role_members_cache_invalidate(role_id).await;
+    // A rebind changes this role's ident, which is what an external authorizer names it by.
+    // Cached ancestor sets carry that ident per row, so they would keep publishing the old
+    // one — and a policy naming the new ident would match nothing.
+    role_assignments_cache::role_ancestors_cache_invalidate_all();
+    Ok(role)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{RoleProviderId, reject_managed_provider};
+
+    #[test]
+    fn reject_managed_provider_denies_system_and_configured_providers() {
+        let okta = RoleProviderId::try_new("okta").unwrap();
+        let entra = RoleProviderId::try_new("entra").unwrap();
+        let mut managed = HashSet::new();
+        managed.insert(okta.clone());
+
+        // `system` is reserved and always rejected, regardless of the managed set.
+        let system = RoleProviderId::try_new("system").unwrap();
+        assert!(reject_managed_provider(&system, &managed).is_err());
+        assert!(reject_managed_provider(&system, &HashSet::new()).is_err());
+
+        // A configured role provider's namespace is rejected.
+        assert!(reject_managed_provider(&okta, &managed).is_err());
+
+        // The native `lakekeeper` namespace and any unconfigured namespace stay
+        // writable (deny-list: only `system` + currently-configured providers).
+        assert!(reject_managed_provider(&RoleProviderId::lakekeeper(), &managed).is_ok());
+        assert!(reject_managed_provider(&entra, &managed).is_ok());
+        assert!(reject_managed_provider(&okta, &HashSet::new()).is_ok());
     }
 }

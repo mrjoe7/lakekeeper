@@ -1,3 +1,7 @@
+---
+description: "Connect Spark, Trino, StarRocks, DuckDB, Athena, Flink, PyIceberg and other query engines to Lakekeeper's Iceberg REST Catalog with per-user permissions."
+---
+
 # Query Engines
 
 In this page we document how query engines can be configured to connect to Lakekeeper. Please also check the documentation of your query engine to obtain additional information. All Query engines that support the Apache Iceberg REST Catalog (IRC) also support Lakekeeper.
@@ -11,7 +15,7 @@ For query engines shared by multiple users, Lakekeeper supports two architecture
 
 Shared query engines must use the same Identity Provider as Lakekeeper in both scenarios unless user-ids are mapped, for example in OPA.
 
-We are tracking open issues and missing features in query engines in a [Tracking Issue on Github](https://github.com/lakekeeper/lakekeeper/issues/399).
+We are tracking open issues and missing features in query engines in a [Tracking Issue on GitHub](https://github.com/lakekeeper/lakekeeper/issues/399).
 
 ## Generic Iceberg REST Clients
 
@@ -19,7 +23,81 @@ All Apache Iceberg REST clients are compatible with Lakekeeper, as Lakekeeper fu
 
 When using Lakekeeper with authentication enabled, remember that you can follow the approaches described at the beginning of this page: either use credentials specific to individual users or leverage OAuth2 token exchange for shared query engines. The authentication parameters typically include credential pairs, OAuth2 server URIs, and scopes as shown in the examples above.
 
-## <img src="/assets/trino.svg" width="30"> Trino
+<!-- Alias for the section's former id. Released docs and anything already
+     linking to `engines/#duckdb-wasm` must keep landing here. -->
+<a id="duckdb-wasm"></a>
+
+## LoQE: Local Query Engine (DuckDB WASM) { #loqe .engine data-icon="lakekeeper" }
+
+**LoQE** (Local Query Engine) is Lakekeeper's built-in SQL console. It runs DuckDB WASM inside your browser, so you can browse a Warehouse and query it straight from the Lakekeeper UI — nothing to install, no engine to deploy. It ships pre-configured with the Lakekeeper UI and is part of the open-source console.
+
+<figure markdown="span">
+  ![The LoQE console in the Lakekeeper UI, running a SQL query against a Warehouse](../../assets/LoQE.png){ width="100%" }
+  <figcaption>LoQE: browse namespaces and tables, run SQL, then view the result as a table or chart — or export it as CSV.</figcaption>
+</figure>
+
+Because the queries execute in your browser rather than on the server, your S3 storage must return a CORS policy that allows requests from the Lakekeeper origin. See the [CORS Configuration guide](storage.md#cors-configuration) for setup instructions.
+
+## DuckDB { .engine data-icon="duckdb" }
+
+Basic setup in DuckDB:
+
+```python
+import duckdb
+
+CATALOG_URL = "http://localhost:8181/catalog"
+WAREHOUSE = "my_warehouse"
+
+# Required if OAuth2 authentication is enabled for Lakekeeper
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
+KEYCLOAK_TOKEN_ENDPOINT = "http://your-idp/realms/iceberg/protocol/openid-connect/token"
+
+# Install and load Iceberg extension
+duckdb.sql("INSTALL ICEBERG;")
+duckdb.sql("LOAD ICEBERG;")
+
+# Create secret for authentication
+duckdb.sql(f"""
+    CREATE SECRET lakekeeper_secret (
+        TYPE ICEBERG,
+        CLIENT_ID '{CLIENT_ID}',
+        CLIENT_SECRET '{CLIENT_SECRET}',
+        OAUTH2_SCOPE 'lakekeeper',
+        OAUTH2_SERVER_URI '{KEYCLOAK_TOKEN_ENDPOINT}'
+    )
+""")
+
+# Attach catalog
+duckdb.sql(f"""
+    ATTACH '{WAREHOUSE}' AS my_datalake (
+        TYPE ICEBERG,
+        ENDPOINT '{CATALOG_URL}',
+        SECRET lakekeeper_secret
+    )
+""")
+
+# Query tables
+duckdb.sql("SELECT * FROM my_datalake.my_namespace.my_table").show()
+```
+
+DuckDB requests vended credentials by default and does not support remote signing. If your warehouse has `sts-enabled: false`, add an S3 secret so DuckDB can reach the storage itself:
+
+```python
+duckdb.sql("""
+    CREATE SECRET storage_secret (
+        TYPE S3,
+        KEY_ID 'my-access-key',
+        SECRET 'my-secret-key',
+        ENDPOINT 's3.my-domain.com',
+        URL_STYLE 'path'
+    )
+""")
+```
+
+For a local or test storage that only serves plaintext HTTP, add `USE_SSL false` to the secret.
+
+## Trino { .engine data-icon="trino" }
 
 The following docker compose examples are available for trino:
 
@@ -47,7 +125,7 @@ Basic setup in trino:
         "iceberg.rest-catalog.vended-credentials-enabled" = 'true',
         "iceberg.unique-table-location" = 'true',
         "s3.region" = '<AWS Region to use. For S3-compatible storage use a non-existent AWS region, such as local>',
-        "fs.native-s3.enabled" = 'true'
+        "fs.s3.enabled" = 'true'
         -- Required for some S3-compatible storages:
         "s3.path-style-access" = 'true',
         "s3.endpoint" = '<Custom S3 endpoint>',
@@ -62,7 +140,7 @@ Basic setup in trino:
 
 === "Azure"
 
-    Trino does not support vended-credentials for Azure, so that Storage Account credentials must be specified in Trino. If you are interested in vended-credentials for Azure, please up-vote the [Trino Issue](https://github.com/trinodb/trino/issues/23238).
+    Trino supports vended-credentials from Iceberg REST Catalogs for Azure, so that no Storage Account credentials are required when creating the Catalog.
 
     Please find additional configuration Options in the [Trino docs](https://trino.io/docs/current/object-storage/file-system-azure.html#object-storage-file-system-azure--page-root).
 
@@ -74,7 +152,7 @@ Basic setup in trino:
         "iceberg.rest-catalog.warehouse" = '<Name of the Warehouse in Lakekeeper>',
         "iceberg.rest-catalog.nested-namespace-enabled" = 'true',
         "iceberg.unique-table-location" = 'true',
-        "fs.native-azure.enabled" = 'true',
+        "fs.azure.enabled" = 'true',
         "azure.auth-type" = 'OAUTH',
         "azure.oauth.client-id" = '<Client-ID for an Application with Storage Account access>',
         "azure.oauth.secret" = '<Client-Secret>',
@@ -91,7 +169,7 @@ Basic setup in trino:
 
 === "GCS"
 
-    Trino does not support vended-credentials for GCS, so that GCS credentials must be specified in Trino. If you are interested in vended-credentials for GCS, please up-vote the [Trino Issue](https://github.com/trinodb/trino/issues/24518).
+    Trino supports vended-credentials from Iceberg REST Catalogs for GCS, so that no GCS credentials are required when creating the Catalog.
 
     Please find additional configuration Options in the [Trino docs](https://trino.io/docs/current/object-storage/file-system-gcs.html).
 
@@ -104,7 +182,7 @@ Basic setup in trino:
         "iceberg.rest-catalog.warehouse" = '<Name of the Warehouse in Lakekeeper>',
         "iceberg.rest-catalog.nested-namespace-enabled" = 'true',
         "iceberg.unique-table-location" = 'true',
-        "fs.native-gcs.enabled" = 'true',
+        "fs.gcs.enabled" = 'true',
         "gcs.project-id" = '<Identifier for the project on Google Cloud Storage>',
         "gcs.json-key" = '<Your Google Cloud service account key in JSON format>',
         -- Required Parameters if OAuth2 authentication is enabled for Lakekeeper:
@@ -116,7 +194,100 @@ Basic setup in trino:
     )
     ```
 
-## <img src="/assets/spark.svg" width="40" background-color="red"> Spark
+## Starburst { .engine data-icon="starburst" }
+
+If [Soft-Deletion](./concepts.md#soft-deletion) is enabled in Lakekeeper, make sure to set `"iceberg.unique-table-location" = 'true'`, to ensure that tables can be recreated in new locations while their dropped counterparts are waiting for expiration.
+
+As Lakekeeper supports nesting of namespaces, we recommend to set `"iceberg.rest-catalog.nested-namespace-enabled" = 'true'`.
+
+Basic setup in Starburst:
+
+=== "S3-Compatible"
+
+    Starburst supports vended-credentials from Iceberg REST Catalogs for S3, so that no S3 credentials are required when creating the Catalog.
+
+    Please find additional configuration Options in the [Starburst docs](https://docs.starburst.io/latest/object-storage/file-system-s3.html).    
+
+    ```sql
+    CREATE CATALOG lakekeeper USING iceberg
+    WITH (
+        "iceberg.catalog.type" = 'rest',
+        "iceberg.rest-catalog.uri" = '<Lakekeeper Catalog URI, i.e. http://localhost:8181/catalog>',
+        "iceberg.rest-catalog.warehouse" = '<Name of the Warehouse in Lakekeeper>',
+        "iceberg.rest-catalog.nested-namespace-enabled" = 'true',
+        "iceberg.rest-catalog.vended-credentials-enabled" = 'true',
+        "iceberg.unique-table-location" = 'true',
+        "s3.region" = '<AWS Region to use. For S3-compatible storage use a non-existent AWS region, such as local>',
+        "fs.s3.enabled" = 'true'
+        -- Required for some S3-compatible storages:
+        "s3.path-style-access" = 'true',
+        "s3.endpoint" = '<Custom S3 endpoint>',
+        -- Required Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.security" = 'OAUTH2',
+        "iceberg.rest-catalog.oauth2.credential" = '<Client-ID>:<Client-Secret>',
+        "iceberg.rest-catalog.oauth2.server-uri" = '<Token Endpoint of your IdP, i.e. http://keycloak:8080/realms/iceberg/protocol/openid-connect/token>',
+        -- Optional Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.oauth2.scope" = '<Scopes to request from the IdP, i.e. lakekeeper>'
+    )
+    ```
+
+=== "Azure"
+
+    Starburst supports vended-credentials from Iceberg REST Catalogs for Azure, so that no Storage Account credentials are required when creating the Catalog.
+
+    Please find additional configuration Options in the [Starburst docs](https://docs.starburst.io/latest/object-storage/file-system-azure.html).
+
+    ```sql
+    CREATE CATALOG lakekeeper USING iceberg
+    WITH (
+        "iceberg.catalog.type" = 'rest',
+        "iceberg.rest-catalog.uri" = '<Lakekeeper Catalog URI, i.e. http://localhost:8181/catalog>',
+        "iceberg.rest-catalog.warehouse" = '<Name of the Warehouse in Lakekeeper>',
+        "iceberg.rest-catalog.nested-namespace-enabled" = 'true',
+        "iceberg.unique-table-location" = 'true',
+        "fs.azure.enabled" = 'true',
+        "azure.auth-type" = 'OAUTH',
+        "azure.oauth.client-id" = '<Client-ID for an Application with Storage Account access>',
+        "azure.oauth.secret" = '<Client-Secret>',
+        "azure.oauth.tenant-id" = '<Tenant-ID>',
+        "azure.oauth.endpoint" = 'https://login.microsoftonline.com/<Tenant-ID>/v2.0',
+        -- Required Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.security" = 'OAUTH2',
+        "iceberg.rest-catalog.oauth2.credential" = '<Client-ID>:<Client-Secret>', -- Client-ID used to access Lakekeeper. Typically different to `azure.oauth.client-id`.
+        "iceberg.rest-catalog.oauth2.server-uri" = '<Token Endpoint of your IdP, i.e. http://keycloak:8080/realms/iceberg/protocol/openid-connect/token>',
+        -- Optional Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.oauth2.scope" = '<Scopes to request from the IdP, i.e. lakekeeper>'
+    )
+    ```
+
+=== "GCS"
+
+    Starburst supports vended-credentials from Iceberg REST Catalogs for GCS, so that no GCS credentials are required when creating the Catalog.
+
+    Please find additional configuration Options in the [Starburst docs](https://docs.starburst.io/latest/object-storage/file-system-gcs.html).
+
+
+    ```sql
+    CREATE CATALOG lakekeeper USING iceberg
+    WITH (
+        "iceberg.catalog.type" = 'rest',
+        "iceberg.rest-catalog.uri" = '<Lakekeeper Catalog URI, i.e. http://localhost:8181/catalog>',
+        "iceberg.rest-catalog.warehouse" = '<Name of the Warehouse in Lakekeeper>',
+        "iceberg.rest-catalog.nested-namespace-enabled" = 'true',
+        "iceberg.unique-table-location" = 'true',
+        "fs.gcs.enabled" = 'true',
+        "gcs.project-id" = '<Identifier for the project on Google Cloud Storage>',
+        "gcs.json-key" = '<Your Google Cloud service account key in JSON format>',
+        -- Required Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.security" = 'OAUTH2',
+        "iceberg.rest-catalog.oauth2.credential" = '<Client-ID>:<Client-Secret>', -- Client-ID used to access Lakekeeper. Typically different to `azure.oauth.client-id`.
+        "iceberg.rest-catalog.oauth2.server-uri" = '<Token Endpoint of your IdP, i.e. http://keycloak:8080/realms/iceberg/protocol/openid-connect/token>',
+        -- Optional Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        "iceberg.rest-catalog.oauth2.scope" = '<Scopes to request from the IdP, i.e. lakekeeper>'
+    )
+    ```
+
+## Spark { .engine data-icon="spark" }
 
 The following docker compose examples are available for spark:
 
@@ -135,7 +306,7 @@ Basic setup in spark:
 
     pyspark_version = pyspark.__version__
     pyspark_version = ".".join(pyspark_version.split(".")[:2]) # Strip patch version
-    iceberg_version = "1.8.1"
+    iceberg_version = "1.10.1"
 
     # Disable the jars which are not needed
     spark_jars_packages = (
@@ -172,7 +343,7 @@ Basic setup in spark:
     spark.sql(f"USE {catalog_name}")
     ```
 
-## <img src="/assets/python.svg" width="30"> PyIceberg
+## PyIceberg { .engine data-icon="python" }
 
 ```python
 import pyiceberg.catalog
@@ -195,20 +366,20 @@ catalog = pyiceberg.catalog.rest.RestCatalog(
 print(catalog.list_namespaces())
 ```
 
-## <img src="/assets/athena.svg" width="30"> AWS Athena (Spark)
+## AWS Athena (Spark) { .engine data-icon="athena" }
 
 Amazon Athena is a serverless query service that allows you to use SQL or PySpark to query data in Lakekeeper without provisioning infrastructure. The following steps demonstrate how to connect Athena PySpark with Lakekeeper.
 
 **1. Create an Apache Spark workgroup in the AWS Athena console:**
 
-* Go to the Athena console > Administration > Workgroups
-* Create a workgroup with Apache Spark as the analytics engine
+- Go to the Athena console > Administration > Workgroups
+- Create a workgroup with Apache Spark as the analytics engine
 
 **2. Create a new PySpark notebook:**
 
-* Give your notebook a name
-* Select your Spark workgroup
-* Configure JSON properties with Lakekeeper catalog settings
+- Give your notebook a name
+- Select your Spark workgroup
+- Configure JSON properties with Lakekeeper catalog settings
 
     ```json
     {
@@ -232,8 +403,7 @@ spark.sql("select count(*) from lakekeeper.<namespace>.<table>").show()
 
 Amazon Athena has Iceberg pre-installed, so no additional package installations are required.
 
-
-## <img src="/assets/starrocks.svg" width="30"> Starrocks
+## Starrocks { .engine data-icon="starrocks" }
 
 Starrocks is improving the Iceberg REST support quickly. This guide is written for Starrocks 3.3, which does not support vended-credentials for AWS S3 with custom endpoints.
 
@@ -243,7 +413,6 @@ The following docker compose examples are available for starrocks:
 - [`Access-Control`](https://github.com/lakekeeper/lakekeeper/tree/main/examples/access-control): Lakekeeper secured with OAuth2, single technical user for starrocks
 
 **Note:** If you are using an IdP like Keycloak, in order for Starrocks to be able to authenticate with Lakekeeper you must ensure the client you are connecting to has "Standard Token Exchange" (or equivalent) enabled. Otherwise Starrocks will be unable to refresh access tokens and you will get authentication errors when the initial access token created by the `CREATE EXTERNAL CATALOG` command expires.
-
 
 === "S3-Compatible"
 
@@ -288,7 +457,7 @@ The following docker compose examples are available for starrocks:
     -- You can also create tables, INSERT INTO them, and query them just like you would any other SQL database.
     ```
 
-## <img src="/assets/olake.svg" width="30"> OLake
+## OLake { .engine data-icon="olake" }
 
 OLake is an open-source, quick and scalable tool for replicating Databases to Apache Iceberg or Data Lakehouses written in Go. Visit the [Olake Iceberg Documentation](https://olake.io/docs/writers/iceberg/catalog/rest#rest-catalog) for the full documentation, and additional information on Olake.
 
@@ -307,3 +476,84 @@ OLake is an open-source, quick and scalable tool for replicating Databases to Ap
     }
     ```
 
+## RisingWave { .engine data-icon="risingwave" }
+
+[RisingWave](https://www.risingwave.com/) is a distributed SQL streaming database that is wire-compatible with PostgreSQL, designed for real-time data ingestion, processing, and querying. Unlike many other query engines that use a `CATALOG` abstraction, RisingWave connects to Lakekeeper through a `CONNECTION` object, which allows it to use Iceberg tables for sources, sinks, and internal tables.
+
+For a hands-on example, a Docker Compose setup is available in the [RisingWave repository](https://github.com/risingwavelabs/risingwave). You can find detailed deployment instructions in the [official RisingWave documentation](https://docs.risingwave.com/iceberg/catalogs/lakekeeper#deploy-with-docker).
+
+Once you have both services running, you can create a `CONNECTION` in RisingWave to connect to Lakekeeper. The following is an example configuration. As parameters may change over time, please refer to the [official RisingWave documentation](https://docs.risingwave.com/iceberg/catalogs/lakekeeper) for the most up-to-date and complete configuration options.
+
+```sql
+CREATE CONNECTION lakekeeper_catalog_conn
+WITH (
+    type = 'iceberg',
+    catalog.type = 'rest',
+    catalog.uri = 'http://lakekeeper:8181/catalog/',
+    warehouse.path = 'risingwave-warehouse',
+    s3.access.key = 'hummockadmin',
+    s3.secret.key = 'hummockadmin',
+    s3.path.style.access = 'true',
+    s3.endpoint = 'http://minio-0:9301',
+    s3.region = 'us-east-1'
+);
+```
+
+After creating the connection, you must set it as the default for your session to create and query internal Iceberg tables. The `SET` command applies the change to the current session only, while `ALTER SYSTEM` makes it persistent across restarts.
+
+```sql
+-- Set for the current session
+SET iceberg_engine_connection = 'public.lakekeeper_catalog_conn';
+
+-- Set persistent for the system
+ALTER SYSTEM SET iceberg_engine_connection = 'public.lakekeeper_catalog_conn';
+```
+
+## Apache Fluss { .engine data-icon="fluss" }
+
+[Apache Fluss](https://fluss.apache.org/) is a streaming storage system that can tier streaming data into Iceberg tables via its [Streaming Lakehouse](https://fluss.apache.org/docs/streaming-lakehouse/overview/) feature. Lakekeeper can be used as the Iceberg REST catalog for this tiering, so that tiered data is immediately queryable by any Iceberg-compatible engine through Lakekeeper. For details on how Fluss integrates with Iceberg specifically, see the [Fluss Iceberg integration docs](https://fluss.apache.org/docs/streaming-lakehouse/integrate-data-lakes/iceberg/).
+
+To point Fluss at Lakekeeper, set the following properties in `server.yaml`. Fluss strips the `datalake.iceberg.` prefix and passes the remainder as native Iceberg REST catalog properties. The snippet below assumes Lakekeeper is running without authentication; if authentication is enabled, additional properties need to be set (see f. ex. [Spark](#spark)).
+
+```yaml
+datalake.format: iceberg
+datalake.iceberg.type: rest
+datalake.iceberg.uri: http://<lakekeeper-host>:<lakekeeper-port>/catalog
+datalake.iceberg.warehouse: <warehouse-name>
+```
+
+A Docker Compose example including Fluss, the tiering service, and Lakekeeper is available in the `examples/fluss` directory of the Lakekeeper repository.
+
+## Firebolt { .engine data-icon="firebolt" }
+
+[Firebolt](https://www.firebolt.io/) is a high-performance, scale-out analytical database. [Firebolt Core](https://github.com/firebolt-db/firebolt-core) is the free, self-hosted edition packaged as a single Docker image. Both connect to Lakekeeper through the same `CREATE LOCATION` syntax.
+
+Firebolt supports vended-credentials from Iceberg REST Catalogs for S3, so no S3 credentials need to be configured on Firebolt. This works for both AWS S3 and self-hosted S3-compatible object stores (e.g. MinIO, RustFS).
+
+=== "S3-Compatible"
+
+    ```sql
+    CREATE LOCATION lakekeeper
+    WITH
+        SOURCE = ICEBERG
+        CATALOG = REST
+        CATALOG_OPTIONS = (
+            URL = '<Lakekeeper Catalog URI, i.e. https://lakekeeper.example.com/catalog>'
+            WAREHOUSE = '<Name of the Warehouse in Lakekeeper>'
+            NAMESPACE = '<Namespace identifier>'
+            TABLE = '<Table name>'
+        )
+        -- Required Parameters if OAuth2 authentication is enabled for Lakekeeper:
+        CREDENTIALS = (
+            OAUTH_CLIENT_ID = '<Client-ID>'
+            OAUTH_CLIENT_SECRET = '<Client-Secret>'
+            OAUTH_SERVER_URL = '<Token Endpoint of your IdP, i.e. https://keycloak.example.com/realms/iceberg/protocol/openid-connect/token>'
+            -- Optional:
+            OAUTH_SCOPE = '<Scopes to request from the IdP, i.e. lakekeeper>'
+        );
+
+    -- Read the table
+    SELECT * FROM READ_ICEBERG(LOCATION => 'lakekeeper');
+    ```
+
+Refer to the [Firebolt CREATE LOCATION (Iceberg) docs](https://docs.firebolt.io/reference-sql/commands/data-definition/create-location-iceberg) for additional options.

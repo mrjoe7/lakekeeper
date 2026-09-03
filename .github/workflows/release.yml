@@ -38,7 +38,7 @@ jobs:
         run: |
           echo "Repository name: $GITHUB_REPOSITORY"
           echo "Branch name: $GITHUB_REF"
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -73,22 +73,14 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             name: lakekeeper-x86_64-unknown-linux-gnu.tar.gz
-            docker-build: false
 
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-24.04
-            name: lakekeeper-x86_64-unknown-linux-musl.tar.gz
-            docker-build: true
-
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-            name: lakekeeper-aarch64-unknown-linux-musl.tar.gz
-            docker-build: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            name: lakekeeper-aarch64-unknown-linux-gnu.tar.gz
 
           - target: aarch64-apple-darwin
             os: macos-14
             name: lakekeeper-aarch64-apple-darwin.tar.gz
-            docker-build: false
 
     #          - target: x86_64-pc-windows-msvc
     #            os: windows-latest
@@ -106,27 +98,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     env:
-      RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      RUSTFLAGS: --cfg tracing_unstable -D warnings
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        if: matrix.docker-build == false
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           target: ${{ matrix.target }}
           cache: false
 
       - name: Setup node
-        if: matrix.docker-build == false
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
-          node-version: 23
+          node-version: 24
 
       - name: Build [Cargo]
-        if: matrix.docker-build == false
         run: cargo build --all-features --release --locked --target ${{ matrix.target }}
 
       #      - name: Prepare artifacts [Windows]
@@ -136,24 +127,6 @@ jobs:
       #          7z a ../../../${{ matrix.name }} lakekeeper.exe
       #          cd -
 
-      - name: Prepare Docker [Docker build]
-        if: matrix.docker-build == true
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build Docker Image [Docker Build]
-        if: matrix.docker-build == true
-        run: |
-          DOCKER_BUILDKIT=1 docker build -t localhost/build-lakekeeper:latest \
-            -f docker-build/build-with-alpine.Dockerfile .
-
-      - name: Build [Docker Build]
-        if: matrix.docker-build == true
-        run: |
-          docker run \
-            -w /build --mount type=bind,src=$(pwd),target=/build \
-            localhost/build-lakekeeper:latest \
-            cargo build --release --all-features --locked --target ${{ matrix.target }}
-
       - name: Prepare artifacts [-nix]
         if: matrix.os != 'windows-latest'
         run: |
@@ -162,7 +135,7 @@ jobs:
           cd -
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bin-${{ matrix.name }}
           path: ${{ matrix.name }}
@@ -189,10 +162,12 @@ jobs:
           - 5432:5432
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: List Artifacts
         run: ls -lh
@@ -202,19 +177,27 @@ jobs:
           cd bin-lakekeeper-x86_64-unknown-linux-gnu.tar.gz
           tar xzvf lakekeeper-x86_64-unknown-linux-gnu.tar.gz
           cd -
-          cd bin-lakekeeper-aarch64-unknown-linux-musl.tar.gz
-          tar xzvf lakekeeper-aarch64-unknown-linux-musl.tar.gz
+          cd bin-lakekeeper-aarch64-unknown-linux-gnu.tar.gz
+          tar xzvf lakekeeper-aarch64-unknown-linux-gnu.tar.gz
           ls -Rlh
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
 
       - name: Docker info
         run: docker info
 
+      # Builds two full images (amd64 + arm64); reclaim preinstalled toolchains
+      # we don't use to avoid "no space left on device" on hosted runners.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          docker-images: false # we build and save Docker images in this job
+          large-packages: false # apt purge is slow; the toolchain dirs free enough
+
       - name: Build Docker image (amd64)
         run: |
-          DOCKER_BUILDKIT=1 docker build -t localhost/lakekeeper-local:amd64 \
+          DOCKER_BUILDKIT=1 docker build --provenance=false -t localhost/lakekeeper-local:amd64 \
             -f docker/bin.Dockerfile \
             --build-arg "ARCH=amd64" \
             --build-arg "EXPIRES=${{ needs.release_please.outputs.releases_created == 'true' && 'Never' || '4w' }}" \
@@ -223,16 +206,16 @@ jobs:
 
       - name: Build Docker image (arm64)
         run: |
-          DOCKER_BUILDKIT=1 docker build \
+          DOCKER_BUILDKIT=1 docker build --provenance=false \
             --platform linux/arm64 -t localhost/lakekeeper-local:arm64 \
             -f docker/bin.Dockerfile \
             --build-arg "ARCH=arm64" \
             --build-arg "EXPIRES=${{ needs.release_please.outputs.releases_created == 'true' && 'Never' || '4w' }}" \
-            --build-arg "BIN=bin-lakekeeper-aarch64-unknown-linux-musl.tar.gz/lakekeeper" .
+            --build-arg "BIN=bin-lakekeeper-aarch64-unknown-linux-gnu.tar.gz/lakekeeper" .
           docker save -o /tmp/docker-lakekeeper-arm64.tar localhost/lakekeeper-local:arm64
 
       - name: Save Docker
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: docker-lakekeeper
           path: /tmp/docker-lakekeeper-*.tar
@@ -253,13 +236,15 @@ jobs:
             arch: arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
 
       - name: Docker info
         run: docker info
@@ -272,10 +257,9 @@ jobs:
       - name: Test Docker
         run: |
           cd tests
-          docker compose run --quiet-pull spark /opt/entrypoint.sh bash -c "cd /opt/tests && bash run_all.sh"
+          bash run_default.sh
         env:
           LAKEKEEPER_TEST__SERVER_IMAGE: localhost/lakekeeper-local:${{ matrix.arch }}
-          LAKEKEEPER_TEST__SPARK_IMAGE: apache/spark:3.5.6-java17-python3
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -286,7 +270,7 @@ jobs:
 
       - name: Dump docker logs on failure
         if: failure()
-        uses: jwalton/gh-docker-logs@2741064ab9d7af54b0b1ffb6076cf64c16f0220e
+        uses: jwalton/gh-docker-logs@2741064ab9d7af54b0b1ffb6076cf64c16f0220e # v2.2.2
 
   debug:
     name: Debug Artifacts
@@ -297,7 +281,7 @@ jobs:
       - release_please
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: List Artifacts
         run: ls -Rlh
@@ -314,14 +298,14 @@ jobs:
         run: echo ${{ needs.release_please.outputs.tag_name }}
 
       - name: Test Login to Quay.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           registry: quay.io
           username: lakekeeper+github
           password: ${{ secrets.QUAY_LAKEKEEPER_PASSWORD }}
 
       - name: Test Login to Dockerhub
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
@@ -334,20 +318,19 @@ jobs:
       - build-binary
       - release_please
       - test-docker
-    if: ${{ needs.release_please.outputs.releases_created != 'true' }} && github.ref == 'refs/heads/main'
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Login to Quay.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           registry: quay.io
           username: lakekeeper+github
           password: ${{ secrets.QUAY_LAKEKEEPER_PASSWORD }}
 
       - name: Login to Dockerhub
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
@@ -390,7 +373,7 @@ jobs:
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Publish Release
         run: gh release edit ${{ needs.release_please.outputs.tag_name }} --draft=false --repo=lakekeeper/lakekeeper
@@ -398,7 +381,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build | Add Artifacts to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: bin-lakekeeper-*/lakekeeper-*
           tag_name: ${{ needs.release_please.outputs.tag_name }}
@@ -414,17 +397,17 @@ jobs:
     if: ${{ needs.release_please.outputs.releases_created == 'true' }}
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Login to Quay.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           registry: quay.io
           username: lakekeeper+github
           password: ${{ secrets.QUAY_LAKEKEEPER_PASSWORD }}
 
       - name: Login to Dockerhub
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}

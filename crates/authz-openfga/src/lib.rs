@@ -9,12 +9,24 @@
 
 use std::{str::FromStr as _, sync::LazyLock};
 
+// Turns the one undiagnosable feature combination into a directive error. `api_doc` is a
+// trait requirement under `lakekeeper/open-api` but is implemented here under *this*
+// crate's `open-api`, and Cargo cannot propagate a feature upward to keep them in step.
+// This import resolves only while lakekeeper's `open-api` is also off; with it on and
+// ours off it fails on a name that states the fix, instead of "missing `api_doc`"
+// pointing at an implementation that is right there.
+#[cfg(not(feature = "open-api"))]
+const _: Option<lakekeeper::enable_the_open_api_feature_of_your_authorizer_crate_too::Marker> =
+    None;
+
 pub use authorizer::OpenFGAAuthorizer;
+#[cfg(any(test, feature = "test-utils"))]
+pub use client::new_authorizer_in_empty_store_from_default_config;
 pub use client::{
-    new_authorizer_from_default_config, new_client_from_default_config, BearerOpenFGAAuthorizer,
-    ClientCredentialsOpenFGAAuthorizer, UnauthenticatedOpenFGAAuthorizer,
+    BearerOpenFGAAuthorizer, ClientCredentialsOpenFGAAuthorizer, UnauthenticatedOpenFGAAuthorizer,
+    new_authorizer_from_default_config, new_client_from_default_config,
 };
-pub(crate) use error::{OpenFGAError, OpenFGAResult};
+pub(crate) use error::{OpenFGAError, OpenFGAResult, ParseOpenFgaEntityError};
 use openfga_client::migration::AuthorizationModelVersion;
 
 mod api;
@@ -24,13 +36,20 @@ mod client;
 mod config;
 mod entities;
 pub mod error;
+mod grant;
 mod health;
 mod migration;
 mod models;
+mod reconcile;
 mod relations;
+mod tuples;
 
 pub use config::CONFIG;
 pub use migration::migrate;
+pub use reconcile::{
+    RECONCILE_LOCK_KEY, RebuildReport, ReconcileMode, ReconcileReport,
+    rebuild_hierarchy_tuples_from_catalog, reconcile_hierarchy_tuples_from_catalog,
+};
 
 const MAX_TUPLES_PER_WRITE: i32 = 100;
 
@@ -72,6 +91,10 @@ pub enum FgaType {
     Table,
     #[strum(serialize = "lakekeeper_view")]
     View,
+    #[strum(serialize = "lakekeeper_generic_table")]
+    GenericTable,
+    #[strum(serialize = "lakekeeper_catalog_tag")]
+    Tag,
     ModelVersion,
     AuthModelId,
 }

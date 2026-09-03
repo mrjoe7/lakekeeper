@@ -24,18 +24,21 @@ pub mod v1 {
 
     pub use self::{
         namespace::{ListNamespacesQuery, NamespaceParameters, PaginationQuery},
-        tables::{DataAccess, DataAccessMode, ListTablesQuery, TableParameters},
+        tables::{
+            DataAccess, DataAccessMode, ListTablesQuery, LoadTableResultOrNotModified,
+            TableParameters,
+        },
         views::ViewParameters,
     };
     pub use crate::{
         api::{
-            iceberg::types::*, ApiContext, CatalogConfig, CommitTableRequest, CommitTableResponse,
+            ApiContext, CatalogConfig, CommitTableRequest, CommitTableResponse,
             CommitTransactionRequest, CommitViewRequest, CreateNamespaceRequest,
             CreateNamespaceResponse, CreateTableRequest, CreateViewRequest, ErrorModel,
             GetNamespaceResponse, IcebergErrorResponse, ListNamespacesResponse, ListTablesResponse,
             LoadTableResult, LoadViewResult, OAuthTokenRequest, OAuthTokenResponse,
             RegisterTableRequest, RenameTableRequest, Result, UpdateNamespacePropertiesRequest,
-            UpdateNamespacePropertiesResponse,
+            UpdateNamespacePropertiesResponse, iceberg::types::*,
         },
         request_metadata::RequestMetadata,
     };
@@ -164,6 +167,15 @@ pub mod v1 {
             }
         }
 
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                entities: HashMap::new(),
+                next_page_tokens: Vec::new(),
+                ordering: Vec::new(),
+            }
+        }
+
         pub fn insert(&mut self, key: T, value: V, next_page_token: String) {
             if self.entities.insert(key.clone(), value).is_some() {
                 let position = self
@@ -210,7 +222,7 @@ pub mod v1 {
                 })
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         pub fn remove(&mut self, key: &T) -> Option<V> {
             let (idx, _) = self.ordering.iter().find_position(|item| **item == *key)?;
             self.ordering.remove(idx);
@@ -218,13 +230,15 @@ pub mod v1 {
             self.entities.remove(key)
         }
 
-        #[cfg(test)]
-        pub(crate) fn into_hashmap(self) -> HashMap<T, V> {
+        #[cfg(any(test, feature = "test-utils"))]
+        #[must_use]
+        pub fn into_hashmap(self) -> HashMap<T, V> {
             self.entities
         }
 
-        #[cfg(test)]
-        pub(crate) fn next_token(&self) -> Option<&str> {
+        #[cfg(any(test, feature = "test-utils"))]
+        #[must_use]
+        pub fn next_token(&self) -> Option<&str> {
             self.next_page_tokens.last().map(String::as_str)
         }
 
@@ -286,6 +300,25 @@ static SUPPORTED_ENDPOINTS: LazyLock<Vec<String>> = LazyLock::new(|| {
 
 pub(crate) fn supported_endpoints() -> &'static [String] {
     &SUPPORTED_ENDPOINTS
+}
+
+/// [`supported_endpoints`] plus the spec's per-table signing route.
+///
+/// Signing is not in the common list because it is only reachable on S3
+/// warehouses that allow remote signing. It has to be advertised somewhere
+/// though: the route is the endpoint `remote-signing-config` implies, and a
+/// client that gates calls on this list would otherwise never make one.
+pub(crate) fn supported_endpoints_with_signing() -> &'static [String] {
+    static ENDPOINTS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut endpoints = SUPPORTED_ENDPOINTS.clone();
+        endpoints.push(
+            crate::api::endpoints::SignEndpoint::S3RequestByTableName
+                .as_http_route()
+                .replace(" /catalog/", " /"),
+        );
+        endpoints
+    });
+    &ENDPOINTS
 }
 
 #[cfg(test)]

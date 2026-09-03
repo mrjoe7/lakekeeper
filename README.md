@@ -6,7 +6,6 @@
 [![Helm Chart](https://img.shields.io/badge/Helm-0F1689?style=for-the-badge&logo=Helm&labelColor=0F1689)](https://github.com/lakekeeper/lakekeeper-charts/tree/main/charts/lakekeeper)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/lakekeeper&color=3f6ec6&labelColor=&style=for-the-badge&logoColor=white)](https://artifacthub.io/packages/helm/lakekeeper/lakekeeper)
 
-
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Unittests](https://github.com/lakekeeper/lakekeeper/actions/workflows/unittests.yml/badge.svg)](https://github.com/lakekeeper/lakekeeper/actions/workflows/unittests.yml)
 [![Spark Integration](https://github.com/lakekeeper/lakekeeper/actions/workflows/spark-integration.yml/badge.svg)](https://github.com/lakekeeper/lakekeeper/actions/workflows/spark-integration.yml)
@@ -14,10 +13,9 @@
 [![Trino Integration](https://github.com/lakekeeper/lakekeeper/actions/workflows/trino-integration.yml/badge.svg)](https://github.com/lakekeeper/lakekeeper/actions/workflows/trino-integration.yml)
 [![Starrocks Integration](https://github.com/lakekeeper/lakekeeper/actions/workflows/starrocks-integration.yml/badge.svg)](https://github.com/lakekeeper/lakekeeper/actions/workflows/starrocks-integration.yml)
 
-
 Please visit [https://docs.lakekeeper.io](https://docs.lakekeeper.io) for Documentation!
 
-This is Lakekeeper: An Apache-Licensed, **secure**, **fast** and **easy to use**  implementation of the [Apache Iceberg](https://iceberg.apache.org/) REST Catalog specification based on [apache/iceberg-rust](https://github.com/apache/iceberg-rust). If you have questions, feature requests or just want a chat, we are hanging around in [Discord](https://discord.gg/jkAGG8p93B)!
+This is Lakekeeper: An Apache-Licensed, **secure**, **fast** and **easy-to-use**  implementation of the [Apache Iceberg](https://iceberg.apache.org/) REST Catalog specification based on [apache/iceberg-rust](https://github.com/apache/iceberg-rust). Define access control once, in the catalog, and enforce it across every compute engine — no rules duplicated per engine. Every request is checked against your policy before any data is read, and recorded. If you have questions, feature requests or just want a chat, we are hanging around in [Discord](https://discord.gg/jkAGG8p93B)!
 
 <p align="center">
 <img src="assets/lakekeeper.gif" alt="Lakekeeper UI" width="480px">
@@ -38,7 +36,7 @@ cd lakekeeper/examples/minimal
 docker compose up
 ```
 
-Then open your browser and head to [localhost:8888](http://localhost:8888) to load the example Jupyter notebooks or head to [localhost:8181](http://localhost:8181) for the Lakekeeper UI.
+Then open your browser and head to [localhost:8888](http://localhost:8888) to load the example Jupyter notebooks or head to [localhost:8181](http://localhost:8181) for the [Lakekeeper UI](https://github.com/lakekeeper/console) (the open-source Console).
 
 For more information on deployment, please check the [Getting Started Guide](https://docs.lakekeeper.io/getting-started/).
 
@@ -58,30 +56,21 @@ The Iceberg Catalog REST interface has become the standard for catalogs in open 
 - **High Available & Horizontally Scalable**: There is no local state - the catalog can be scaled horizontally easily.
 - **Fine Grained Access (FGA):** Lakekeeper's default Authorization system leverages [OpenFGA](https://openfga.dev/). If your company already has a different system in place, you can integrate with it by implementing a handful of methods in the `Authorizer` trait.
 
-If you are missing something, we would love to hear about it in a [Github Issue](https://github.com/lakekeeper/lakekeeper/issues/new).
-
+If you are missing something, we would love to hear about it in a [GitHub Issue](https://github.com/lakekeeper/lakekeeper/issues/new).
 
 # Status
 
-### Supported Operations - Iceberg-Rest
-
-| Operation | Status  | Description                                            |
-|-----------|:-------:|--------------------------------------------------------|
-| Namespace | ![done] | All operations implemented                             |
-| Table     | ![done] | All operations implemented - additional integration tests in development |
-| Views     | ![done] | Remove unused files and log entries                    |
-| Metrics   | ![open] | Endpoint is available but doesn't store the metrics    |
-
 ### Storage Profile Support
 
-| Storage              |    Status    | Comment                                |
-|----------------------|:------------:|----------------------------------------|
-| S3 - AWS             | ![semi-done] | vended-credentials & remote-signing, assume role missing |
-| S3 - Custom          |   ![done]    | vended-credentials & remote-signing, tested against Minio |
-| Azure ADLS Gen2      |   ![done]    |                                        |
-| Azure Blob           |   ![open]    |                                        |
-| Microsoft OneLake    |   ![open]    |                                        |
-| Google Cloud Storage |   ![done]    |                                        |
+| Storage              | Status  | Comment                                     |
+|----------------------|:-------:|---------------------------------------------|
+| S3 - AWS             | ![done] | vended-credentials & remote-signing with optional role assumption, support for session Tags |
+| S3 - Custom          | ![done] | vended-credentials & remote-signing; MinIO, Ceph and other S3-compatible stores |
+| S3 - Cloudflare R2    | ![done] | vended-credentials via R2 temporary-access-credentials |
+| S3 - Alibaba Cloud OSS (Aliyun / 阿里云) | ![done] | vended-credentials via Alibaba Cloud STS `AssumeRole` |
+| Azure ADLS Gen2      | ![done] |                                             |
+| Microsoft OneLake    | ![done] | Microsoft Fabric / OneLake with SAS-token vending; supports regional and private-link endpoints |
+| Google Cloud Storage | ![done] | Support for GCS with and without hierarchical namespace |
 
 Details on how to configure the storage profiles can be found in the [Docs](https://docs.lakekeeper.io).
 
@@ -90,29 +79,37 @@ Details on how to configure the storage profiles can be found in the [Docs](http
 | Backend  | Status  | Comment |
 |----------|:-------:|---------|
 | Postgres | ![done] | \>=15   |
-| MongoDB  | ![open] |         |
 
 ### Supported Secret Stores
 
 | Backend         | Status  | Comment       |
-| --------------- | :-----: | ------------- |
+|-----------------|:-------:|---------------|
 | Postgres        | ![done] |               |
 | kv2 (hcp-vault) | ![done] | userpass auth |
 
 ### Supported Event Stores
 
 | Backend | Status  | Comment |
-| ------- | :-----: | ------- |
+|---------|:-------:|---------|
 | NATS    | ![done] |         |
 | Kafka   | ![done] |         |
 
-### Supported Operations - Management API
+### Supported Operations
 
-| Operation            | Status  | Description                                 |
-|----------------------|:-------:|---------------------------------------------|
-| Warehouse Management | ![done] | Create / Update / Delete a Warehouse        |
-| AuthZ                | ![open] | Manage access to warehouses, namespaces and tables |
-| More to come!        | ![open] |                                             |
+Operations outside of the Iceberg REST specification that are supported by Lakekeeper.
+
+| Operation             | Status  | Description                                |
+|-----------------------|:-------:|--------------------------------------------|
+| Project Management    | ![done] |                                            |
+| Warehouse Management  | ![done] |                                            |
+| Soft Deletion         | ![done] | Configurable on Warehouse level            |
+| Deletion Protection   | ![done] | Deletion Protection for Warehouses, Namespaces, Tables and Views |
+| Recursive Drop        | ![done] | Recursively drop all items inside Namespaces |
+| Search                | ![done] | Fuzzy search for Tables on Warehouse level |
+| Task Management       | ![done] |                                            |
+| User Management       | ![done] | User discovery and management for permission assignment. Includes fuzzy search functionality. Note: Lakekeeper does not serve as an identity provider |
+| Role Management       | ![done] |                                            |
+| Permission Management | ![done] | Table level, Requires OpenFGA              |
 
 ### Auth(N/Z) Handlers
 
@@ -120,12 +117,33 @@ Details on how to configure the storage profiles can be found in the [Docs](http
 |-----------------|:-------:|--------------------------------------------------|
 | OIDC (AuthN)    | ![done] | Secure access to the catalog via OIDC            |
 | Custom (AuthZ)  | ![done] | If you are willing to implement a single rust Trait, the `AuthZHandler` can be implement to connect to your system |
-| OpenFGA (AuthZ) | ![open] | Internal Authorization management                |
+| OpenFGA (AuthZ) | ![done] | Internal Authorization management                |
+| Cedar           | ![done] | Available in Lakekeeper+                         |
+| OPA bridge      | ![done] | Exposes Lakekeeper permissions via [Open Policy Agent](https://docs.lakekeeper.io/docs/nightly/opa/) so engines like Trino enforce them |
 
+### Web Console
 
-# Contributing
+| UI                 | Status  | Comment |
+|--------------------|:-------:|---------|
+| [Lakekeeper Console](https://github.com/lakekeeper/console) | ![done] | Open-source web UI, bundled via the `ui` feature. Manage warehouses, namespaces, tables, views, users, roles and permissions |
 
-See [DEVELOPMENT.md](./DEVELOPMENT.md) for some tips.
+# Contributors
+
+Lakekeeper is built by a community of contributors.
+
+<a href="https://github.com/lakekeeper/lakekeeper/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=lakekeeper/lakekeeper" alt="Lakekeeper contributors" />
+</a>
+
+See [DEVELOPMENT.md](./DEVELOPMENT.md) to get started, or join us on [Discord](https://discord.gg/jkAGG8p93B).
+
+# Support
+
+Community support is available on [Discord](https://discord.gg/jkAGG8p93B) and via [GitHub Issues](https://github.com/lakekeeper/lakekeeper/issues/new).
+
+Lakekeeper is maintained by [Vakamo](https://vakamo.com), which also offers Lakekeeper
+Plus — an edition adding Cedar-based authorization (see the Auth(N/Z) table above),
+audit and an SLA.
 
 # License
 

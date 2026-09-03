@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use iceberg::NamespaceIdent;
 
 #[cfg(feature = "axum")]
@@ -8,7 +10,7 @@ pub struct CreateNamespaceRequest {
     /// Reference to one or more levels of a namespace
     pub namespace: NamespaceIdent,
     /// Configured string to string map of properties for the namespace
-    pub properties: Option<std::collections::HashMap<String, String>>,
+    pub properties: Option<HashMap<String, String>>,
 }
 
 impl TryFrom<CreateNamespaceRequest> for iceberg::Namespace {
@@ -47,7 +49,7 @@ pub struct CreateNamespaceResponse {
     pub namespace: NamespaceIdent,
     /// Properties stored on the namespace, if supported by the server.
     #[serde(rename = "properties", skip_serializing_if = "Option::is_none")]
-    pub properties: Option<std::collections::HashMap<String, String>>,
+    pub properties: Option<HashMap<String, String>>,
 }
 
 impl CreateNamespaceResponse {
@@ -67,7 +69,7 @@ impl_into_response!(CreateNamespaceResponse);
 #[serde(rename_all = "kebab-case")]
 pub struct UpdateNamespacePropertiesRequest {
     pub removals: Option<Vec<String>>,
-    pub updates: Option<std::collections::HashMap<String, String>>,
+    pub updates: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,7 +99,7 @@ pub struct GetNamespaceResponse {
     /// If the server does not support namespace properties, it should return
     /// null for this field. If namespace properties are supported, but none are
     /// set, it should return an empty object.
-    pub properties: Option<std::collections::HashMap<String, String>>,
+    pub properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,7 +121,7 @@ pub struct ListNamespacesResponse {
     /// either `null` or missing response value of `next-page-token` as the end of the listing results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
-    pub namespaces: Vec<NamespaceIdent>,
+    pub namespaces: Arc<Vec<NamespaceIdent>>,
     /// Lakekeeper IDs of the namespaces.
     /// The Lakekeeper ID persists even if the Namespace is renamed / moved.
     /// The order of the IDs in this list corresponds to the order of the namespaces in the `namespaces` field.

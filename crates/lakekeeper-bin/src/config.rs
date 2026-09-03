@@ -17,6 +17,9 @@ pub(crate) struct DebugConfig {
     pub(crate) migrate_before_serve: bool,
     /// Run the serve command unless another command is specified.
     pub(crate) auto_serve: bool,
+    /// Include file names and line numbers in log output.
+    /// This is useful for debugging but can be disabled for cleaner logs in production.
+    pub(crate) extended_logs: bool,
 }
 
 fn get_config() -> DynAppConfig {
@@ -33,17 +36,16 @@ fn get_config() -> DynAppConfig {
         config = config.merge(env);
     }
 
-    let config = match config.extract::<DynAppConfig>() {
+    match config.extract::<DynAppConfig>() {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to extract Lakekeeper Binary config: {e}");
         }
-    };
-
-    config
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 

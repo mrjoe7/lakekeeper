@@ -1,22 +1,22 @@
 use http::StatusCode;
 use iceberg::{
-    spec::{ViewMetadata, ViewMetadataRef},
     TableIdent,
+    spec::{ViewMetadata, ViewMetadataRef},
 };
-use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
+use iceberg_ext::catalog::rest::ErrorModel;
 use lakekeeper_io::Location;
 
 use crate::{
+    WarehouseId,
     service::{
-        define_simple_tabular_err, define_transparent_error, impl_error_stack_methods,
-        impl_from_with_detail, CatalogBackendError, CatalogGetNamespaceError, CatalogStore,
-        ConcurrentUpdateError, ConversionError, CreateTabularError, DropTabularError,
+        CatalogBackendError, CatalogGetNamespaceError, CatalogStore, ConcurrentUpdateError,
+        ConversionError, CreateTabularError, DropTabularError, GetTabularInfoError,
         InternalParseLocationError, InvalidNamespaceIdentifier, LocationAlreadyTaken, NamespaceId,
         ProtectedTabularDeletionWithoutForce, SerializationError, TabularAlreadyExists,
         TabularNotFound, Transaction, UnexpectedTabularInResponse, ViewId, ViewInfo,
-        WarehouseVersion,
+        WarehouseVersion, define_simple_tabular_err, define_transparent_error,
+        impl_error_stack_methods, impl_from_with_detail,
     },
-    WarehouseId,
 };
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,6 @@ pub struct CatalogView {
 
 #[derive(Debug, Clone)]
 pub struct ViewCommit<'a> {
-    pub view_ident: &'a TableIdent,
     pub namespace_id: NamespaceId,
     pub warehouse_id: WarehouseId,
     pub previous_view: &'a CatalogView,
@@ -51,13 +50,12 @@ define_simple_tabular_err!(
 
 impl From<RequiredViewComponentMissing> for ErrorModel {
     fn from(err: RequiredViewComponentMissing) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "RequiredViewComponentMissing".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("RequiredViewComponentMissing")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -68,13 +66,12 @@ define_simple_tabular_err!(
 
 impl From<InvalidViewRepresentationsInternal> for ErrorModel {
     fn from(err: InvalidViewRepresentationsInternal) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "InvalidViewRepresentations".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("InvalidViewRepresentations")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -85,13 +82,12 @@ define_simple_tabular_err!(
 
 impl From<ViewMetadataValidationFailedInternal> for ErrorModel {
     fn from(err: ViewMetadataValidationFailedInternal) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "ViewMetadataValidationFailed".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("ViewMetadataValidationFailed")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -127,7 +123,8 @@ define_transparent_error! {
         InvalidViewRepresentationsInternal,
         InternalParseLocationError,
         ViewMetadataValidationFailedInternal,
-        TabularNotFound
+        TabularNotFound,
+        SerializationError
     ]
 }
 impl From<CatalogGetNamespaceError> for LoadViewError {
@@ -139,6 +136,7 @@ impl From<CatalogGetNamespaceError> for LoadViewError {
             CatalogGetNamespaceError::CatalogBackendError(e) => {
                 LoadViewError::CatalogBackendError(e)
             }
+            CatalogGetNamespaceError::SerializationError(e) => LoadViewError::SerializationError(e),
         }
     }
 }
@@ -197,6 +195,28 @@ impl From<CreateViewError> for CommitViewError {
             CreateViewError::UnexpectedTabularInResponse(e) => e.into(),
             CreateViewError::InvalidNamespaceIdentifier(e) => e.into(),
             CreateViewError::TabularAlreadyExists(e) => e.into(),
+        }
+    }
+}
+impl From<CreateTabularError> for CommitViewError {
+    fn from(err: CreateTabularError) -> Self {
+        match err {
+            CreateTabularError::CatalogBackendError(e) => e.into(),
+            CreateTabularError::InternalParseLocationError(e) => e.into(),
+            CreateTabularError::LocationAlreadyTaken(e) => e.into(),
+            CreateTabularError::InvalidNamespaceIdentifier(e) => e.into(),
+            CreateTabularError::TabularAlreadyExists(e) => e.into(),
+        }
+    }
+}
+impl From<GetTabularInfoError> for CommitViewError {
+    fn from(err: GetTabularInfoError) -> Self {
+        match err {
+            GetTabularInfoError::CatalogBackendError(e) => e.into(),
+            GetTabularInfoError::InvalidNamespaceIdentifier(e) => e.into(),
+            GetTabularInfoError::SerializationError(e) => e.into(),
+            GetTabularInfoError::UnexpectedTabularInResponse(e) => e.into(),
+            GetTabularInfoError::InternalParseLocationError(e) => e.into(),
         }
     }
 }

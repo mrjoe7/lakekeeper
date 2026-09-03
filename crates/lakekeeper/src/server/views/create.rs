@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use iceberg::{spec::ViewMetadataBuilder, TableIdent, ViewCreation};
+use iceberg::{TableIdent, ViewCreation, spec::ViewMetadataBuilder};
 use iceberg_ext::catalog::rest::{CreateViewRequest, ErrorModel, LoadViewResult};
 
 use crate::{
     api::{
-        iceberg::v1::{DataAccessMode, NamespaceParameters},
         ApiContext,
+        iceberg::v1::{DataAccessMode, NamespaceParameters},
     },
     request_metadata::RequestMetadata,
     server::{
@@ -15,20 +15,31 @@ use crate::{
         maybe_get_secret, require_warehouse_id,
         tables::{require_active_warehouse, validate_table_or_view_ident},
         tabular::determine_tabular_location,
-        views::validate_view_properties,
+        views::{commit::validate_trusted_engine_properties_on_create, validate_view_properties},
     },
     service::{
-        authz::{Authorizer, AuthzNamespaceOps, AuthzWarehouseOps, CatalogNamespaceAction},
-        storage::{StorageLocations as _, StoragePermissions},
-        CatalogNamespaceOps, CatalogStore, CatalogViewOps, CatalogWarehouseOps, Result,
-        SecretStore, State, TabularId, Transaction, ViewId,
+        CachePolicy, CatalogStore, CatalogViewOps, Result, SecretStore, State, TabularId,
+        Transaction, ViewId,
+        authz::{
+            Authorizer, AuthzNamespaceOps, CatalogNamespaceAction, GrantResource,
+            emit_bootstrap_grants_async, write_bootstrap_grants,
+        },
+        events::{
+            APIEventContext,
+            context::{ResolvedNamespace, UserProvidedNamespace},
+        },
+        storage::StoragePermissions,
     },
 };
 
 // TODO: split up into smaller functions
 #[allow(clippy::too_many_lines)]
-/// Create a view in the given namespace
-pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+/// Create a view in the given namespace.
+///
+/// # Panics
+/// Panics if the resolved metadata builder fails an internal invariant (e.g.
+/// uuid assignment).
+pub async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
     parameters: NamespaceParameters,
     request: CreateViewRequest,
     state: ApiContext<State<A, C, S>>,
@@ -46,6 +57,7 @@ pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
 
     validate_table_or_view_ident(&view)?;
     validate_view_properties(request.properties.keys())?;
+    validate_trusted_engine_properties_on_create(&request.properties, &request_metadata)?;
 
     if request.view_version.representations().is_empty() {
         return Err(ErrorModel::bad_request(
@@ -56,35 +68,48 @@ pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
         .into());
     }
 
+    let action = CatalogNamespaceAction::CreateView {
+        name: Some(request.name.clone()),
+        properties: Arc::new(request.properties.clone().into_iter().collect()),
+    };
+    let event_ctx = APIEventContext::for_namespace(
+        Arc::new(request_metadata.clone()),
+        state.v1_state.events,
+        warehouse_id,
+        provided_ns.clone(),
+        action.clone(),
+    );
+
     // ------------------- AUTHZ -------------------
     let authorizer = &state.v1_state.authz;
-
-    let (warehouse, namespace) = tokio::join!(
-        C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()),
-        C::get_namespace(warehouse_id, provided_ns, state.v1_state.catalog.clone())
-    );
-    let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-
-    let namespace = authorizer
-        .require_namespace_action(
+    let authz_result = authorizer
+        .load_and_authorize_namespace_action::<C>(
             &request_metadata,
-            &warehouse,
-            provided_ns,
-            namespace,
-            CatalogNamespaceAction::CanCreateView,
+            UserProvidedNamespace::new(warehouse_id, provided_ns.clone()),
+            action.clone(),
+            CachePolicy::Use,
+            state.v1_state.catalog.clone(),
         )
-        .await?;
+        .await;
+
+    let (event_ctx, (warehouse, ns_hierarchy)) = event_ctx.emit_authz(authz_result)?;
+
+    let event_ctx = event_ctx.resolve(ResolvedNamespace {
+        warehouse: warehouse.clone(),
+        namespace: ns_hierarchy.namespace.clone(),
+    });
 
     // ------------------- BUSINESS LOGIC -------------------
     let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
-    require_active_warehouse(warehouse.status)?;
+    require_active_warehouse(event_ctx.resolved().warehouse.status)?;
 
     let view_id: TabularId = TabularId::View(uuid::Uuid::now_v7().into());
 
     let view_location = determine_tabular_location(
-        &namespace.namespace,
+        &ns_hierarchy,
         request.location.clone(),
         view_id,
+        &view,
         &warehouse.storage_profile,
     )?;
 
@@ -121,9 +146,9 @@ pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
         )
     })?;
 
-    C::create_view(
+    let view_info = C::create_view(
         warehouse_id,
-        namespace.namespace_id(),
+        ns_hierarchy.namespace_id(),
         &view,
         &metadata_build_result.metadata,
         &metadata_location,
@@ -134,10 +159,11 @@ pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
     // We don't commit the transaction yet, first we need to write the metadata file.
     let storage_secret =
         maybe_get_secret(warehouse.storage_secret_id, &state.v1_state.secrets).await?;
+    let storage_secret_ref = storage_secret.as_deref();
 
     let file_io = warehouse
         .storage_profile
-        .file_io(storage_secret.as_ref())
+        .file_io(storage_secret_ref)
         .await?;
     let compression_codec = CompressionCodec::try_from_metadata(&metadata_build_result.metadata)?;
     write_file(
@@ -159,140 +185,60 @@ pub(crate) async fn create_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
         .storage_profile
         .generate_table_config(
             data_access,
-            storage_secret.as_ref(),
+            storage_secret_ref,
             &view_location,
             StoragePermissions::Read,
             &request_metadata,
-            warehouse_id,
-            ViewId::from(metadata_build_result.metadata.uuid()).into(),
+            &view_info,
         )
         .await?;
 
+    let view_id = ViewId::from(metadata_build_result.metadata.uuid());
     authorizer
         .create_view(
             &request_metadata,
             warehouse_id,
-            ViewId::from(metadata_build_result.metadata.uuid()),
-            namespace.namespace_id(),
+            view_id,
+            ns_hierarchy.namespace_id(),
         )
         .await?;
 
+    let bootstrap_grants = write_bootstrap_grants::<C, A>(
+        authorizer,
+        &request_metadata,
+        &GrantResource::View {
+            warehouse_id,
+            view_id,
+        },
+        t.transaction(),
+    )
+    .await?;
+
     t.commit().await?;
 
-    state
-        .v1_state
-        .hooks
-        .create_view(
-            warehouse_id,
-            parameters.clone(),
-            Arc::new(request),
-            Arc::new(metadata_build_result.metadata.clone()),
-            Arc::new(metadata_location.clone()),
-            data_access,
-            Arc::new(request_metadata),
-        )
-        .await;
+    // Held across the create event below, which consumes the context.
+    let grant_dispatcher = event_ctx.dispatcher().clone();
+    let grant_request_metadata = event_ctx.request_metadata_arc();
+
+    let view_metadata = Arc::new(metadata_build_result.metadata);
+    let metadata_location_str = metadata_location.to_string();
+    let metadata_location = Arc::new(metadata_location);
+
+    // Emit success event using the event context
+    event_ctx.emit_view_created_async(
+        view_metadata.clone(),
+        metadata_location.clone(),
+        view.name,
+        Arc::new(request),
+    );
+
+    emit_bootstrap_grants_async(&grant_dispatcher, grant_request_metadata, bootstrap_grants);
 
     let load_view_result = LoadViewResult {
-        metadata_location: metadata_location.to_string(),
-        metadata: Arc::new(metadata_build_result.metadata),
+        metadata_location: metadata_location_str,
+        metadata: view_metadata,
         config: Some(config.config.into()),
     };
 
     Ok(load_view_result)
-}
-
-#[cfg(test)]
-pub(crate) mod test {
-    use iceberg::NamespaceIdent;
-    use sqlx::PgPool;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::{
-        api::iceberg::{types::Prefix, v1::DataAccess},
-        implementations::postgres::{
-            namespace::tests::initialize_namespace, secrets::SecretsState,
-        },
-        service::authz::AllowAllAuthorizer,
-        tests::create_view_request,
-    };
-
-    pub(crate) async fn create_view(
-        api_context: ApiContext<
-            State<
-                AllowAllAuthorizer,
-                crate::implementations::postgres::PostgresBackend,
-                SecretsState,
-            >,
-        >,
-        namespace: NamespaceIdent,
-        rq: CreateViewRequest,
-        prefix: Option<String>,
-    ) -> Result<LoadViewResult> {
-        Box::pin(super::create_view(
-            NamespaceParameters {
-                namespace: namespace.clone(),
-                prefix: Some(Prefix(
-                    prefix.unwrap_or("b8683712-3484-11ef-a305-1bc8771ed40c".to_string()),
-                )),
-            },
-            rq,
-            api_context,
-            DataAccess {
-                vended_credentials: true,
-                remote_signing: false,
-            },
-            RequestMetadata::new_unauthenticated(),
-        ))
-        .await
-    }
-
-    #[sqlx::test]
-    async fn test_create_view(pool: PgPool) {
-        let (api_context, namespace, whi) = crate::server::views::test::setup(pool, None).await;
-
-        let mut rq = create_view_request(None, None);
-
-        let _view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            rq.clone(),
-            Some(whi.to_string()),
-        ))
-        .await
-        .unwrap();
-        let view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            rq.clone(),
-            Some(whi.to_string()),
-        ))
-        .await
-        .expect_err("Recreate with same ident should fail.");
-        assert_eq!(view.error.code, 409);
-        let old_name = rq.name.clone();
-        rq.name = "some-other-name".to_string();
-
-        let _view = Box::pin(create_view(
-            api_context.clone(),
-            namespace,
-            rq.clone(),
-            Some(whi.to_string()),
-        ))
-        .await
-        .expect("Recreate with with another name it should work");
-
-        rq.name = old_name;
-        let namespace = NamespaceIdent::from_vec(vec![Uuid::now_v7().to_string()]).unwrap();
-        let new_ns =
-            initialize_namespace(api_context.v1_state.catalog.clone(), whi, &namespace, None)
-                .await
-                .namespace_ident
-                .clone();
-
-        let _view = Box::pin(create_view(api_context, new_ns, rq, Some(whi.to_string())))
-            .await
-            .expect("Recreate with same name but different ns should work.");
-    }
 }

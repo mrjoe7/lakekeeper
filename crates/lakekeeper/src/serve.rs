@@ -6,27 +6,31 @@ use limes::{Authenticator, AuthenticatorEnum};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::{
+    CONFIG, CancellationToken,
     api::{
-        management::v1::server::{LicenseStatus, APACHE_LICENSE_STATUS},
-        router::{new_full_router, serve as service_serve, RouterArgs},
-        shutdown_signal, ApiContext,
+        ApiContext,
+        management::v1::server::{
+            APACHE_LICENSE_STATUS, BuildInfo, DEFAULT_BUILD_INFO, LicenseStatus,
+        },
+        router::{RouterArgs, new_full_router, serve as service_serve},
+        shutdown_signal,
     },
     service::{
-        authz::{AllowAllAuthorizer, Authorizer},
+        CatalogStore, EndpointStatisticsTrackerTx, RoleProviderId, SecretStore, ServerInfo, State,
+        admission::AdmissionGates,
+        authz::{AllowAllAuthorizer, Authorizer, ConfiguredInstanceAdmins},
         contract_verification::ContractVerifiers,
-        endpoint_hooks::EndpointHookCollection,
         endpoint_statistics::{
             EndpointStatisticsMessage, EndpointStatisticsSink, EndpointStatisticsTracker, FlushMode,
         },
-        event_publisher::{
+        events::{
             CloudEventBackend, CloudEventsMessage, CloudEventsPublisher,
-            CloudEventsPublisherBackgroundTask,
+            CloudEventsPublisherBackgroundTask, EventDispatcher,
+            backends::audit::AuditEventListener,
         },
         health::ServiceHealthProvider,
         tasks::TaskQueueRegistry,
-        CatalogStore, EndpointStatisticsTrackerTx, SecretStore, ServerInfo, State,
     },
-    CancellationToken, CONFIG,
 };
 
 /// Type alias for a function that registers additional background services.
@@ -71,7 +75,9 @@ fn log_service_completion<H: ::std::hash::BuildHasher>(
                         tracing::info!("{msg}");
                         msg
                     } else {
-                        let msg = format!("Service '{task_name}' finished successfully but was supposed to run indefinitely");
+                        let msg = format!(
+                            "Service '{task_name}' finished successfully but was supposed to run indefinitely"
+                        );
                         tracing::info!("{msg}");
                         msg
                     }
@@ -129,9 +135,18 @@ pub struct ServeConfiguration<
     /// Contract verifiers that can prohibit invalid table changes
     pub contract_verification: ContractVerifiers,
     #[builder(default)]
+    /// Post-authentication admission gates. Empty by default (admits every
+    /// request). Downstream binaries may register gates that reject already
+    /// authenticated principals before they reach any handler — e.g. an
+    /// external control-plane permission check.
+    pub admission_gates: AdmissionGates,
+    #[builder(default)]
     /// A function to modify the router before serving
     pub modify_router_fn: Option<fn(axum::Router) -> axum::Router>,
-    /// Cloud events sinks / publishers
+    /// Cloud events sinks / publishers.
+    ///
+    /// The cloud-event publisher is registered only when this is non-empty.
+    /// Listeners added through `event_dispatcher` are unaffected.
     #[builder(default)]
     pub cloud_event_sinks: Vec<Arc<dyn CloudEventBackend + Send + Sync + 'static>>,
     /// Enable built-in queue workers
@@ -141,10 +156,10 @@ pub struct ServeConfiguration<
     #[builder(default)]
     #[debug("Vec with {} functions", register_additional_task_queues_fn.len())]
     pub register_additional_task_queues_fn: Vec<RegisterTaskQueueFn<A, C, S>>,
-    /// Additional endpoint hooks to register.
+    /// Additional event listeners to register.
     /// Emitting cloud events is always registered.
     #[builder(default)]
-    pub additional_endpoint_hooks: Option<EndpointHookCollection>,
+    pub event_dispatcher: Option<EventDispatcher>,
     /// Additional background services / futures to await.
     #[builder(default)]
     #[debug("Vec with {} functions", register_additional_background_services_fn.len())]
@@ -152,6 +167,18 @@ pub struct ServeConfiguration<
     /// License Status
     #[builder(default)]
     pub license_status: Option<&'static LicenseStatus>,
+    /// Build-time information (commit SHAs, enterprise version, bundled console).
+    /// Defaults to empty values; downstream binaries should inject their own.
+    #[builder(default)]
+    pub build_info: Option<&'static BuildInfo>,
+    /// Catalog-managed system roles installed into the process-wide
+    /// registry for the duration of this `serve` call. Drives the seed
+    /// in `create_project`. Pass an empty `Vec` for OSS (no system roles
+    /// seeded); downstream binaries pass their
+    /// full spec list — the same one the binary passes to
+    /// `run_post_migration_hooks` so both subcommands agree.
+    #[builder(default)]
+    pub system_roles: Vec<crate::service::SystemRoleSpec>,
 }
 
 /// Starts the service with the provided configuration.
@@ -161,9 +188,32 @@ pub struct ServeConfiguration<
 /// - If the terms of service have not been accepted during bootstrap.
 #[allow(clippy::too_many_lines)]
 pub async fn serve<C: CatalogStore, S: SecretStore, A: Authorizer, N: Authenticator + 'static>(
-    config: ServeConfiguration<C, S, A, N>,
+    mut config: ServeConfiguration<C, S, A, N>,
 ) -> anyhow::Result<()> {
+    // Install the system role registry for this process. Driven by the
+    // binary; OSS passes an empty Vec, downstream binaries pass their
+    // spec list. Drives the seed in `create_project` for the lifetime
+    // of this serve call.
+    if let Err(rejected) =
+        crate::service::install_system_role_registry(std::mem::take(&mut config.system_roles))
+    {
+        // Logged at ERROR by the installer; second install in the same
+        // process indicates a programming error in the host binary, but
+        // we don't escalate here.
+        let _ = rejected;
+    }
+
     let cancellation_token = CancellationToken::new();
+
+    // Validate Authenticators and propagate their IDP IDs to the authorizer
+    if let Some(authenticator) = &config.authenticator {
+        let idp_ids = validate_authenticator_idp_ids(authenticator)?;
+        config.authorizer.set_registered_idp_ids(idp_ids);
+    }
+    let config = config; // Make config immutable for our sanity
+
+    log_instance_admins();
+
     // Strings are name of the service, used for logging
     let mut service_futures = JoinSet::<Result<(), anyhow::Error>>::new();
     let mut service_ids = HashMap::new();
@@ -172,7 +222,8 @@ pub async fn serve<C: CatalogStore, S: SecretStore, A: Authorizer, N: Authentica
     let cancellation_token_clone = cancellation_token.clone();
     let shutdown_signal_handle = service_futures.spawn(async move {
         shutdown_signal(cancellation_token_clone).await;
-        Err(anyhow!("Shutdown signal received"))
+        tracing::info!("Shutdown signal received");
+        Ok(())
     });
     let shutdown_signal_id = shutdown_signal_handle.id();
     service_ids.insert(
@@ -221,7 +272,10 @@ pub async fn serve<C: CatalogStore, S: SecretStore, A: Authorizer, N: Authentica
     let report_interval_secs = 5;
     let start_time = std::time::Instant::now();
 
-    tracing::info!("Waiting up to {shutdown_timeout_secs} seconds for {} background services to finish gracefully", service_ids.len());
+    tracing::info!(
+        "Waiting up to {shutdown_timeout_secs} seconds for {} background services to finish gracefully",
+        service_ids.len()
+    );
 
     let timeout = tokio::time::timeout(
         std::time::Duration::from_secs(shutdown_timeout_secs),
@@ -239,12 +293,12 @@ pub async fn serve<C: CatalogStore, S: SecretStore, A: Authorizer, N: Authentica
 
                     if !running_services.is_empty() {
                         tracing::info!(
-                        "Shutdown progress: {} seconds elapsed, {} seconds remaining. Still waiting for {} services: {:?}",
-                        elapsed,
-                        remaining,
-                        running_services.len(),
-                        running_services
-                    );
+                            "Shutdown progress: {} seconds elapsed, {} seconds remaining. Still waiting for {} services: {:?}",
+                            elapsed,
+                            remaining,
+                            running_services.len(),
+                            running_services
+                        );
                     }
                     last_report = std::time::Instant::now();
                 }
@@ -304,16 +358,20 @@ async fn serve_inner<
         authenticator,
         stats,
         contract_verification,
+        admission_gates,
         modify_router_fn,
         cloud_event_sinks,
         enable_built_in_task_queues: enable_built_in_queues,
         register_additional_task_queues_fn,
-        additional_endpoint_hooks,
+        event_dispatcher: additional_event_dispatcher,
         register_additional_background_services_fn: additional_background_services,
         license_status,
+        build_info,
+        system_roles: _,
     } = config;
 
     let license_status = license_status.unwrap_or(&APACHE_LICENSE_STATUS);
+    let build_info = build_info.unwrap_or(&DEFAULT_BUILD_INFO);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -334,6 +392,7 @@ async fn serve_inner<
     );
 
     // Cloud events publisher setup
+    let has_cloud_event_sinks = !cloud_event_sinks.is_empty();
     let cloud_events_background_task = CloudEventsPublisherBackgroundTask {
         source: cloud_events_rx,
         sinks: cloud_event_sinks,
@@ -341,13 +400,13 @@ async fn serve_inner<
 
     // Metrics server
     let (layer, metrics_future) = crate::metrics::get_axum_layer_and_install_recorder(
-        CONFIG.metrics_port,
+        CONFIG.metrics.port,
         cancellation_token.clone(),
     )
     .map_err(|e| {
         anyhow!(e).context(format!(
             "Failed to start metrics server on port: {}",
-            CONFIG.metrics_port
+            CONFIG.metrics.port
         ))
     })?;
 
@@ -359,29 +418,72 @@ async fn serve_inner<
         FlushMode::Automatic,
     );
 
-    // Endpoint Hooks
-    let mut hooks = additional_endpoint_hooks.unwrap_or(EndpointHookCollection::new(vec![]));
-    hooks.append(Arc::new(CloudEventsPublisher::new(cloud_events_tx.clone())));
+    // Event system setup
+    let dispatcher = additional_event_dispatcher.unwrap_or(EventDispatcher::new(vec![]));
+    // Registering the publisher with no sinks configured is pure waste that is
+    // paid per commit: the listener runs `serde_json::to_value` over the whole
+    // commit request (megabytes, once `max_request_body_size` is raised), queues
+    // it, and the background task then builds a full `CloudEvent` from it —
+    // only to drop it because there is nowhere to send it. Skip the listener
+    // entirely instead; nothing observable changes.
+    if has_cloud_event_sinks {
+        dispatcher
+            .append(Arc::new(CloudEventsPublisher::new(cloud_events_tx.clone())))
+            .await;
+    } else {
+        tracing::info!(
+            "No cloud-event sinks configured, not registering the cloud-events publisher"
+        );
+    }
     if CONFIG.cache.warehouse.enabled {
-        tracing::info!("Warehouse cache is enabled, registering warehouse cache endpoint hook");
-        hooks.append(Arc::new(
-            crate::service::warehouse_cache::WarehouseCacheEndpointHook {},
-        ));
+        tracing::info!("Warehouse cache is enabled, registering warehouse cache event listener");
+        dispatcher
+            .append(Arc::new(
+                crate::service::warehouse_cache::WarehouseCacheEventListener {},
+            ))
+            .await;
     } else {
         tracing::info!("Warehouse cache is disabled");
     }
     if CONFIG.cache.namespace.enabled {
-        tracing::info!("Namespace cache is enabled, registering namespace cache endpoint hook");
-        hooks.append(Arc::new(
-            crate::service::namespace_cache::NamespaceCacheEndpointHook {},
-        ));
+        tracing::info!("Namespace cache is enabled, registering namespace cache event listener");
+        dispatcher
+            .append(Arc::new(
+                crate::service::namespace_cache::NamespaceCacheEventListener {},
+            ))
+            .await;
     } else {
         tracing::info!("Namespace cache is disabled");
+    }
+    if CONFIG.cache.role.enabled {
+        tracing::info!("Role cache is enabled, registering role cache event listener");
+        dispatcher
+            .append(Arc::new(
+                crate::service::role_cache::RoleCacheEventListener {},
+            ))
+            .await;
+    } else {
+        tracing::info!("Role cache is disabled");
+    }
+    if CONFIG.audit.tracing.enabled {
+        tracing::info!("Audit tracing is enabled, registering audit event listener");
+        dispatcher.append(Arc::new(AuditEventListener)).await;
+    } else {
+        tracing::info!("Audit tracing is disabled");
     }
 
     // Task queues
     let task_queue_registry = TaskQueueRegistry::new();
-    if enable_built_in_queues {
+    // In read-only maintenance mode we don't start built-in queue workers:
+    // the operator drains writes before running schema migrations, and
+    // workers would otherwise tick against a half-migrated DB.
+    let skip_built_in_queues_for_maintenance = CONFIG.maintenance_mode.is_read_only();
+    if skip_built_in_queues_for_maintenance {
+        tracing::info!(
+            "Maintenance mode is read-only: skipping built-in task queue worker registration."
+        );
+    }
+    if enable_built_in_queues && !skip_built_in_queues_for_maintenance {
         task_queue_registry
             .register_built_in_queues::<C, _, _>(
                 catalog_state.clone(),
@@ -403,8 +505,9 @@ async fn serve_inner<
             secrets: secrets_state,
             contract_verifiers: contract_verification,
             registered_task_queues,
-            hooks,
+            events: dispatcher,
             license_status,
+            build_info,
         },
     };
 
@@ -420,6 +523,8 @@ async fn serve_inner<
         cors_origins: CONFIG.allow_origin.as_deref(),
         metrics_layer: Some(layer),
         endpoint_statistics_tracker_tx: endpoint_statistics_tracker_tx.clone(),
+        instance_admin_membership: Arc::new(ConfiguredInstanceAdmins::from_config()),
+        admission_gates,
     })
     .await?;
 
@@ -523,7 +628,9 @@ async fn serve_inner<
 
 fn validate_server_info(server_info: &ServerInfo) -> anyhow::Result<()> {
     if server_info.is_open_for_bootstrap() {
-        tracing::info!("The catalog is open for bootstrap. Bootstrapping sets the initial administrator. Please open the Web-UI after startup or call the bootstrap endpoint directly.");
+        tracing::info!(
+            "The catalog is open for bootstrap. Bootstrapping sets the initial administrator. Please open the Web-UI after startup or call the bootstrap endpoint directly."
+        );
     } else {
         tracing::info!("The catalog is not open for bootstrap.");
         if !server_info.terms_accepted() {
@@ -540,4 +647,47 @@ fn validate_server_info(server_info: &ServerInfo) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Log the configured instance admins at startup. Count at INFO; individual
+/// IDs at DEBUG (they are deployment-config PII — `IdP` subjects).
+fn log_instance_admins() {
+    let n = CONFIG.instance_admins.len();
+    if n == 0 {
+        return;
+    }
+    tracing::info!(
+        "Configured {n} instance admin(s) via LAKEKEEPER__INSTANCE_ADMINS. \
+         These principals bypass authorization for all control-plane actions \
+         (but not for CatalogTableAction::ReadData / WriteData)."
+    );
+    for admin in &CONFIG.instance_admins {
+        tracing::debug!("Instance admin: {admin}");
+    }
+}
+
+fn validate_authenticator_idp_ids(
+    authenticator: &impl Authenticator,
+) -> anyhow::Result<Arc<[RoleProviderId]>> {
+    let idp_ids = authenticator.idp_ids();
+    if idp_ids.is_empty() {
+        anyhow::bail!(
+            "Authenticator returned an empty list of IdP IDs. At least one IdP ID is required if authentication is enabled. All IdP IDs must be non-empty strings."
+        );
+    }
+    let mut result = Vec::with_capacity(idp_ids.len());
+    for idp_id in idp_ids {
+        let Some(idp_id) = idp_id else {
+            return Err(anyhow!(
+                "Authenticator returned an empty IdP ID. All IdP IDs must be non-empty strings."
+            ));
+        };
+        let role_provider_id = RoleProviderId::try_new(idp_id).map_err(|e| {
+            anyhow!(
+                "Invalid IdP ID '{idp_id}' in authenticator configuration: {e}. All IdP IDs must consist of lowercase letters, digits, or hyphens."
+            )
+        })?;
+        result.push(role_provider_id);
+    }
+    Ok(result.into())
 }

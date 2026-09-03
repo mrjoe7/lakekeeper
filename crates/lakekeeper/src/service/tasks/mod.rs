@@ -1,28 +1,36 @@
+#[cfg(feature = "open-api")]
+use std::collections::HashMap;
 use std::{fmt::Debug, marker::PhantomData, ops::Deref, time::Duration};
 
 use chrono::Utc;
 use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use strum::EnumIter;
 use uuid::Uuid;
 
 use super::{Transaction, WarehouseId};
-use crate::service::{
-    CatalogStore, CatalogTaskOps, TableId, TableNamed, TabularId, ViewId, ViewNamed,
+use crate::{
+    ProjectId,
+    api::management::v1::tasks::TaskStatus,
+    service::{
+        ArcProjectId, CatalogStore, CatalogTaskOps, GenericTableId, GenericTableNamed, TableId,
+        TableNamed, TabularId, ViewId, ViewNamed, task_configs::TaskQueueConfigFilter,
+    },
 };
 
 mod task_queues_runner;
 mod task_registry;
 pub use task_queues_runner::{TaskQueueWorkerFn, TaskQueuesRunner};
 pub use task_registry::{
-    QueueApiConfig, QueueRegistration, RegisteredTaskQueues, TaskQueueRegistry, ValidatorFn,
+    QueueApiConfig, QueueRegistration, QueueScope, RegisteredTaskQueues, ScheduleEligibilityFn,
+    TaskQueueRegistry, UserScheduling, ValidatorFn,
 };
 pub mod tabular_expiration_queue;
 pub mod tabular_purge_queue;
+pub mod task_log_cleanup_queue;
 
-#[cfg(test)]
-pub(crate) const DEFAULT_MAX_TIME_SINCE_LAST_HEARTBEAT: chrono::Duration =
-    chrono::Duration::seconds(300);
+#[cfg(any(test, feature = "test-utils"))]
+pub const DEFAULT_MAX_TIME_SINCE_LAST_HEARTBEAT: chrono::Duration = chrono::Duration::seconds(300);
 const DEFAULT_MAX_RETRIES: i32 = 5;
 
 #[cfg(feature = "open-api")]
@@ -34,6 +42,67 @@ pub static BUILT_IN_API_CONFIGS: std::sync::LazyLock<Vec<QueueApiConfig>> =
             tabular_purge_queue::API_CONFIG.clone(),
         ]
     });
+
+#[cfg(feature = "open-api")]
+#[allow(clippy::declare_interior_mutable_const)]
+pub static BUILT_IN_PROJECT_API_CONFIGS: std::sync::LazyLock<Vec<QueueApiConfig>> =
+    std::sync::LazyLock::new(|| vec![task_log_cleanup_queue::API_CONFIG.clone()]);
+
+#[cfg(feature = "open-api")]
+pub static BUILT_IN_DEPENDENT_SCHEMAS: std::sync::LazyLock<
+    HashMap<String, utoipa::openapi::RefOr<utoipa::openapi::Schema>>,
+> = std::sync::LazyLock::new(HashMap::new);
+
+#[cfg(all(test, feature = "open-api"))]
+mod built_in_schedulable_pin_test {
+    use super::{BUILT_IN_API_CONFIGS, BUILT_IN_PROJECT_API_CONFIGS};
+    use crate::service::tasks::{tabular_expiration_queue, tabular_purge_queue};
+
+    /// Pin the set of OSS queues that opt in to `task-queue/{name}/schedule`.
+    ///
+    /// **OSS has zero schedulable queues.** Destructive (`tabular_purge`) and
+    /// lifecycle-managed (`soft_deletion`) queues intentionally stay
+    /// opted out so they can't be enqueued out-of-band; `task_log_cleanup` is
+    /// project-scoped and not meaningful to trigger manually.
+    ///
+    /// Enterprise has its own pin test for `expire_snapshots` and
+    /// `remove_orphan_files`. If a new OSS queue legitimately needs to be
+    /// manually schedulable, update both this list and the operator docs in
+    /// the same PR so the decision is reviewed.
+    #[test]
+    fn oss_schedulable_queues_pin() {
+        let mut names: Vec<&str> = BUILT_IN_API_CONFIGS
+            .iter()
+            .chain(BUILT_IN_PROJECT_API_CONFIGS.iter())
+            .filter(|c| c.user_scheduling.is_enabled())
+            .map(|c| c.queue_name.as_str())
+            .collect();
+        names.sort_unstable();
+        let expected: Vec<&str> = vec![];
+        assert_eq!(
+            names, expected,
+            "OSS schedulable-queue set changed; review the security \
+             implications and update the operator docs."
+        );
+    }
+
+    /// Belt-and-braces: explicitly assert the two queues we must never expose
+    /// stay `Disabled`. If a future refactor reshuffles `BUILT_IN_API_CONFIGS`
+    /// and the aggregate above goes stale, this catches the regression by name.
+    #[test]
+    fn tabular_purge_and_expiration_are_never_schedulable() {
+        assert!(
+            !tabular_purge_queue::API_CONFIG.user_scheduling.is_enabled(),
+            "tabular_purge is destructive and must never be user-schedulable"
+        );
+        assert!(
+            !tabular_expiration_queue::API_CONFIG
+                .user_scheduling
+                .is_enabled(),
+            "soft_deletion is lifecycle-managed and must never be user-schedulable"
+        );
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(transparent)]
@@ -76,10 +145,10 @@ impl TaskQueueName {
     }
 }
 
-#[derive(Hash, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Hash, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case", tag = "type")]
-pub enum TaskEntity {
+pub enum WarehouseTaskEntityId {
     #[serde(rename_all = "kebab-case")]
     Table {
         #[cfg_attr(feature = "open-api", schema(value_type = uuid::Uuid))]
@@ -90,20 +159,31 @@ pub enum TaskEntity {
         #[cfg_attr(feature = "open-api", schema(value_type = uuid::Uuid))]
         view_id: ViewId,
     },
+    #[serde(rename_all = "kebab-case")]
+    GenericTable {
+        #[cfg_attr(feature = "open-api", schema(value_type = uuid::Uuid))]
+        generic_table_id: GenericTableId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
-pub enum TaskEntityNamed {
+pub enum ResolvedTaskEntity {
     Table(TableNamed),
     View(ViewNamed),
+    GenericTable(GenericTableNamed),
+    Warehouse(WarehouseId),
+    Project,
 }
 
-impl TaskEntityNamed {
+impl ResolvedTaskEntity {
     #[must_use]
-    pub fn warehouse_id(&self) -> WarehouseId {
+    pub fn warehouse_id(&self) -> Option<WarehouseId> {
         match self {
-            TaskEntityNamed::Table(t) => t.warehouse_id,
-            TaskEntityNamed::View(v) => v.warehouse_id,
+            ResolvedTaskEntity::Table(t) => Some(t.warehouse_id),
+            ResolvedTaskEntity::View(v) => Some(v.warehouse_id),
+            ResolvedTaskEntity::GenericTable(g) => Some(g.warehouse_id),
+            ResolvedTaskEntity::Warehouse(w) => Some(*w),
+            ResolvedTaskEntity::Project => None,
         }
     }
 }
@@ -121,6 +201,44 @@ pub trait TaskConfig:
     }
 
     fn queue_name() -> &'static TaskQueueName;
+
+    /// Names this queue was known by in earlier releases. The worker
+    /// dual-reads these alongside [`Self::queue_name`] so tasks enqueued
+    /// before a rename are still picked up, and cancellation on drop covers
+    /// them too. Default: none.
+    #[must_use]
+    fn legacy_queue_names() -> Vec<&'static TaskQueueName> {
+        Vec::new()
+    }
+
+    /// Decide whether a manual schedule call is acceptable right now.
+    ///
+    /// Called by the `task-queue/{name}/schedule` endpoint after authz, with
+    /// the queue's current config and the target entity's properties already
+    /// fetched. Sync + pure: given inputs, decide.
+    ///
+    /// `entity_properties` carries the properties of whichever entity the
+    /// caller targeted — table OR view. Implementors that only support one
+    /// entity kind must match on `entity` and reject the unsupported variant
+    /// explicitly; the framework no longer rejects views globally.
+    ///
+    /// Return `Err(ErrorModel)` (typically `400 Bad Request`) when the
+    /// configuration is one the worker would skip at pickup — e.g.
+    /// `gc.enabled=false` on the table, per-table opt-out property set, or
+    /// the queue's master switch is off at the warehouse. Failing here
+    /// surfaces the misconfiguration to the operator instead of creating a
+    /// no-op task they have to discover via `task/list`.
+    ///
+    /// Default: always eligible. Queues whose workers have skip-at-pickup
+    /// conditions should override.
+    #[allow(unused_variables)]
+    fn check_schedule_eligibility(
+        config: &Self,
+        entity_properties: &std::collections::HashMap<String, String>,
+        entity: WarehouseTaskEntityId,
+    ) -> Result<(), ErrorModel> {
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "open-api"))]
@@ -134,9 +252,32 @@ pub trait TaskConfig: Serialize + DeserializeOwned + Clone + Send + Sync {
     }
 
     fn queue_name() -> &'static TaskQueueName;
+
+    /// See the `open-api`-enabled trait for full documentation.
+    #[must_use]
+    fn legacy_queue_names() -> Vec<&'static TaskQueueName> {
+        Vec::new()
+    }
+
+    /// See the `open-api`-enabled trait for full documentation.
+    #[allow(unused_variables)]
+    fn check_schedule_eligibility(
+        config: &Self,
+        entity_properties: &std::collections::HashMap<String, String>,
+        entity: WarehouseTaskEntityId,
+    ) -> Result<(), ErrorModel> {
+        Ok(())
+    }
 }
 
-/// Task Payload
+/// Task Payload.
+///
+/// Queues whose worker depends on exact payload shape should annotate the
+/// payload type with `#[serde(deny_unknown_fields)]`. The schedule
+/// endpoint's payload validator is `serde_json::from_value::<D>`, which by
+/// default silently ignores unknown fields — fine for queues that take an
+/// empty or open-ended payload, but a silent footgun for queues with a
+/// strict contract.
 pub trait TaskData: Clone + Serialize + DeserializeOwned + Send + Sync {}
 
 pub trait TaskExecutionDetails: Clone + Serialize + DeserializeOwned + Send + Sync {}
@@ -191,77 +332,221 @@ impl AsRef<TaskAttemptId> for TaskAttemptId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskFilter {
-    WarehouseId(WarehouseId),
+    WarehouseId {
+        warehouse_id: WarehouseId,
+        project_id: ArcProjectId,
+    },
     TaskIds(Vec<TaskId>),
+    ProjectId {
+        project_id: ArcProjectId,
+        include_sub_tasks: bool,
+    },
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelTasksFilter {
+    WarehouseId {
+        warehouse_id: WarehouseId,
+    },
+    TaskIds(Vec<TaskId>),
+    ProjectId {
+        project_id: ProjectId,
+        include_sub_tasks: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskResolveScope {
+    Warehouse {
+        project_id: ArcProjectId,
+        warehouse_id: Option<WarehouseId>,
+    },
+    Project {
+        project_id: ArcProjectId,
+    },
+}
+
+impl TaskResolveScope {
+    #[must_use]
+    pub fn project_id(&self) -> ArcProjectId {
+        match self {
+            TaskResolveScope::Warehouse { project_id, .. }
+            | TaskResolveScope::Project { project_id } => project_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskDetailsScope {
+    Warehouse {
+        project_id: ArcProjectId,
+        warehouse_id: WarehouseId,
+    },
+    Project {
+        project_id: ArcProjectId,
+    },
+}
+
+impl TaskDetailsScope {
+    #[must_use]
+    pub fn project_id(&self) -> ArcProjectId {
+        match self {
+            TaskDetailsScope::Warehouse { project_id, .. }
+            | TaskDetailsScope::Project { project_id } => project_id.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn warehouse_id(&self) -> Option<WarehouseId> {
+        match self {
+            TaskDetailsScope::Warehouse { warehouse_id, .. } => Some(*warehouse_id),
+            TaskDetailsScope::Project { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TaskInput {
     /// Metadata for this task instance.
     /// Metadata type is shared between different task types.
-    pub task_metadata: TaskMetadata,
+    pub task_metadata: ScheduleTaskMetadata,
     /// Specific payload for this task type
     pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// Metadata stored for each task in the database backend.
-/// This is separate from the task payload, which is specific to each task type.
+pub enum TaskEntity {
+    Project,
+    Warehouse {
+        warehouse_id: WarehouseId,
+    },
+    EntityInWarehouse {
+        warehouse_id: WarehouseId,
+        entity_id: WarehouseTaskEntityId,
+        entity_name: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskMetadata {
-    pub warehouse_id: WarehouseId,
+    pub project_id: ArcProjectId,
     pub parent_task_id: Option<TaskId>,
-    pub entity_id: EntityId,
-    pub entity_name: Vec<String>,
-    pub schedule_for: Option<chrono::DateTime<Utc>>,
+    pub scheduled_for: chrono::DateTime<Utc>,
+    pub entity: TaskEntity,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleTaskMetadata {
+    pub project_id: ArcProjectId,
+    pub parent_task_id: Option<TaskId>,
+    pub scheduled_for: Option<chrono::DateTime<Utc>>,
+    pub entity: TaskEntity,
+}
+
+impl TaskMetadata {
+    #[must_use]
+    pub fn project_id(&self) -> &ArcProjectId {
+        &self.project_id
+    }
+
+    #[must_use]
+    pub fn warehouse_id(&self) -> Option<WarehouseId> {
+        match &self.entity {
+            TaskEntity::Warehouse { warehouse_id }
+            | TaskEntity::EntityInWarehouse { warehouse_id, .. } => Some(*warehouse_id),
+            TaskEntity::Project => None,
+        }
+    }
+
+    #[must_use]
+    pub fn parent_task_id(&self) -> Option<TaskId> {
+        self.parent_task_id
+    }
+
+    #[must_use]
+    pub fn schedule_for(&self) -> chrono::DateTime<Utc> {
+        self.scheduled_for
+    }
+
+    #[must_use]
+    pub fn warehouse_task_sub_entity(
+        &self,
+    ) -> Option<(WarehouseId, &WarehouseTaskEntityId, &Vec<String>)> {
+        match &self.entity {
+            TaskEntity::EntityInWarehouse {
+                warehouse_id,
+                entity_id,
+                entity_name,
+            } => Some((*warehouse_id, entity_id, entity_name)),
+            TaskEntity::Warehouse { .. } | TaskEntity::Project => None,
+        }
+    }
+
+    #[must_use]
+    pub fn entity_name(&self) -> Option<&Vec<String>> {
+        match &self.entity {
+            TaskEntity::EntityInWarehouse { entity_name, .. } => Some(entity_name),
+            TaskEntity::Warehouse { .. } | TaskEntity::Project => None,
+        }
+    }
+
+    #[must_use]
+    pub fn entity_id(&self) -> Option<WarehouseTaskEntityId> {
+        match &self.entity {
+            TaskEntity::EntityInWarehouse { entity_id, .. } => Some(*entity_id),
+            TaskEntity::Warehouse { .. } | TaskEntity::Project => None,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, strum_macros::Display)]
 #[strum(serialize_all = "kebab-case")]
-pub enum EntityType {
+pub enum WarehouseEntityType {
     Table,
     View,
+    GenericTable,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, derive_more::From)]
-pub enum EntityId {
-    Table(TableId),
-    View(ViewId),
-}
-
-impl std::fmt::Display for EntityId {
+impl std::fmt::Display for WarehouseTaskEntityId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EntityId::Table(id) => write!(f, "Table({id})"),
-            EntityId::View(id) => write!(f, "View({id})"),
+            WarehouseTaskEntityId::Table { table_id } => write!(f, "Table({table_id})"),
+            WarehouseTaskEntityId::View { view_id } => write!(f, "View({view_id})"),
+            WarehouseTaskEntityId::GenericTable { generic_table_id } => {
+                write!(f, "GenericTable({generic_table_id})")
+            }
         }
     }
 }
 
-impl EntityId {
+impl WarehouseTaskEntityId {
     #[must_use]
-    pub fn entity_type(&self) -> EntityType {
+    pub fn entity_type(&self) -> WarehouseEntityType {
         match self {
-            EntityId::Table(_) => EntityType::Table,
-            EntityId::View(_) => EntityType::View,
+            WarehouseTaskEntityId::Table { .. } => WarehouseEntityType::Table,
+            WarehouseTaskEntityId::View { .. } => WarehouseEntityType::View,
+            WarehouseTaskEntityId::GenericTable { .. } => WarehouseEntityType::GenericTable,
         }
     }
-}
 
-impl EntityId {
     #[must_use]
     pub fn as_uuid(&self) -> Uuid {
         match self {
-            EntityId::Table(id) => **id,
-            EntityId::View(id) => **id,
+            WarehouseTaskEntityId::Table { table_id } => **table_id,
+            WarehouseTaskEntityId::View { view_id } => **view_id,
+            WarehouseTaskEntityId::GenericTable { generic_table_id } => **generic_table_id,
         }
     }
 }
 
-impl From<TabularId> for EntityId {
+impl From<TabularId> for WarehouseTaskEntityId {
     fn from(id: TabularId) -> Self {
         match id {
-            TabularId::Table(table_id) => EntityId::Table(table_id),
-            TabularId::View(view_id) => EntityId::View(view_id),
+            TabularId::Table(table_id) => WarehouseTaskEntityId::Table { table_id },
+            TabularId::View(view_id) => WarehouseTaskEntityId::View { view_id },
+            TabularId::GenericTable(generic_table_id) => {
+                WarehouseTaskEntityId::GenericTable { generic_table_id }
+            }
         }
     }
 }
@@ -271,10 +556,85 @@ pub struct Task {
     pub task_metadata: TaskMetadata,
     pub queue_name: TaskQueueName,
     pub id: TaskAttemptId,
+    pub status: TaskIntermediateStatus,
+    pub picked_up_at: Option<chrono::DateTime<Utc>>,
+    pub config: Option<serde_json::Value>,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskInfo {
+    pub task_metadata: TaskMetadata,
+    pub queue_name: TaskQueueName,
+    pub id: TaskAttemptId,
     pub status: TaskStatus,
     pub picked_up_at: Option<chrono::DateTime<Utc>>,
-    pub(crate) config: Option<serde_json::Value>,
-    pub(crate) data: serde_json::Value,
+    pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub progress: f32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl TaskInfo {
+    #[must_use]
+    pub fn task_id(&self) -> TaskId {
+        self.id.task_id
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> &ProjectId {
+        self.task_metadata.project_id()
+    }
+
+    #[must_use]
+    pub fn queue_name(&self) -> &TaskQueueName {
+        &self.queue_name
+    }
+
+    #[must_use]
+    pub fn attempt(&self) -> i32 {
+        self.id.attempt
+    }
+
+    #[must_use]
+    pub fn status(&self) -> TaskStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub fn parent_task_id(&self) -> Option<TaskId> {
+        self.task_metadata.parent_task_id()
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> f32 {
+        self.progress
+    }
+
+    #[must_use]
+    pub fn picked_up_at(&self) -> Option<chrono::DateTime<Utc>> {
+        self.picked_up_at
+    }
+
+    #[must_use]
+    pub fn scheduled_for(&self) -> chrono::DateTime<Utc> {
+        self.task_metadata.schedule_for()
+    }
+
+    #[must_use]
+    pub fn last_heartbeat_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_heartbeat_at
+    }
+
+    #[must_use]
+    pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.created_at
+    }
+
+    #[must_use]
+    pub fn updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.updated_at
+    }
 }
 
 impl AsRef<TaskAttemptId> for Task {
@@ -287,7 +647,7 @@ impl AsRef<TaskAttemptId> for Task {
 pub struct SpecializedTask<C: TaskConfig, P: TaskData, E: TaskExecutionDetails> {
     pub task_metadata: TaskMetadata,
     pub id: TaskAttemptId,
-    pub status: TaskStatus,
+    pub status: TaskIntermediateStatus,
     pub picked_up_at: Option<chrono::DateTime<Utc>>,
     pub config: Option<C>,
     pub data: P,
@@ -408,8 +768,12 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
         warehouse_id: WarehouseId,
         catalog_state: C::State,
     ) -> crate::api::Result<Option<Q>> {
-        let config =
-            C::get_task_queue_config(warehouse_id, Self::queue_name(), catalog_state).await?;
+        let config = C::get_task_queue_config(
+            &TaskQueueConfigFilter::WarehouseId { warehouse_id },
+            Self::queue_name(),
+            catalog_state,
+        )
+        .await?;
 
         config
             .map(|cfg| {
@@ -436,7 +800,7 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
     /// # Errors
     /// Returns an error if the task cannot be enqueued / scheduled.
     pub async fn schedule_task<C: CatalogStore>(
-        task_metadata: TaskMetadata,
+        task_metadata: ScheduleTaskMetadata,
         payload: D,
         transaction: <C::Transaction as Transaction<C::State>>::Transaction<'_>,
     ) -> Result<Option<TaskId>, ErrorModel> {
@@ -471,7 +835,7 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
     /// # Errors
     /// Returns an error if the tasks cannot be enqueued / scheduled.
     pub async fn schedule_tasks<C: CatalogStore>(
-        tasks: impl Iterator<Item = (TaskMetadata, D)>,
+        tasks: impl Iterator<Item = (ScheduleTaskMetadata, D)>,
         transaction: <C::Transaction as Transaction<C::State>>::Transaction<'_>,
     ) -> Result<Vec<TaskId>, ErrorModel> {
         let task_inputs = tasks
@@ -501,14 +865,18 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
     /// Cancel scheduled tasks matching the filter.
     ///
     /// If `cancel_running_and_should_stop` is true, also cancel tasks in the `running` and `should-stop` states.
+    ///
+    /// # Errors
+    /// Returns an error on DB errors
     #[tracing::instrument(level = "info", skip(transaction), fields(queue_name = %Self::queue_name(), filter = ?filter, cancel_running_and_should_stop))]
     pub async fn cancel_scheduled_tasks<C: CatalogStore>(
-        filter: TaskFilter,
+        filter: CancelTasksFilter,
         transaction: <C::Transaction as Transaction<C::State>>::Transaction<'_>,
         cancel_running_and_should_stop: bool,
     ) -> Result<(), IcebergErrorResponse> {
         C::cancel_scheduled_tasks(
             Some(Self::queue_name()),
+            &Q::legacy_queue_names(),
             filter,
             cancel_running_and_should_stop,
             transaction,
@@ -532,6 +900,7 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
     ) -> crate::api::Result<Option<Self>> {
         let task = C::pick_new_task(
             Q::queue_name(),
+            &Q::legacy_queue_names(),
             Q::max_time_since_last_heartbeat(),
             catalog_state.clone(),
         )
@@ -864,7 +1233,7 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
                 "Failed to commit transaction for recording deserialization failure for `{id}` task {}: {e}. Original Error: {error}",
                 Q::queue_name()
             );
-        };
+        }
     }
 
     async fn record_status_for_state<C: CatalogStore>(
@@ -940,7 +1309,7 @@ impl<Q: TaskConfig, D: TaskData, E: TaskExecutionDetails> SpecializedTask<Q, D, 
     feature = "sqlx-postgres",
     sqlx(type_name = "task_intermediate_status", rename_all = "kebab-case")
 )]
-pub enum TaskStatus {
+pub enum TaskIntermediateStatus {
     Scheduled,
     Running,
     ShouldStop,
@@ -985,10 +1354,11 @@ mod test {
             "type": "table",
             "table-id": "550e8400-e29b-41d4-a716-446655440000"
         });
-        let deserialized: super::TaskEntity = serde_json::from_value(json.clone()).unwrap();
+        let deserialized: super::WarehouseTaskEntityId =
+            serde_json::from_value(json.clone()).unwrap();
         assert_eq!(
             deserialized,
-            TaskEntity::Table {
+            WarehouseTaskEntityId::Table {
                 table_id: TableId::from(
                     Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
                 )
@@ -997,5 +1367,38 @@ mod test {
 
         let serialized = serde_json::to_value(deserialized).unwrap();
         assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn test_task_entity_serde_generic_table() {
+        let json = serde_json::json!({
+            "type": "generic-table",
+            "generic-table-id": "550e8400-e29b-41d4-a716-446655440111"
+        });
+        let deserialized: super::WarehouseTaskEntityId =
+            serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            deserialized,
+            WarehouseTaskEntityId::GenericTable {
+                generic_table_id: GenericTableId::from(
+                    Uuid::parse_str("550e8400-e29b-41d4-a716-446655440111").unwrap()
+                )
+            }
+        );
+
+        let serialized = serde_json::to_value(deserialized).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn test_tabular_id_into_warehouse_task_entity_id_generic_table() {
+        let gt_uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440222").unwrap();
+        let tabular = TabularId::GenericTable(GenericTableId::from(gt_uuid));
+        assert_eq!(
+            WarehouseTaskEntityId::from(tabular),
+            WarehouseTaskEntityId::GenericTable {
+                generic_table_id: GenericTableId::from(gt_uuid)
+            }
+        );
     }
 }

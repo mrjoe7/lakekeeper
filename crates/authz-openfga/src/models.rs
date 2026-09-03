@@ -1,34 +1,4 @@
-use lakekeeper::service::RoleId;
-
 use crate::FgaType;
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-/// `OpenFGA` userset with `#assignee` suffix to represent role assignees
-pub(crate) struct RoleAssignee(RoleId);
-
-impl RoleAssignee {
-    #[must_use]
-    pub(crate) fn from_role(role: RoleId) -> Self {
-        RoleAssignee(role)
-    }
-
-    #[must_use]
-    pub(crate) fn role(&self) -> RoleId {
-        self.0
-    }
-}
-
-pub(crate) trait RoleIdExt {
-    #[must_use]
-    fn into_assignees(self) -> RoleAssignee;
-}
-
-impl RoleIdExt for RoleId {
-    fn into_assignees(self) -> RoleAssignee {
-        RoleAssignee::from_role(self)
-    }
-}
 
 pub(crate) trait OpenFgaType {
     fn user_of(&self) -> &[FgaType];
@@ -40,6 +10,13 @@ impl OpenFgaType for FgaType {
     fn user_of(&self) -> &[FgaType] {
         match self {
             FgaType::Server => &[FgaType::Project],
+            // Every object type a principal can appear on as the `user` side, which is
+            // what deleting a principal must sweep. Tags belong here: `apply` and
+            // `ownership` on a tag definition are held by a user or role like any other
+            // grant. Omitting one leaves the principal's grants on that type behind, and
+            // for a user that is not inert — the id is stable across re-login and
+            // `create_user` has no `require_no_relations` guard, so a returning account
+            // silently regains them.
             FgaType::User | FgaType::Role => &[
                 FgaType::Role,
                 FgaType::Server,
@@ -48,6 +25,8 @@ impl OpenFgaType for FgaType {
                 FgaType::Namespace,
                 FgaType::Table,
                 FgaType::View,
+                FgaType::GenericTable,
+                FgaType::Tag,
             ],
             FgaType::Project => &[FgaType::Server, FgaType::Warehouse],
             FgaType::Warehouse => &[FgaType::Project, FgaType::Namespace],
@@ -56,9 +35,15 @@ impl OpenFgaType for FgaType {
                 FgaType::Namespace,
                 FgaType::Table,
                 FgaType::View,
+                FgaType::GenericTable,
             ],
-            FgaType::View | FgaType::Table => &[FgaType::Namespace],
-            FgaType::ModelVersion => &[],
+            FgaType::View | FgaType::Table | FgaType::GenericTable => &[FgaType::Namespace],
+            // The other direction: a tag definition is only ever the *object* of a
+            // relation (project→tag, user/role→tag), never the `user` side, so — like
+            // model_version — it is a user of nothing. That is why deleting a tag
+            // definition needs no user-side sweep; it says nothing about deleting a
+            // principal that holds one, which is the arm above.
+            FgaType::Tag | FgaType::ModelVersion => &[],
             FgaType::AuthModelId => &[FgaType::ModelVersion],
         }
     }

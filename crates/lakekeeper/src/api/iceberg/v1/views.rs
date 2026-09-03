@@ -1,28 +1,72 @@
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, Query, State},
+    Extension, Json, Router,
+    extract::{Path, Query, RawQuery, State},
     response::IntoResponse,
     routing::{get, post},
-    Extension, Json, Router,
 };
 use http::{HeaderMap, StatusCode};
 use iceberg::TableIdent;
+use serde::Deserialize;
 
 use super::ListTablesQuery;
 use crate::{
     api::{
-        iceberg::{
-            types::{DropParams, Prefix},
-            v1::{
-                namespace::{NamespaceIdentUrl, NamespaceParameters},
-                tables::DataAccessMode,
-            },
-        },
         ApiContext, CommitViewRequest, CreateViewRequest, ListTablesResponse, LoadViewResult,
         RenameTableRequest, Result,
+        iceberg::{
+            types::{DropParams, Prefix, ReferencingView},
+            v1::{
+                ReferencedByQuery,
+                namespace::{NamespaceIdentUrl, NamespaceParameters},
+                tables::{DataAccessMode, normalize_tabular_name},
+            },
+        },
     },
     request_metadata::RequestMetadata,
 };
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct LoadViewQuery {
+    pub referenced_by: Option<ReferencedByQuery>,
+}
+
+impl<'de> serde::Deserialize<'de> for LoadViewQuery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct LoadViewQueryVisitor;
+
+        impl Visitor<'_> for LoadViewQueryVisitor {
+            type Value = LoadViewQuery;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string containing query parameters")
+            }
+
+            fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let referenced_by = super::tables::parse_referenced_by_param(s);
+
+                Ok(LoadViewQuery { referenced_by })
+            }
+        }
+
+        deserializer.deserialize_str(LoadViewQueryVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadViewRequest {
+    pub data_access: DataAccessMode,
+    pub referenced_by: Option<Vec<ReferencingView>>,
+}
 
 #[async_trait]
 pub trait ViewService<S: crate::api::ThreadSafe>
@@ -49,8 +93,8 @@ where
     /// Load a view from the catalog
     async fn load_view(
         parameters: ViewParameters,
+        request: LoadViewRequest,
         state: ApiContext<S>,
-        data_access: impl Into<DataAccessMode> + Send,
         request_metadata: RequestMetadata,
     ) -> Result<LoadViewResult>;
 
@@ -139,22 +183,46 @@ pub fn router<I: ViewService<S>, S: crate::api::ThreadSafe>() -> Router<ApiConte
             get(
                 |Path((prefix, namespace, view)): Path<(Prefix, NamespaceIdentUrl, String)>,
                  State(api_context): State<ApiContext<S>>,
+                 RawQuery(load_view_query): RawQuery,
                  headers: HeaderMap,
                  Extension(metadata): Extension<RequestMetadata>| {
-                    {
-                        I::load_view(
-                            ViewParameters {
-                                prefix: Some(prefix),
-                                view: TableIdent {
-                                    namespace: namespace.into(),
-                                    name: view,
-                                },
+                    // Deserialization cannot fail: StrDeserializer always provides a
+                    // string, and LoadViewQuery::visit_str always returns Ok (it
+                    // delegates to parse_referenced_by_param which returns Option).
+                    let load_view_query = load_view_query
+                        .as_deref()
+                        .and_then(|q| {
+                            use serde::de::{IntoDeserializer, value::StrDeserializer};
+                            let deserializer: StrDeserializer<'_, serde::de::value::Error> =
+                                q.into_deserializer();
+                            LoadViewQuery::deserialize(deserializer)
+                                .map_err(|e| {
+                                    tracing::warn!("Failed to parse load view query: {}", e);
+                                    e
+                                })
+                                .ok()
+                        })
+                        .unwrap_or_default();
+
+                    I::load_view(
+                        ViewParameters {
+                            prefix: Some(prefix),
+                            view: TableIdent {
+                                namespace: namespace.into(),
+                                name: normalize_tabular_name(&view),
                             },
-                            api_context,
-                            crate::api::iceberg::v1::tables::parse_data_access(&headers),
-                            metadata,
-                        )
-                    }
+                        },
+                        LoadViewRequest {
+                            data_access: crate::api::iceberg::v1::tables::parse_data_access(
+                                &headers,
+                            ),
+                            referenced_by: load_view_query
+                                .referenced_by
+                                .map(ReferencedByQuery::into_inner),
+                        },
+                        api_context,
+                        metadata,
+                    )
                 },
             )
             .post(
@@ -169,7 +237,7 @@ pub fn router<I: ViewService<S>, S: crate::api::ThreadSafe>() -> Router<ApiConte
                                 prefix: Some(prefix),
                                 view: TableIdent {
                                     namespace: namespace.into(),
-                                    name: view,
+                                    name: normalize_tabular_name(&view),
                                 },
                             },
                             request,
@@ -184,14 +252,14 @@ pub fn router<I: ViewService<S>, S: crate::api::ThreadSafe>() -> Router<ApiConte
                 |Path((prefix, namespace, view)): Path<(Prefix, NamespaceIdentUrl, String)>,
                  Query(drop_params): Query<DropParams>,
                  State(api_context): State<ApiContext<S>>,
-                 Extension(metadata): Extension<RequestMetadata>| async {
+                 Extension(metadata): Extension<RequestMetadata>| async move {
                     {
                         I::drop_view(
                             ViewParameters {
                                 prefix: Some(prefix),
                                 view: TableIdent {
                                     namespace: namespace.into(),
-                                    name: view,
+                                    name: normalize_tabular_name(&view),
                                 },
                             },
                             drop_params,
@@ -206,14 +274,14 @@ pub fn router<I: ViewService<S>, S: crate::api::ThreadSafe>() -> Router<ApiConte
             .head(
                 |Path((prefix, namespace, view)): Path<(Prefix, NamespaceIdentUrl, String)>,
                  State(api_context): State<ApiContext<S>>,
-                 Extension(metadata): Extension<RequestMetadata>| async {
+                 Extension(metadata): Extension<RequestMetadata>| async move {
                     {
                         I::view_exists(
                             ViewParameters {
                                 prefix: Some(prefix),
                                 view: TableIdent {
                                     namespace: namespace.into(),
-                                    name: view,
+                                    name: normalize_tabular_name(&view),
                                 },
                             },
                             api_context,

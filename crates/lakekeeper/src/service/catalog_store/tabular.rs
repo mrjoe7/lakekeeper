@@ -1,20 +1,28 @@
+use std::collections::HashMap;
+
 use http::StatusCode;
-use iceberg::TableIdent;
+use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
 use lakekeeper_io::{Location, LocationParseError};
 
 use crate::{
+    WarehouseId,
     api::{
         iceberg::v1::{PaginatedMapping, PaginationQuery},
         management::v1::TabularType,
     },
     service::{
-        authz::ActionOnTableOrView, define_simple_error, define_transparent_error,
-        impl_error_stack_methods, impl_from_with_detail, tasks::TaskId, CatalogBackendError,
-        CatalogStore, InvalidNamespaceIdentifier, InvalidPaginationToken, NamespaceId, Result,
-        TableId, TabularId, TabularIdentBorrowed, TabularIdentOwned, Transaction, ViewId,
+        CatalogBackendError, CatalogStore, GenericTableId, InvalidNamespaceIdentifier,
+        InvalidPaginationToken, NamespaceId, NamespaceVersion, Result, TableId, TabularId,
+        TabularIdentBorrowed, TabularIdentOwned, Transaction, ViewId, WarehouseVersion,
+        authz::{
+            ActionOnGenericTable, ActionOnTable, ActionOnTableOrView, ActionOnView, UserOrRole,
+        },
+        define_simple_error, define_transparent_error,
+        events::impl_authorization_failure_source,
+        impl_error_stack_methods, impl_from_with_detail,
+        tasks::TaskId,
     },
-    WarehouseId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,20 +80,105 @@ pub struct ExpirationTaskInfo {
 pub struct TabularInfo<T: std::fmt::Debug + PartialEq + Copy> {
     pub warehouse_id: WarehouseId,
     pub namespace_id: NamespaceId,
+    pub namespace_version: NamespaceVersion,
+    pub warehouse_version: WarehouseVersion,
+    /// Case handling note: the case carried by `tabular_ident` depends on how
+    /// this entry was fetched.
+    ///
+    /// - **By ident** (e.g. `get_tabular_infos_by_idents`): `tabular_ident` carries
+    ///   the *caller's* case — namespace and table name both reflect the case the
+    ///   caller sent, even when it differs from the stored (canonical) case due to
+    ///   case-insensitive matching via the DB collation.
+    /// - **By id** (e.g. `get_tabular_infos_by_ids`): `tabular_ident` carries the
+    ///   *canonical* (stored, creation-time) case, because there is no caller case
+    ///   to honor.
+    ///
+    /// If you need a stable, case-deterministic identifier across requests (e.g.
+    /// for audit logs), refetch by `tabular_id` or use the id itself as the key.
     pub tabular_ident: TableIdent, // Not used to determine type
-    pub tabular_id: T,             // Contains type info
+    pub tabular_id: T, // Contains type info
     pub location: Location,
     pub metadata_location: Option<Location>,
     pub protected: bool,
+    pub properties: HashMap<String, String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+impl BasicTabularInfo for TableInfo {
+    fn namespace_version(&self) -> NamespaceVersion {
+        self.namespace_version
+    }
+    fn warehouse_version(&self) -> WarehouseVersion {
+        self.warehouse_version
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        self.warehouse_id
+    }
+
+    fn tabular_ident(&self) -> &TableIdent {
+        &self.tabular_ident
+    }
+
+    fn tabular_id(&self) -> TabularId {
+        self.tabular_id.into()
+    }
+
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+}
+impl BasicTabularInfo for ViewInfo {
+    fn namespace_version(&self) -> NamespaceVersion {
+        self.namespace_version
+    }
+    fn warehouse_version(&self) -> WarehouseVersion {
+        self.warehouse_version
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        self.warehouse_id
+    }
+
+    fn tabular_ident(&self) -> &TableIdent {
+        &self.tabular_ident
+    }
+
+    fn tabular_id(&self) -> TabularId {
+        self.tabular_id.into()
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+}
+impl BasicTabularInfo for GenericTabularInfo {
+    fn namespace_version(&self) -> NamespaceVersion {
+        self.namespace_version
+    }
+    fn warehouse_version(&self) -> WarehouseVersion {
+        self.warehouse_version
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        self.warehouse_id
+    }
+
+    fn tabular_ident(&self) -> &TableIdent {
+        &self.tabular_ident
+    }
+
+    fn tabular_id(&self) -> TabularId {
+        self.tabular_id.into()
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
 }
 #[derive(Debug, Clone, PartialEq, derive_more::From)]
 pub enum ViewOrTableInfo {
     Table(TableInfo),
     View(ViewInfo),
+    GenericTable(GenericTabularInfo),
 }
 pub type TableInfo = TabularInfo<TableId>;
 pub type ViewInfo = TabularInfo<ViewId>;
+pub type GenericTabularInfo = TabularInfo<GenericTableId>;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 #[error("{source}")]
@@ -105,13 +198,12 @@ impl From<LocationParseError> for InternalParseLocationError {
 }
 impl From<InternalParseLocationError> for ErrorModel {
     fn from(err: InternalParseLocationError) -> Self {
-        ErrorModel {
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            r#type: "InternalParseLocationError".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .r#type("InternalParseLocationError")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 impl From<InternalParseLocationError> for IcebergErrorResponse {
@@ -122,7 +214,8 @@ impl From<InternalParseLocationError> for IcebergErrorResponse {
     }
 }
 
-pub(crate) fn build_tabular_ident_from_vec(
+#[cfg(feature = "sqlx-postgres")]
+pub fn build_tabular_ident_from_vec(
     name_parts: &[String],
 ) -> Result<TableIdent, InvalidTabularIdentifier> {
     TableIdent::from_strs(name_parts.to_owned()).map_err(|e| {
@@ -138,13 +231,12 @@ define_simple_error!(
 );
 impl From<InvalidTabularIdentifier> for ErrorModel {
     fn from(err: InvalidTabularIdentifier) -> Self {
-        ErrorModel {
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            r#type: "InvalidTabularIdentifier".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .r#type("InvalidTabularIdentifier")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 impl From<InvalidTabularIdentifier> for IcebergErrorResponse {
@@ -161,6 +253,7 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => TabularId::Table(info.tabular_id),
             Self::View(info) => TabularId::View(info.tabular_id),
+            Self::GenericTable(info) => TabularId::GenericTable(info.tabular_id),
         }
     }
 
@@ -169,6 +262,16 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => &info.tabular_ident,
             Self::View(info) => &info.tabular_ident,
+            Self::GenericTable(info) => &info.tabular_ident,
+        }
+    }
+
+    #[must_use]
+    pub fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Table(info) => info.namespace_id,
+            Self::View(info) => info.namespace_id,
+            Self::GenericTable(info) => info.namespace_id,
         }
     }
 
@@ -177,6 +280,7 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => info.protected,
             Self::View(info) => info.protected,
+            Self::GenericTable(info) => info.protected,
         }
     }
 
@@ -185,17 +289,36 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => info.updated_at,
             Self::View(info) => info.updated_at,
+            Self::GenericTable(info) => info.updated_at,
         }
     }
 
-    pub fn as_action_request<AV, AT>(
+    pub fn as_action_request<'u, AV, AT, AG>(
         &self,
         view_action: AV,
         table_action: AT,
-    ) -> ActionOnTableOrView<'_, TableInfo, ViewInfo, AT, AV> {
+        generic_table_action: AG,
+        user: Option<&'u UserOrRole>,
+    ) -> ActionOnTableOrView<'_, 'u, TableInfo, ViewInfo, AT, AV, GenericTabularInfo, AG> {
         match self {
-            Self::View(view) => ActionOnTableOrView::View((view, view_action)),
-            Self::Table(table) => ActionOnTableOrView::Table((table, table_action)),
+            Self::View(view) => ActionOnTableOrView::View(ActionOnView {
+                info: view,
+                action: view_action,
+                user,
+                is_delegated_execution: false,
+            }),
+            Self::Table(table) => ActionOnTableOrView::Table(ActionOnTable {
+                info: table,
+                action: table_action,
+                user,
+                is_delegated_execution: false,
+            }),
+            Self::GenericTable(gt) => ActionOnTableOrView::GenericTable(ActionOnGenericTable {
+                info: gt,
+                action: generic_table_action,
+                user,
+                is_delegated_execution: false,
+            }),
         }
     }
 
@@ -204,6 +327,7 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => info.metadata_location.as_ref(),
             Self::View(info) => info.metadata_location.as_ref(),
+            Self::GenericTable(info) => info.metadata_location.as_ref(),
         }
     }
 
@@ -212,13 +336,14 @@ impl ViewOrTableInfo {
         match self {
             Self::Table(info) => &info.location,
             Self::View(info) => &info.location,
+            Self::GenericTable(info) => &info.location,
         }
     }
 }
 
 #[cfg(test)]
 impl TableInfo {
-    pub(crate) fn new_random() -> Self {
+    pub(crate) fn new_random(warehouse_id: WarehouseId) -> Self {
         use std::str::FromStr;
 
         let table_id = TableId::new_random();
@@ -229,8 +354,10 @@ impl TableInfo {
         let location =
             Location::from_str(&format!("s3://bucket/path/to/table_{table_id}")).unwrap();
         TableInfo {
-            warehouse_id: WarehouseId::new_random(),
+            warehouse_id,
             namespace_id: NamespaceId::new_random(),
+            namespace_version: 0.into(),
+            warehouse_version: 0.into(),
             tabular_ident,
             tabular_id: table_id,
             metadata_location: Some(
@@ -239,13 +366,14 @@ impl TableInfo {
             location,
             protected: false,
             updated_at: Some(chrono::Utc::now()),
+            properties: HashMap::new(),
         }
     }
 }
 
 #[cfg(test)]
 impl ViewInfo {
-    pub(crate) fn new_random() -> Self {
+    pub(crate) fn new_random(warehouse_id: WarehouseId) -> Self {
         use std::str::FromStr;
 
         let view_id = ViewId::new_random();
@@ -255,8 +383,10 @@ impl ViewInfo {
         );
         let location = Location::from_str(&format!("s3://bucket/path/to/view_{view_id}")).unwrap();
         ViewInfo {
-            warehouse_id: WarehouseId::new_random(),
+            warehouse_id,
             namespace_id: NamespaceId::new_random(),
+            namespace_version: 0.into(),
+            warehouse_version: 0.into(),
             tabular_ident,
             tabular_id: view_id,
             metadata_location: Some(
@@ -265,6 +395,72 @@ impl ViewInfo {
             location,
             protected: false,
             updated_at: Some(chrono::Utc::now()),
+            properties: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl GenericTabularInfo {
+    /// Create a test `GenericTabularInfo` with the given IDs and dummy values.
+    ///
+    /// # Panics
+    /// Panics if the hardcoded S3 location cannot be parsed (never in practice).
+    #[must_use]
+    pub fn test_default(
+        warehouse_id: WarehouseId,
+        namespace_id: NamespaceId,
+        generic_table_id: GenericTableId,
+    ) -> Self {
+        use std::str::FromStr;
+        let tabular_ident = TableIdent::new(
+            iceberg::NamespaceIdent::new("test".to_string()),
+            format!("generic_table_{generic_table_id}"),
+        );
+        let location = Location::from_str(&format!(
+            "s3://bucket/path/to/generic_table_{generic_table_id}"
+        ))
+        .unwrap();
+        GenericTabularInfo {
+            warehouse_id,
+            namespace_id,
+            namespace_version: 0.into(),
+            warehouse_version: 0.into(),
+            tabular_ident,
+            tabular_id: generic_table_id,
+            metadata_location: None,
+            location,
+            protected: false,
+            updated_at: None,
+            properties: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GenericTabularInfo {
+    pub(crate) fn new_random(warehouse_id: WarehouseId) -> Self {
+        use std::str::FromStr;
+
+        let gt_id = GenericTableId::new_random();
+        let tabular_ident = TableIdent::new(
+            iceberg::NamespaceIdent::new("test".to_string()),
+            format!("generic_table_{gt_id}"),
+        );
+        let location =
+            Location::from_str(&format!("s3://bucket/path/to/generic_table_{gt_id}")).unwrap();
+        GenericTabularInfo {
+            warehouse_id,
+            namespace_id: NamespaceId::new_random(),
+            namespace_version: 0.into(),
+            warehouse_version: 0.into(),
+            tabular_ident,
+            tabular_id: gt_id,
+            metadata_location: None,
+            location,
+            protected: false,
+            updated_at: Some(chrono::Utc::now()),
+            properties: HashMap::new(),
         }
     }
 }
@@ -280,39 +476,44 @@ pub struct ViewNamed {
     pub view_ident: TableIdent,
     pub view_id: ViewId,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericTableNamed {
+    pub warehouse_id: WarehouseId,
+    pub generic_table_ident: TableIdent,
+    pub generic_table_id: GenericTableId,
+}
 pub trait AuthZTableInfo: Send + Sync {
     fn warehouse_id(&self) -> WarehouseId;
     fn table_ident(&self) -> &TableIdent;
     fn table_id(&self) -> TableId;
+    fn namespace_id(&self) -> NamespaceId;
+    fn namespace_ident(&self) -> &NamespaceIdent {
+        self.table_ident().namespace()
+    }
+    fn is_protected(&self) -> bool;
+    fn properties(&self) -> &HashMap<String, String>;
 }
 pub trait AuthZViewInfo: Send + Sync {
     fn warehouse_id(&self) -> WarehouseId;
     fn view_ident(&self) -> &TableIdent;
     fn view_id(&self) -> ViewId;
+    fn namespace_id(&self) -> NamespaceId;
+    fn namespace_ident(&self) -> &NamespaceIdent {
+        self.view_ident().namespace()
+    }
+    fn is_protected(&self) -> bool;
+    fn properties(&self) -> &HashMap<String, String>;
 }
-
-impl AuthZViewInfo for ViewNamed {
-    fn warehouse_id(&self) -> WarehouseId {
-        self.warehouse_id
+pub trait AuthZGenericTableInfo: Send + Sync {
+    fn warehouse_id(&self) -> WarehouseId;
+    fn generic_table_ident(&self) -> &TableIdent;
+    fn generic_table_id(&self) -> GenericTableId;
+    fn namespace_id(&self) -> NamespaceId;
+    fn namespace_ident(&self) -> &NamespaceIdent {
+        self.generic_table_ident().namespace()
     }
-    fn view_ident(&self) -> &TableIdent {
-        &self.view_ident
-    }
-    fn view_id(&self) -> ViewId {
-        self.view_id
-    }
-}
-
-impl AuthZTableInfo for TableNamed {
-    fn warehouse_id(&self) -> WarehouseId {
-        self.warehouse_id
-    }
-    fn table_ident(&self) -> &TableIdent {
-        &self.table_ident
-    }
-    fn table_id(&self) -> TableId {
-        self.table_id
-    }
+    fn is_protected(&self) -> bool;
+    fn properties(&self) -> &HashMap<String, String>;
 }
 
 impl AuthZTableInfo for TableInfo {
@@ -324,6 +525,15 @@ impl AuthZTableInfo for TableInfo {
     }
     fn table_id(&self) -> TableId {
         self.tabular_id
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
     }
 }
 
@@ -337,6 +547,15 @@ impl AuthZTableInfo for TableDeletionInfo {
     fn table_id(&self) -> TableId {
         self.tabular.tabular_id
     }
+    fn namespace_id(&self) -> NamespaceId {
+        self.tabular.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.tabular.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.tabular.properties
+    }
 }
 
 impl AuthZViewInfo for ViewInfo {
@@ -348,6 +567,57 @@ impl AuthZViewInfo for ViewInfo {
     }
     fn view_id(&self) -> ViewId {
         self.tabular_id
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+}
+
+impl AuthZGenericTableInfo for GenericTabularInfo {
+    fn warehouse_id(&self) -> WarehouseId {
+        self.warehouse_id
+    }
+    fn generic_table_ident(&self) -> &TableIdent {
+        &self.tabular_ident
+    }
+    fn generic_table_id(&self) -> GenericTableId {
+        self.tabular_id
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+}
+
+impl AuthZGenericTableInfo for GenericTableDeletionInfo {
+    fn warehouse_id(&self) -> WarehouseId {
+        self.tabular.warehouse_id
+    }
+    fn generic_table_ident(&self) -> &TableIdent {
+        &self.tabular.tabular_ident
+    }
+    fn generic_table_id(&self) -> GenericTableId {
+        self.tabular.tabular_id
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.tabular.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.tabular.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.tabular.properties
     }
 }
 
@@ -361,6 +631,159 @@ impl AuthZViewInfo for ViewDeletionInfo {
     fn view_id(&self) -> ViewId {
         self.tabular.tabular_id
     }
+    fn namespace_id(&self) -> NamespaceId {
+        self.tabular.namespace_id
+    }
+    fn is_protected(&self) -> bool {
+        self.tabular.protected
+    }
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.tabular.properties
+    }
+}
+
+pub trait AuthZTabularInfo: BasicTabularInfo + Send + Sync {
+    fn tabular_id(&self) -> TabularId;
+    fn namespace_id(&self) -> NamespaceId;
+    fn namespace_ident(&self) -> &NamespaceIdent {
+        self.tabular_ident().namespace()
+    }
+    fn is_protected(&self) -> bool;
+    fn properties(&self) -> &HashMap<String, String>;
+}
+
+impl AuthZTabularInfo for ViewOrTableInfo {
+    fn tabular_id(&self) -> TabularId {
+        match self {
+            Self::Table(info) => TabularId::Table(info.tabular_id),
+            Self::View(info) => TabularId::View(info.tabular_id),
+            Self::GenericTable(info) => TabularId::GenericTable(info.tabular_id),
+        }
+    }
+
+    fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Table(info) => info.namespace_id,
+            Self::View(info) => info.namespace_id,
+            Self::GenericTable(info) => info.namespace_id,
+        }
+    }
+
+    fn is_protected(&self) -> bool {
+        match self {
+            Self::Table(info) => info.protected,
+            Self::View(info) => info.protected,
+            Self::GenericTable(info) => info.protected,
+        }
+    }
+
+    fn properties(&self) -> &HashMap<String, String> {
+        match self {
+            Self::Table(info) => &info.properties,
+            Self::View(info) => &info.properties,
+            Self::GenericTable(info) => &info.properties,
+        }
+    }
+}
+
+pub trait BasicTabularInfo: Send + Sync {
+    fn warehouse_id(&self) -> WarehouseId;
+    fn warehouse_version(&self) -> WarehouseVersion;
+    fn tabular_ident(&self) -> &TableIdent;
+    fn tabular_id(&self) -> TabularId;
+    fn namespace_id(&self) -> NamespaceId;
+    fn namespace_ident(&self) -> &NamespaceIdent {
+        self.tabular_ident().namespace()
+    }
+    fn namespace_version(&self) -> NamespaceVersion;
+}
+impl BasicTabularInfo for ViewOrTableInfo {
+    fn namespace_version(&self) -> NamespaceVersion {
+        match self {
+            Self::Table(info) => info.namespace_version,
+            Self::View(info) => info.namespace_version,
+            Self::GenericTable(info) => info.namespace_version,
+        }
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Table(info) => info.namespace_id,
+            Self::View(info) => info.namespace_id,
+            Self::GenericTable(info) => info.namespace_id,
+        }
+    }
+    fn warehouse_version(&self) -> WarehouseVersion {
+        match self {
+            Self::Table(info) => info.warehouse_version,
+            Self::View(info) => info.warehouse_version,
+            Self::GenericTable(info) => info.warehouse_version,
+        }
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        match self {
+            Self::Table(info) => info.warehouse_id,
+            Self::View(info) => info.warehouse_id,
+            Self::GenericTable(info) => info.warehouse_id,
+        }
+    }
+    fn tabular_ident(&self) -> &TableIdent {
+        match self {
+            Self::Table(info) => &info.tabular_ident,
+            Self::View(info) => &info.tabular_ident,
+            Self::GenericTable(info) => &info.tabular_ident,
+        }
+    }
+    fn tabular_id(&self) -> TabularId {
+        match self {
+            Self::Table(info) => TabularId::Table(info.tabular_id),
+            Self::View(info) => TabularId::View(info.tabular_id),
+            Self::GenericTable(info) => TabularId::GenericTable(info.tabular_id),
+        }
+    }
+}
+impl BasicTabularInfo for ViewOrTableDeletionInfo {
+    fn namespace_version(&self) -> NamespaceVersion {
+        match self {
+            Self::Table(info) => info.tabular.namespace_version,
+            Self::View(info) => info.tabular.namespace_version,
+            Self::GenericTable(info) => info.tabular.namespace_version,
+        }
+    }
+    fn warehouse_version(&self) -> WarehouseVersion {
+        match self {
+            Self::Table(info) => info.tabular.warehouse_version,
+            Self::View(info) => info.tabular.warehouse_version,
+            Self::GenericTable(info) => info.tabular.warehouse_version,
+        }
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        match self {
+            Self::Table(info) => info.tabular.warehouse_id,
+            Self::View(info) => info.tabular.warehouse_id,
+            Self::GenericTable(info) => info.tabular.warehouse_id,
+        }
+    }
+    fn tabular_ident(&self) -> &TableIdent {
+        match self {
+            Self::Table(info) => &info.tabular.tabular_ident,
+            Self::View(info) => &info.tabular.tabular_ident,
+            Self::GenericTable(info) => &info.tabular.tabular_ident,
+        }
+    }
+    fn tabular_id(&self) -> TabularId {
+        match self {
+            Self::Table(info) => TabularId::Table(info.tabular.tabular_id),
+            Self::View(info) => TabularId::View(info.tabular.tabular_id),
+            Self::GenericTable(info) => TabularId::GenericTable(info.tabular.tabular_id),
+        }
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Table(info) => info.tabular.namespace_id,
+            Self::View(info) => info.tabular.namespace_id,
+            Self::GenericTable(info) => info.tabular.namespace_id,
+        }
+    }
 }
 
 impl ViewOrTableInfo {
@@ -368,7 +791,7 @@ impl ViewOrTableInfo {
     pub fn into_table_info(self) -> Option<TableInfo> {
         match self {
             Self::Table(info) => Some(info),
-            Self::View(_) => None,
+            Self::View(_) | Self::GenericTable(_) => None,
         }
     }
 
@@ -376,7 +799,15 @@ impl ViewOrTableInfo {
     pub fn into_view_info(self) -> Option<ViewInfo> {
         match self {
             Self::View(info) => Some(info),
-            Self::Table(_) => None,
+            Self::Table(_) | Self::GenericTable(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn into_generic_table_info(self) -> Option<GenericTabularInfo> {
+        match self {
+            Self::GenericTable(info) => Some(info),
+            Self::Table(_) | Self::View(_) => None,
         }
     }
 }
@@ -388,14 +819,15 @@ pub struct TabularDeletionInfo<T: std::fmt::Debug + PartialEq + Copy> {
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub expiration_task: Option<ExpirationTaskInfo>,
 }
-
 #[derive(Debug, PartialEq, derive_more::From)]
 pub enum ViewOrTableDeletionInfo {
     Table(TableDeletionInfo),
     View(ViewDeletionInfo),
+    GenericTable(GenericTableDeletionInfo),
 }
 pub type TableDeletionInfo = TabularDeletionInfo<TableId>;
 pub type ViewDeletionInfo = TabularDeletionInfo<ViewId>;
+pub type GenericTableDeletionInfo = TabularDeletionInfo<GenericTableId>;
 
 impl ViewOrTableDeletionInfo {
     #[must_use]
@@ -403,6 +835,16 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => ViewOrTableInfo::Table(info.tabular),
             Self::View(info) => ViewOrTableInfo::View(info.tabular),
+            Self::GenericTable(info) => ViewOrTableInfo::GenericTable(info.tabular),
+        }
+    }
+
+    #[must_use]
+    pub fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Table(info) => info.tabular.namespace_id,
+            Self::View(info) => info.tabular.namespace_id,
+            Self::GenericTable(info) => info.tabular.namespace_id,
         }
     }
 
@@ -411,6 +853,7 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => TabularId::Table(info.tabular.tabular_id),
             Self::View(info) => TabularId::View(info.tabular.tabular_id),
+            Self::GenericTable(info) => TabularId::GenericTable(info.tabular.tabular_id),
         }
     }
 
@@ -419,6 +862,7 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => info.deleted_at,
             Self::View(info) => info.deleted_at,
+            Self::GenericTable(info) => info.deleted_at,
         }
     }
 
@@ -427,6 +871,7 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => info.created_at,
             Self::View(info) => info.created_at,
+            Self::GenericTable(info) => info.created_at,
         }
     }
 
@@ -435,6 +880,7 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => info.expiration_task.as_ref(),
             Self::View(info) => info.expiration_task.as_ref(),
+            Self::GenericTable(info) => info.expiration_task.as_ref(),
         }
     }
 
@@ -443,6 +889,7 @@ impl ViewOrTableDeletionInfo {
         match self {
             Self::Table(info) => &info.tabular.tabular_ident,
             Self::View(info) => &info.tabular.tabular_ident,
+            Self::GenericTable(info) => &info.tabular.tabular_ident,
         }
     }
 
@@ -450,7 +897,7 @@ impl ViewOrTableDeletionInfo {
     pub fn into_table_info(self) -> Option<TableDeletionInfo> {
         match self {
             Self::Table(info) => Some(info),
-            Self::View(_) => None,
+            Self::View(_) | Self::GenericTable(_) => None,
         }
     }
 
@@ -458,18 +905,45 @@ impl ViewOrTableDeletionInfo {
     pub fn into_view_info(self) -> Option<ViewDeletionInfo> {
         match self {
             Self::View(info) => Some(info),
-            Self::Table(_) => None,
+            Self::Table(_) | Self::GenericTable(_) => None,
         }
     }
 
-    pub fn as_action_request<AV, AT>(
+    pub fn as_action_request<'u, AV, AT, AG>(
         &self,
         view_action: AV,
         table_action: AT,
-    ) -> ActionOnTableOrView<'_, TableDeletionInfo, ViewDeletionInfo, AT, AV> {
+        generic_table_action: AG,
+        user: Option<&'u UserOrRole>,
+    ) -> ActionOnTableOrView<
+        '_,
+        'u,
+        TableDeletionInfo,
+        ViewDeletionInfo,
+        AT,
+        AV,
+        GenericTableDeletionInfo,
+        AG,
+    > {
         match self {
-            Self::View(view) => ActionOnTableOrView::View((view, view_action)),
-            Self::Table(table) => ActionOnTableOrView::Table((table, table_action)),
+            Self::View(view) => ActionOnTableOrView::View(ActionOnView {
+                info: view,
+                action: view_action,
+                user,
+                is_delegated_execution: false,
+            }),
+            Self::Table(table) => ActionOnTableOrView::Table(ActionOnTable {
+                info: table,
+                action: table_action,
+                user,
+                is_delegated_execution: false,
+            }),
+            Self::GenericTable(gt) => ActionOnTableOrView::GenericTable(ActionOnGenericTable {
+                info: gt,
+                action: generic_table_action,
+                user,
+                is_delegated_execution: false,
+            }),
         }
     }
 }
@@ -478,6 +952,27 @@ impl ViewOrTableDeletionInfo {
 pub struct CatalogSearchTabularInfo {
     pub tabular: ViewOrTableInfo,
     pub distance: Option<f32>,
+}
+
+impl BasicTabularInfo for CatalogSearchTabularInfo {
+    fn warehouse_version(&self) -> WarehouseVersion {
+        self.tabular.warehouse_version()
+    }
+    fn warehouse_id(&self) -> WarehouseId {
+        self.tabular.warehouse_id()
+    }
+    fn tabular_ident(&self) -> &TableIdent {
+        self.tabular.tabular_ident()
+    }
+    fn tabular_id(&self) -> TabularId {
+        self.tabular.tabular_id()
+    }
+    fn namespace_id(&self) -> NamespaceId {
+        self.tabular.namespace_id()
+    }
+    fn namespace_version(&self) -> NamespaceVersion {
+        self.tabular.namespace_version()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +1019,7 @@ macro_rules! define_ident_or_id {
 }
 define_ident_or_id!(TableIdentOrId, TableId, Table);
 define_ident_or_id!(ViewIdentOrId, ViewId, View);
+define_ident_or_id!(GenericTableIdentOrId, GenericTableId, GenericTable);
 
 #[derive(Hash, Debug, Clone, PartialEq, Eq, derive_more::From)]
 pub enum TabularIdentOrId {
@@ -550,11 +1046,24 @@ impl TabularIdentOrId {
     }
 
     #[must_use]
+    pub fn is_generic_table(&self) -> bool {
+        matches!(
+            self,
+            TabularIdentOrId::Ident(TabularIdentOwned::GenericTable(_))
+                | TabularIdentOrId::Id(TabularId::GenericTable(_))
+        )
+    }
+
+    #[must_use]
     pub fn type_str(&self) -> &'static str {
-        if self.is_table() {
-            "table"
-        } else {
+        // Explicit dispatch — generic_table first defends against a future
+        // variant silently being labelled "generic-table" via the fallback.
+        if self.is_generic_table() {
+            "generic-table"
+        } else if self.is_view() {
             "view"
+        } else {
+            "table"
         }
     }
 }
@@ -564,10 +1073,12 @@ impl std::fmt::Display for TabularIdentOrId {
             TabularIdentOrId::Ident(ident) => match ident {
                 TabularIdentOwned::Table(t) => write!(f, "Table '{t}'"),
                 TabularIdentOwned::View(v) => write!(f, "View '{v}'"),
+                TabularIdentOwned::GenericTable(g) => write!(f, "GenericTable '{g}'"),
             },
             TabularIdentOrId::Id(id) => match id {
                 TabularId::Table(t) => write!(f, "Table ID '{t}'"),
                 TabularId::View(v) => write!(f, "View ID '{v}'"),
+                TabularId::GenericTable(g) => write!(f, "GenericTable ID '{g}'"),
             },
         }
     }
@@ -580,6 +1091,11 @@ impl From<TableId> for TabularIdentOrId {
 impl From<ViewId> for TabularIdentOrId {
     fn from(value: ViewId) -> Self {
         Self::Id(TabularId::View(value))
+    }
+}
+impl From<GenericTableId> for TabularIdentOrId {
+    fn from(value: GenericTableId) -> Self {
+        Self::Id(TabularId::GenericTable(value))
     }
 }
 
@@ -625,6 +1141,11 @@ macro_rules! define_simple_tabular_err {
             pub fn is_view(&self) -> bool {
                 self.tabular().is_view()
             }
+
+            #[must_use]
+            pub fn is_generic_table(&self) -> bool {
+                self.tabular().is_generic_table()
+            }
         }
 
         impl_error_stack_methods!($error_name);
@@ -638,13 +1159,12 @@ define_simple_error!(
 );
 impl From<TabularAlreadyExists> for ErrorModel {
     fn from(err: TabularAlreadyExists) -> Self {
-        ErrorModel {
-            code: StatusCode::CONFLICT.as_u16(),
-            r#type: "AlreadyExistsException".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::CONFLICT.as_u16())
+            .r#type("AlreadyExistsException")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -654,13 +1174,12 @@ define_simple_tabular_err!(
 );
 impl From<ProtectedTabularDeletionWithoutForce> for ErrorModel {
     fn from(err: ProtectedTabularDeletionWithoutForce) -> Self {
-        ErrorModel {
-            code: StatusCode::CONFLICT.as_u16(),
-            r#type: "ProtectedTabularDeletionWithoutForce".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::CONFLICT.as_u16())
+            .r#type("ProtectedTabularDeletionWithoutForce")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -671,32 +1190,32 @@ define_simple_tabular_err!(
 );
 impl From<ConcurrentUpdateError> for ErrorModel {
     fn from(err: ConcurrentUpdateError) -> Self {
-        ErrorModel {
-            code: StatusCode::CONFLICT.as_u16(),
-            r#type: CONCURRENT_UPDATE_ERROR_TYPE.to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::CONFLICT.as_u16())
+            .r#type(CONCURRENT_UPDATE_ERROR_TYPE)
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
 define_simple_tabular_err!(TabularNotFound, "Error getting tabular from catalog");
 impl From<TabularNotFound> for ErrorModel {
     fn from(err: TabularNotFound) -> Self {
-        let t = if err.is_view() {
+        let t = if err.is_generic_table() {
+            "NoSuchGenericTableException"
+        } else if err.is_view() {
             "NoSuchViewException"
         } else {
             "NoSuchTableException"
         };
 
-        ErrorModel {
-            code: StatusCode::NOT_FOUND.as_u16(),
-            r#type: t.to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .r#type(t)
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 impl From<TabularNotFound> for IcebergErrorResponse {
@@ -713,7 +1232,7 @@ pub struct SerializationError {
     entity: String,
     stack: Vec<String>,
     #[source]
-    source: serde_json::Error,
+    source: Box<serde_json::Error>,
 }
 impl_error_stack_methods!(SerializationError);
 impl SerializationError {
@@ -722,21 +1241,22 @@ impl SerializationError {
         Self {
             entity: entity.into(),
             stack: Vec::new(),
-            source,
+            source: Box::new(source),
         }
     }
 }
 impl From<SerializationError> for ErrorModel {
     fn from(err: SerializationError) -> Self {
-        ErrorModel {
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            r#type: "SerializationError".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: Some(Box::new(err.source)),
-        }
+        ErrorModel::builder()
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .r#type("SerializationError")
+            .message(err.to_string())
+            .stack(err.stack)
+            .source(Some(err.source))
+            .build()
     }
 }
+impl_authorization_failure_source!(SerializationError => InternalCatalogError);
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}: {source}")]
@@ -782,13 +1302,13 @@ impl From<ConversionError> for ErrorModel {
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        ErrorModel {
-            code: code.as_u16(),
-            r#type: "ConversionError".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: Some(err.source),
-        }
+        ErrorModel::builder()
+            .code(code.as_u16())
+            .r#type("ConversionError")
+            .message(err.to_string())
+            .stack(err.stack)
+            .source(Some(err.source))
+            .build()
     }
 }
 
@@ -818,13 +1338,26 @@ define_simple_tabular_err!(
 );
 impl From<ViewInTableList> for ErrorModel {
     fn from(err: ViewInTableList) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "ViewInTableList".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("ViewInTableList")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
+    }
+}
+define_simple_tabular_err!(
+    GenericTableInTableList,
+    "Catalog returned a generic table when filtering for tables"
+);
+impl From<GenericTableInTableList> for ErrorModel {
+    fn from(err: GenericTableInTableList) -> Self {
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("GenericTableInTableList")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 define_simple_tabular_err!(
@@ -833,13 +1366,26 @@ define_simple_tabular_err!(
 );
 impl From<TableInViewList> for ErrorModel {
     fn from(err: TableInViewList) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "TableInViewList".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("TableInViewList")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
+    }
+}
+define_simple_tabular_err!(
+    GenericTableInViewList,
+    "Catalog returned a generic table when filtering for views"
+);
+impl From<GenericTableInViewList> for ErrorModel {
+    fn from(err: GenericTableInViewList) -> Self {
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("GenericTableInViewList")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -859,7 +1405,8 @@ define_transparent_error! {
     stack_message: "Error listing tables in catalog",
     variants: [
         ListTabularsError,
-        ViewInTableList
+        ViewInTableList,
+        GenericTableInTableList
     ]
 }
 
@@ -868,7 +1415,8 @@ define_transparent_error! {
     stack_message: "Error listing tables in catalog",
     variants: [
         ListTabularsError,
-        TableInViewList
+        TableInViewList,
+        GenericTableInViewList
     ]
 }
 
@@ -904,15 +1452,15 @@ define_simple_error!(
 
 impl From<UnexpectedTabularInResponse> for ErrorModel {
     fn from(err: UnexpectedTabularInResponse) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "UnexpectedTabularInResponse".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("UnexpectedTabularInResponse")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
+impl_authorization_failure_source!(UnexpectedTabularInResponse => InternalCatalogError);
 
 // --------------------------- Search Tabulars ----------------
 define_transparent_error! {
@@ -924,6 +1472,7 @@ define_transparent_error! {
         InternalParseLocationError
     ]
 }
+impl_authorization_failure_source!(InternalParseLocationError => InternalCatalogError);
 
 // --------------------------- Rename Tabulars ----------------
 define_transparent_error! {
@@ -933,6 +1482,7 @@ define_transparent_error! {
         CatalogBackendError,
         InvalidNamespaceIdentifier,
         InternalParseLocationError,
+        TabularAlreadyExists,
         TabularNotFound
     ]
 }
@@ -996,13 +1546,12 @@ impl LocationAlreadyTaken {
 impl_error_stack_methods!(LocationAlreadyTaken);
 impl From<LocationAlreadyTaken> for ErrorModel {
     fn from(err: LocationAlreadyTaken) -> Self {
-        ErrorModel {
-            code: StatusCode::CONFLICT.as_u16(),
-            r#type: "LocationAlreadyTaken".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::CONFLICT.as_u16())
+            .r#type("LocationAlreadyTaken")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -1083,7 +1632,7 @@ where
         tabulars: &[TabularIdentBorrowed<'_>],
         list_flags: TabularListFlags,
         catalog_state: Self::State,
-    ) -> Result<Vec<ViewOrTableInfo>, GetTabularInfoError> {
+    ) -> Result<HashMap<TableIdent, ViewOrTableInfo>, GetTabularInfoError> {
         Self::get_tabular_infos_by_ident_impl(warehouse_id, tabulars, list_flags, catalog_state)
             .await
     }
@@ -1102,7 +1651,7 @@ where
         let tables =
             Self::get_tabular_infos_by_ident(warehouse_id, &tabulars, list_flags, catalog_state)
                 .await?
-                .into_iter()
+                .into_values()
                 .map(|info| {
                     let tabular_id = info.tabular_id();
                     info.into_table_info().ok_or_else(|| {
@@ -1122,6 +1671,38 @@ where
         catalog_state: Self::State,
     ) -> Result<Vec<ViewOrTableInfo>, GetTabularInfoError> {
         Self::get_tabular_infos_by_id_impl(warehouse_id, tabulars, list_flags, catalog_state).await
+    }
+
+    /// Resolve a tabular from a bare UUID, i.e. without knowing its type.
+    ///
+    /// Prefer the typed lookups ([`Self::get_table_info`], [`Self::get_view_info`],
+    /// [`Self::get_generic_table_info`]) — this is for the few routes that are
+    /// deliberately type-agnostic, such as the S3 signer's `tabular-id/{uuid}`.
+    async fn get_tabular_info_by_uuid(
+        warehouse_id: WarehouseId,
+        tabular_id: uuid::Uuid,
+        list_flags: TabularListFlags,
+        catalog_state: Self::State,
+    ) -> Result<Option<ViewOrTableInfo>, GetTabularInfoError> {
+        let candidates = [
+            TabularId::Table(TableId::from(tabular_id)),
+            TabularId::View(ViewId::from(tabular_id)),
+            TabularId::GenericTable(GenericTableId::from(tabular_id)),
+        ];
+        let mut infos =
+            Self::get_tabular_infos_by_id(warehouse_id, &candidates, list_flags, catalog_state)
+                .await?;
+
+        if infos.len() > 1 {
+            return Err(UnexpectedTabularInResponse::new()
+                .append_detail(format!(
+                    "Expected at most one tabular for id {tabular_id}, got {}",
+                    infos.len()
+                ))
+                .into());
+        }
+
+        Ok(infos.pop())
     }
 
     async fn get_tabular_infos_by_s3_location(
@@ -1152,6 +1733,8 @@ where
                 let borrowed = tabular_ident.as_borrowed();
                 Self::get_tabular_infos_by_ident(warehouse_id, &[borrowed], filter, catalog_state)
                     .await?
+                    .into_values()
+                    .collect()
             }
             TableIdentOrId::Id(id) => {
                 Self::get_tabular_infos_by_id(warehouse_id, &[id.into()], filter, catalog_state)
@@ -1191,6 +1774,8 @@ where
                 let borrowed = tabular_ident.as_borrowed();
                 Self::get_tabular_infos_by_ident(warehouse_id, &[borrowed], filter, catalog_state)
                     .await?
+                    .into_values()
+                    .collect()
             }
             ViewIdentOrId::Id(id) => {
                 Self::get_tabular_infos_by_id(warehouse_id, &[id.into()], filter, catalog_state)
@@ -1215,6 +1800,47 @@ where
         };
 
         Ok(Some(view_info))
+    }
+
+    async fn get_generic_table_info(
+        warehouse_id: WarehouseId,
+        tabular: impl Into<GenericTableIdentOrId> + Send,
+        filter: TabularListFlags,
+        catalog_state: Self::State,
+    ) -> Result<Option<GenericTabularInfo>, GetTabularInfoError> {
+        let tabular = tabular.into();
+        let info = match tabular {
+            GenericTableIdentOrId::Ident(ident) => {
+                let tabular_ident = TabularIdentOwned::GenericTable(ident.clone());
+                let borrowed = tabular_ident.as_borrowed();
+                Self::get_tabular_infos_by_ident(warehouse_id, &[borrowed], filter, catalog_state)
+                    .await?
+                    .into_values()
+                    .collect()
+            }
+            GenericTableIdentOrId::Id(id) => {
+                Self::get_tabular_infos_by_id(warehouse_id, &[id.into()], filter, catalog_state)
+                    .await?
+            }
+        };
+
+        if info.len() > 1 {
+            return Err(UnexpectedTabularInResponse::new().into());
+        }
+
+        let Some(info) = info.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let obtained_id = info.tabular_id();
+
+        let Some(gt_info) = info.into_generic_table_info() else {
+            return Err(UnexpectedTabularInResponse::new()
+                .append_detail(format!("Expected only generic tables, got {obtained_id}"))
+                .into());
+        };
+
+        Ok(Some(gt_info))
     }
 
     async fn set_tabular_protected(
@@ -1264,13 +1890,21 @@ where
         let views = page.map::<ViewId, ViewDeletionInfo, ListViewsError>(
             |k| match k {
                 TabularId::Table(_) => Err(TableInViewList::new(warehouse_id, k).into()),
+                TabularId::GenericTable(_) => {
+                    Err(GenericTableInViewList::new(warehouse_id, k).into())
+                }
                 TabularId::View(t) => Ok(t),
             },
             |v| {
                 let tabular_id = v.tabular_id();
-                match v.into_view_info() {
-                    Some(view) => Ok(view),
-                    None => Err(TableInViewList::new(warehouse_id, tabular_id).into()),
+                match v {
+                    ViewOrTableDeletionInfo::View(view) => Ok(view),
+                    ViewOrTableDeletionInfo::Table(_) => {
+                        Err(TableInViewList::new(warehouse_id, tabular_id).into())
+                    }
+                    ViewOrTableDeletionInfo::GenericTable(_) => {
+                        Err(GenericTableInViewList::new(warehouse_id, tabular_id).into())
+                    }
                 }
             },
         )?;
@@ -1297,12 +1931,20 @@ where
             |k| match k {
                 TabularId::Table(t) => Ok(t),
                 TabularId::View(_) => Err(ViewInTableList::new(warehouse_id, k).into()),
+                TabularId::GenericTable(_) => {
+                    Err(GenericTableInTableList::new(warehouse_id, k).into())
+                }
             },
             |v| {
                 let tabular_id = v.tabular_id();
-                match v.into_table_info() {
-                    Some(table) => Ok(table),
-                    None => Err(ViewInTableList::new(warehouse_id, tabular_id).into()),
+                match v {
+                    ViewOrTableDeletionInfo::Table(table) => Ok(table),
+                    ViewOrTableDeletionInfo::View(_) => {
+                        Err(ViewInTableList::new(warehouse_id, tabular_id).into())
+                    }
+                    ViewOrTableDeletionInfo::GenericTable(_) => {
+                        Err(GenericTableInTableList::new(warehouse_id, tabular_id).into())
+                    }
                 }
             },
         )?;

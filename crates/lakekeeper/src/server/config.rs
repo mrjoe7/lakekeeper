@@ -1,24 +1,25 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use super::CatalogServer;
 use crate::{
+    CONFIG,
     api::{
         iceberg::v1::{
-            config::GetConfigQueryParams, ApiContext, CatalogConfig, ErrorModel, PageToken,
-            PaginationQuery, Result,
+            ApiContext, CatalogConfig, ErrorModel, PageToken, PaginationQuery, Result,
+            config::GetConfigQueryParams,
         },
-        management::v1::user::{parse_create_user_request, UserLastUpdatedWith},
+        management::v1::user::{UserLastUpdatedWith, parse_create_user_request},
     },
+    config::{IdempotencyConfig, MaintenanceMode},
     request_metadata::RequestMetadata,
     service::{
-        authz::{
-            AuthZProjectOps, Authorizer, AuthzWarehouseOps, CatalogProjectAction,
-            CatalogWarehouseAction,
-        },
         CatalogStore, CatalogWarehouseOps, ProjectId, SecretStore, State, Transaction,
-        WarehouseNameNotFound, WarehouseStatus,
+        UserUpsertMode, WarehouseNameNotFound, WarehouseStatus,
+        authz::{
+            Authorizer, AuthzWarehouseOps, CatalogWarehouseAction, RequireWarehouseActionError,
+        },
+        events::APIEventContext,
     },
-    CONFIG,
 };
 
 #[async_trait::async_trait]
@@ -32,43 +33,83 @@ impl<A: Authorizer + Clone, C: CatalogStore, S: SecretStore>
     ) -> Result<CatalogConfig> {
         let authorizer = api_context.v1_state.authz;
 
-        maybe_register_user::<C>(&request_metadata, api_context.v1_state.catalog.clone()).await?;
+        // Maintenance mode: the catalog is in a read-only window (typically a
+        // Kubernetes operator running a schema migration). Skip the
+        // first-touch user-register side-effect so `GET /v1/config` stays a
+        // pure read. Returning the catalog config itself is still valuable —
+        // existing clients need it to keep reading.
+        if matches!(CONFIG.maintenance_mode, MaintenanceMode::Off) {
+            maybe_register_user::<C>(&request_metadata, api_context.v1_state.catalog.clone())
+                .await?;
+        }
+
+        let request_metadata_arc = Arc::new(request_metadata);
 
         // Arg takes precedence over auth
-        let warehouse = if let Some(query_warehouse) = query.warehouse {
-            let (project_from_arg, warehouse_from_arg) = parse_warehouse_arg(&query_warehouse);
-            let project_id = request_metadata.require_project_id(project_from_arg)?;
-            authorizer
-                .require_project_action(
-                    &request_metadata,
-                    &project_id,
-                    CatalogProjectAction::CanListWarehouses,
-                )
-                .await?;
-            C::get_warehouse_by_name(
-                &warehouse_from_arg,
-                &project_id,
-                WarehouseStatus::active(),
-                api_context.v1_state.catalog.clone(),
-            )
-            .await?
-            .ok_or_else(|| ErrorModel::from(WarehouseNameNotFound::new(warehouse_from_arg)))?
-        } else {
+        let Some(query_warehouse) = query.warehouse else {
             return Err(ErrorModel::bad_request("No warehouse specified. Please specify the 'warehouse' parameter in the GET /config request.".to_string(), "GetConfigNoWarehouseProvided", None).into());
         };
+        let (project_from_arg, warehouse_from_arg) = parse_warehouse_arg(&query_warehouse);
+        let project_id = request_metadata_arc.require_project_id(project_from_arg)?;
 
-        let warehouse = authorizer
+        // Authorize the single warehouse (get-config), not the project: a project-level
+        // "list warehouses" check considers every warehouse and times out on large
+        // projects (issue #1780). With no project gate, the caller-supplied project_id
+        // is unchecked, so a missing name and a warehouse the caller can't see both
+        // return the same name-keyed `NoSuchWarehouseException` — otherwise name->id
+        // resolution leaks existence/UUID. (Audit log keeps the truth; response timing
+        // still differs.)
+        let not_found = || ErrorModel::from(WarehouseNameNotFound::new(warehouse_from_arg.clone()));
+
+        let Some(warehouse) = C::get_warehouse_by_name(
+            &warehouse_from_arg,
+            &project_id,
+            WarehouseStatus::active(),
+            api_context.v1_state.catalog.clone(),
+        )
+        .await?
+        else {
+            return Err(not_found().into());
+        };
+
+        let action = CatalogWarehouseAction::GetConfig;
+        let event_ctx = APIEventContext::for_warehouse(
+            request_metadata_arc.clone(),
+            api_context.v1_state.events,
+            warehouse.warehouse_id,
+            action.clone(),
+        );
+
+        let authz_result = authorizer
             .require_warehouse_action(
-                &request_metadata,
+                &request_metadata_arc,
                 warehouse.warehouse_id,
                 Ok(Some(warehouse)),
-                CatalogWarehouseAction::CanGetConfig,
+                action,
             )
-            .await?;
+            .await;
+        // Mask "can't see it" as not-found (see above); a forbidden on a warehouse the
+        // caller *can* see keeps its native 403, which leaks nothing new.
+        let warehouse_hidden = authz_result
+            .as_ref()
+            .err()
+            .is_some_and(RequireWarehouseActionError::is_warehouse_hidden);
+        let (_event_ctx, warehouse) = match event_ctx.emit_authz(authz_result) {
+            Ok(checked) => checked,
+            // emit_authz has already written the full-detail audit event.
+            Err(masked) => {
+                return Err(if warehouse_hidden {
+                    not_found()
+                } else {
+                    masked
+                }
+                .into());
+            }
+        };
 
         let mut config = warehouse.storage_profile.generate_catalog_config(
             warehouse.warehouse_id,
-            &request_metadata,
+            &request_metadata_arc,
             warehouse.tabular_delete_profile,
         );
 
@@ -83,10 +124,26 @@ impl<A: Authorizer + Clone, C: CatalogStore, S: SecretStore>
 
         config
             .overrides
-            .insert("uri".to_string(), request_metadata.base_uri_catalog());
+            .insert("uri".to_string(), request_metadata_arc.base_uri_catalog());
+
+        config.idempotency_key_lifetime = advertised_idempotency_lifetime(&CONFIG.idempotency);
 
         Ok(config)
     }
+}
+
+/// The `idempotency-key-lifetime` to advertise in `GET /v1/config`.
+///
+/// A top-level field, not an override: it announces a server capability rather
+/// than a property the client should apply to itself. `None` when idempotency
+/// is disabled — absence is precisely how a client learns it is unsupported, so
+/// advertising a lifetime here while the server ignores `Idempotency-Key` would
+/// invite clients to rely on a guarantee that does not hold.
+///
+/// Split out from the handler so it is reachable without a database or the
+/// global config.
+fn advertised_idempotency_lifetime(idempotency: &IdempotencyConfig) -> Option<String> {
+    idempotency.enabled.then(|| idempotency.lifetime_iso8601())
 }
 
 fn parse_warehouse_arg(arg: &str) -> (Option<ProjectId>, String) {
@@ -117,6 +174,17 @@ fn parse_warehouse_arg(arg: &str) -> (Option<ProjectId>, String) {
     }
 }
 
+/// True if the token carries a non-empty name claim. Backfilling a stub is only
+/// useful — and only safe — when the token actually provides a name: backfilling
+/// from a nameless token would flip the row to `ConfigCallCreation` with a still-
+/// placeholder name, locking out a later name-bearing login or SCIM full-sync.
+fn token_provides_name(request_metadata: &RequestMetadata) -> bool {
+    request_metadata
+        .authentication()
+        .and_then(|auth| auth.full_name())
+        .is_some_and(|name| !name.is_empty())
+}
+
 async fn maybe_register_user<D: CatalogStore>(
     request_metadata: &RequestMetadata,
     state: <D as CatalogStore>::State,
@@ -137,11 +205,29 @@ async fn maybe_register_user<D: CatalogStore>(
     )
     .await?;
 
-    if user.users.is_empty() {
+    // Register on first touch, OR backfill a role-provider stub once a real name
+    // is available. #1824 made admin-facing assignment writes 404 on unknown
+    // users, so role-provider sync now stubs a `users` row (`name IS NULL`,
+    // `last_updated_with = RoleProvider`) before the user ever logs in; without
+    // this, that stub (rendered as a placeholder name) would survive first login
+    // forever. A `RoleProvider` row is the only ambiguous case — it may be an
+    // un-named stub OR a real SCIM-synced name — so we attempt the write and let
+    // `create_or_backfill_user`'s `WHERE name IS NULL` guard disambiguate
+    // atomically: a real name (even a concurrent one) is left untouched. The
+    // `token_provides_name` gate keeps the backfill from being a downgrade.
+    let should_register = match user.users.first() {
+        None => true,
+        Some(existing) => {
+            existing.last_updated_with == UserLastUpdatedWith::RoleProvider
+                && token_provides_name(request_metadata)
+        }
+    };
+
+    if should_register {
         let (creation_user_id, name, user_type, email) =
             parse_create_user_request(request_metadata, None)?;
 
-        // If the user is authenticated, create a user in the catalog
+        // If the user is authenticated, create or backfill the catalog user.
         let mut t = D::Transaction::begin_write(state).await?;
         D::create_or_update_user(
             &creation_user_id,
@@ -149,6 +235,7 @@ async fn maybe_register_user<D: CatalogStore>(
             email.as_deref(),
             UserLastUpdatedWith::ConfigCallCreation,
             user_type,
+            UserUpsertMode::BackfillUnnamedStub,
             t.transaction(),
         )
         .await?;
@@ -156,4 +243,38 @@ async fn maybe_register_user<D: CatalogStore>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn idempotency(enabled: bool, lifetime: Duration) -> IdempotencyConfig {
+        IdempotencyConfig {
+            enabled,
+            lifetime,
+            ..IdempotencyConfig::default()
+        }
+    }
+
+    /// Absence is the "unsupported" signal, so a disabled server must advertise
+    /// nothing rather than a lifetime it will not honor.
+    #[test]
+    fn disabled_idempotency_advertises_nothing() {
+        assert_eq!(
+            advertised_idempotency_lifetime(&idempotency(false, Duration::from_mins(30))),
+            None
+        );
+    }
+
+    /// A non-default lifetime, so this cannot pass by coinciding with the default.
+    #[test]
+    fn enabled_idempotency_advertises_the_configured_lifetime() {
+        assert_eq!(
+            advertised_idempotency_lifetime(&idempotency(true, Duration::from_hours(1))),
+            Some("PT1H".to_string())
+        );
+    }
 }

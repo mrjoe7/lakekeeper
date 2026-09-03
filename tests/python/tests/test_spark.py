@@ -1,12 +1,12 @@
+import time
 import uuid
 
 import conftest
+import fsspec
 import pandas as pd
+import pyiceberg.io as io
 import pytest
 import requests
-import pyiceberg.io as io
-import time
-import fsspec
 
 
 def test_create_namespace(spark, warehouse: conftest.Warehouse):
@@ -206,12 +206,21 @@ def test_drop_table(
             if not exists:
                 break
 
-        assert (
-            not exists
-        ), f"Table location {table_location} still exists after waiting for {i} seconds"
+        assert not exists, (
+            f"Table location {table_location} still exists after waiting for {i} seconds"
+        )
 
 
 def test_drop_table_purge_spark(spark, warehouse: conftest.Warehouse, storage_config):
+    if storage_config["storage-profile"]["type"] in ("adls", "onelake"):
+        # For ADLS / OneLake with vended credentials enabled, Spark tries to
+        # refresh the credentials for purge after the table is dropped, which
+        # fails as the table no longer exists. Set
+        # f"spark.sql.catalog.{catalog_name}.adls.refresh-credentials-enabled":
+        # "false" in the catalog session to make client side purge work.
+        pytest.skip(
+            "ADLS / Onelake currently don't work with spark PURGE and refresh credentials."
+        )
     spark.sql("CREATE NAMESPACE test_drop_table_purge_spark")
     spark.sql(
         "CREATE TABLE test_drop_table_purge_spark.my_table (my_ints INT, my_floats DOUBLE, strings STRING) USING iceberg"
@@ -231,11 +240,6 @@ def test_drop_table_purge_spark(spark, warehouse: conftest.Warehouse, storage_co
 
 
 def test_drop_table_purge_http(spark, warehouse: conftest.Warehouse, storage_config):
-    if storage_config["storage-profile"]["type"] == "adls":
-        # pyiceberg load_table doesn't contain any of the adls properties so this test doesn't work until
-        # https://github.com/apache/iceberg-python/issues/1146 is resolved
-        pytest.skip("ADLS currently doesn't work with pyiceberg.")
-
     namespace = "test_drop_table_purge_http"
     spark.sql(f"CREATE NAMESPACE {namespace}")
     dfs = []
@@ -305,12 +309,12 @@ def drop_table_and_assert_that_table_is_gone(
     file_io = io._infer_file_io_from_scheme(table_0.location(), properties)
     # sleep to give time for the table to be gone
     time.sleep(5)
-    # On filesystems with hierarchies like HDFS and ADLS we might leave
+    # On filesystems with hierarchies like HDFS and ADLS/Onelake we might leave
     # empty directories. This is a known issue:
     # https://github.com/lakekeeper/lakekeeper/issues/1064
     location = table_0.location().rstrip("/") + "/"
     inp = file_io.new_input(location)
-    if storage_config["storage-profile"]["type"] != "adls":
+    if storage_config["storage-profile"]["type"] not in ("adls", "onelake"):
         assert not inp.exists(), f"Table location {location} still exists"
     tables = warehouse.pyiceberg_catalog.list_tables(namespace)
     assert len(tables) == 1
@@ -397,7 +401,7 @@ def undrop_table(table_0, warehouse):
                 "v1",
                 "warehouse",
                 str(warehouse.warehouse_id),
-                "deleted_tabulars",
+                "deleted-tabulars",
                 "undrop",
             ]
         )
@@ -413,11 +417,6 @@ def undrop_table(table_0, warehouse):
 def test_undropped_table_can_be_purged_again_http(
     spark, warehouse: conftest.Warehouse, storage_config
 ):
-    # if storage_config["storage-profile"]["type"] == "adls":
-    #     # pyiceberg load_table doesn't contain any of the adls properties so this test doesn't work until
-    #     # https://github.com/apache/iceberg-python/issues/1146 is resolved
-    #     pytest.skip("ADLS currently doesn't work with pyiceberg.")
-
     namespace = "test_undropped_table_can_be_purged_again_http"
     spark.sql(f"CREATE NAMESPACE {namespace}")
     dfs = []
@@ -748,8 +747,14 @@ def test_drop_with_shared_prefix(spark, namespace, warehouse: conftest.Warehouse
         (*namespace.name, str(table_id))
     ).location()
 
-    # Replace element behind the last slash with "custom_location"
-    custom_location = default_location.rsplit("/", 1)[0] + "/custom_location"
+    # Sibling of the default table location, kept unique per test namespace.
+    # The default layout is flat (no per-namespace directory), so the parent is
+    # the shared (session-scoped) warehouse root — a constant segment would
+    # collide across namespaces.
+    custom_location = (
+        default_location.rstrip("/").rsplit("/", 1)[0]
+        + f"/{namespace.name[-1]}-custom-location"
+    )
 
     # Create a table with a custom location
     first_table_id = str(uuid.uuid4()).replace("-", "_")
@@ -794,8 +799,14 @@ def test_custom_location(spark, namespace, warehouse: conftest.Warehouse):
         (*namespace.name, "my_table")
     ).location()
 
-    # Replace element behind the last slash with "custom_location"
-    custom_location = default_location.rsplit("/", 1)[0] + "/custom_location"
+    # Sibling of the default table location, kept unique per test namespace.
+    # The default layout is flat (no per-namespace directory), so the parent is
+    # the shared (session-scoped) warehouse root — a constant segment would
+    # collide across namespaces.
+    custom_location = (
+        default_location.rstrip("/").rsplit("/", 1)[0]
+        + f"/{namespace.name[-1]}-custom-location"
+    )
 
     # Create a table with a custom location
     spark.sql(
@@ -829,8 +840,14 @@ def test_cannot_create_table_at_same_location(
         (*namespace.name, "my_table")
     ).location()
 
-    # Replace element behind the last slash with "custom_location"
-    custom_location = default_location.rsplit("/", 1)[0] + "/custom_location"
+    # Sibling of the default table location, kept unique per test namespace.
+    # The default layout is flat (no per-namespace directory), so the parent is
+    # the shared (session-scoped) warehouse root — a constant segment would
+    # collide across namespaces.
+    custom_location = (
+        default_location.rstrip("/").rsplit("/", 1)[0]
+        + f"/{namespace.name[-1]}-custom-location"
+    )
 
     # Create a table with a custom location
     spark.sql(
@@ -873,8 +890,14 @@ def test_cannot_create_table_at_sub_location(
         (*namespace.name, "my_table")
     ).location()
 
-    # Replace element behind the last slash with "custom_location"
-    custom_location = default_location.rsplit("/", 1)[0] + "/custom_location"
+    # Sibling of the default table location, kept unique per test namespace.
+    # The default layout is flat (no per-namespace directory), so the parent is
+    # the shared (session-scoped) warehouse root — a constant segment would
+    # collide across namespaces.
+    custom_location = (
+        default_location.rstrip("/").rsplit("/", 1)[0]
+        + f"/{namespace.name[-1]}-custom-location"
+    )
 
     # Create a table with a custom location
     spark.sql(
@@ -988,6 +1011,149 @@ def test_hierarchical_namespaces(
     assert "exceeds maximum depth" in str(e.value)
 
 
+def test_special_characters_in_names(
+    spark,
+    namespace: conftest.Namespace,
+):
+    # Test various UTF-8 special characters in namespace and table names
+
+    special_namespace_names = [
+        "namespace with spaces",
+        "namespace-with-hyphens",
+        "namespace_with_underscores",
+        "namespace!with@special#chars$",
+        "naméspace_with_àccents_ñ",
+        "namespace_with_ümlauts_ä_ö",
+        "namespace_中文_日本語",
+        "namespace_עברית_العربية",
+        "namespace_🚀_emoji_✨",
+        "namespace-Mix!_OF_everything_中文_ä_🎉",
+        "namespace%with%percent",
+        "namespace&with&ampersands",
+        "namespace=with=equals",
+        "namespace,with,commas",
+    ]
+
+    special_table_names = [
+        "table with spaces",
+        "table-with-hyphens",
+        "table_with_underscores",
+        "table!with@special#chars$",
+        "tablé_with_àccents_ñ",
+        "table_with_ümlauts_ä_ö",
+        "table_中文_日本語",
+        "table_עברית_العربية",
+        "table_🚀_emoji_✨",
+        "table-Mix!_OF_everything_中文_ä_🎉",
+        "table%with%percent",
+        "table,with,commas",
+    ]
+
+    # This test exercises special-character *identifiers* (namespace/table
+    # names) in the catalog. Under the full-hierarchy storage layout those
+    # names also land in the storage path, and real AWS STS caps the *packed*
+    # size of the vended session policy (PackedPolicyTooLarge) — the long
+    # percent-encoded names overflow that budget. So pin each table to a short
+    # location under the warehouse base: the catalog still stores the special
+    # identifiers, but the vended-credential policy stays small. Special
+    # characters *in the storage path* (and the STS policy escaping for them)
+    # are covered separately by test_special_char_locations.py.
+    base_location = namespace.pyiceberg_catalog.load_namespace_properties(
+        namespace.name
+    )["location"].rstrip("/")
+
+    def short_location() -> str:
+        return f"{base_location}/sc-{uuid.uuid4().hex}"
+
+    # Test creating nested namespaces with special characters
+    for i, special_name in enumerate(special_namespace_names):
+        full_namespace = f"{namespace.spark_name}.`{special_name}`"
+
+        # Create namespace with special characters
+        spark.sql(f"CREATE NAMESPACE {full_namespace}")
+
+        # Verify namespace was created
+        namespaces_df = spark.sql(
+            f"SHOW NAMESPACES IN {namespace.spark_name}"
+        ).toPandas()
+        # The namespace column contains the full qualified name
+        assert any(special_name in ns for ns in namespaces_df["namespace"].values)
+
+        # Create table in the special namespace
+        spark.sql(
+            f"CREATE TABLE {full_namespace}.my_table (id INT, value STRING) USING iceberg"
+            f" LOCATION '{short_location()}'"
+        )
+        spark.sql(f"INSERT INTO {full_namespace}.my_table VALUES ({i + 1}, 'test_{i}')")
+
+        # Read from the table
+        df = spark.sql(f"SELECT * FROM {full_namespace}.my_table").toPandas()
+        assert len(df) == 1
+        assert df["id"].tolist() == [i + 1]
+        assert df["value"].tolist() == [f"test_{i}"]
+
+    # Test creating tables with special character names
+    for i, special_table_name in enumerate(special_table_names):
+        spark.sql(
+            f"CREATE TABLE {namespace.spark_name}.`{special_table_name}` (id INT, value STRING) USING iceberg"
+            f" LOCATION '{short_location()}'"
+        )
+        spark.sql(
+            f"INSERT INTO {namespace.spark_name}.`{special_table_name}` VALUES ({i}, 'value_{i}')"
+        )
+
+        # Read from the table
+        df = spark.sql(
+            f"SELECT * FROM {namespace.spark_name}.`{special_table_name}`"
+        ).toPandas()
+        assert len(df) == 1
+        assert df["id"].tolist() == [i]
+        assert df["value"].tolist() == [f"value_{i}"]
+
+        # Verify table appears in listing
+        tables_df = spark.sql(f"SHOW TABLES IN {namespace.spark_name}").toPandas()
+        assert special_table_name in tables_df["tableName"].values
+
+    # Test deeply nested namespaces with special characters
+    nested_special = [
+        namespace.spark_name,
+        "`specialns,-1_ä`",
+        "`nest_中文_2`",
+        "`lëvel_3_🚀`",
+    ]
+
+    for i in range(2, len(nested_special)):
+        this_namespace = nested_special[:i]
+        spark.sql("CREATE NAMESPACE " + ".".join(this_namespace))
+
+        # Create and query a table in the nested namespace with special chars
+        full_ns = ".".join(this_namespace)
+        spark.sql(
+            f"CREATE TABLE {full_ns}.`tåble_émoji_🎯` (id INT, data STRING) USING iceberg"
+            f" LOCATION '{short_location()}'"
+        )
+        spark.sql(
+            f"INSERT INTO {full_ns}.`tåble_émoji_🎯` VALUES ({i}, 'nested_level_{i}')"
+        )
+
+        df = spark.sql(f"SELECT * FROM {full_ns}.`tåble_émoji_🎯`").toPandas()
+        assert len(df) == 1
+        assert df["id"].tolist() == [i]
+        assert df["data"].tolist() == [f"nested_level_{i}"]
+
+    # Test renaming to special characters
+    spark.sql(f"CREATE TABLE {namespace.spark_name}.rename_test (id INT) USING iceberg")
+    new_name = "rënamed_tåble_🎯"
+    spark.sql(
+        f"ALTER TABLE {namespace.spark_name}.rename_test RENAME TO {namespace.spark_name}.`{new_name}`"
+    )
+
+    # Verify renamed table works
+    spark.sql(f"INSERT INTO {namespace.spark_name}.`{new_name}` VALUES (42)")
+    df = spark.sql(f"SELECT * FROM {namespace.spark_name}.`{new_name}`").toPandas()
+    assert df["id"].tolist() == [42]
+
+
 def test_register_table(
     spark,
     namespace,
@@ -1023,7 +1189,7 @@ def test_register_table(
     assert spark.sql(f"SHOW TABLES IN {namespace.spark_name}").toPandas().shape[0] == 0
 
     # Wait for expiration of soft delete
-    time.sleep(3)
+    time.sleep(4)
 
     spark.sql(
         f"""
@@ -1053,6 +1219,9 @@ def test_case_insensitivity(
     spark.sql(
         f"ALTER TABLE {namespace.spark_name}.MY_TABLE ADD COLUMN My_Floats DOUBLE"
     )
+    spark.sql(f"REFRESH TABLE {namespace.spark_name}.my_table")
+    pdf = spark.sql(f"SELECT * FROM {namespace.spark_name}.my_table").toPandas()
+    assert len(pdf.columns) == 2
     spark.sql(f"INSERT INTO {namespace.spark_name}.my_table VALUES (2, 2.2)")
     pdf = (
         spark.sql(f"SELECT * FROM {namespace.spark_name}.my_table ORDER BY My_Ints")
@@ -1079,6 +1248,73 @@ def test_case_insensitivity(
         spark.sql(f"SELECT * FROM {namespace.spark_name}.my_renamed_table").toPandas()
 
 
+def test_metadata_queries_tables(spark, namespace):
+    spark.sql(
+        f"CREATE TABLE {namespace.spark_name}.my_table (my_ints INT, my_floats DOUBLE, strings STRING) USING iceberg"
+    )
+    spark.sql(
+        f"INSERT INTO {namespace.spark_name}.my_table VALUES (1, 1.2, 'foo'), (2, 2.2, 'bar')"
+    )
+    all_data_files = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.my_table.all_data_files"
+    ).toPandas()
+    assert len(all_data_files) > 0
+    all_delete_files = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.my_table.all_delete_files"
+    ).toPandas()
+    assert len(all_delete_files) == 0
+    all_entries = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.my_table.all_entries"
+    ).toPandas()
+    assert len(all_entries) > 0
+    all_manifests = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.my_table.all_manifests"
+    ).toPandas()
+    assert len(all_manifests) > 0
+    metadata_log_entries = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.my_table.metadata_log_entries"
+    ).toPandas()
+    assert len(metadata_log_entries) > 0
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_upgrade_v2_table_with_data_to_v3(spark, namespace):
+    """Upgrade a v2 table that has existing snapshots to v3 (lakekeeper#1690)."""
+    spark.sql(
+        f"CREATE TABLE {namespace.spark_name}.upgrade_table (id BIGINT) USING iceberg TBLPROPERTIES ('format-version' = '2')"
+    )
+    spark.sql(f"INSERT INTO {namespace.spark_name}.upgrade_table VALUES (1)")
+    spark.sql(f"INSERT INTO {namespace.spark_name}.upgrade_table VALUES (2)")
+
+    # Upgrade to v3 - this previously failed with:
+    # "v3 Snapshots must have first-row-id and rows-added fields set"
+    spark.sql(
+        f"ALTER TABLE {namespace.spark_name}.upgrade_table SET TBLPROPERTIES ('format-version' = '3')"
+    )
+
+    table_props = (
+        spark.sql(f"SHOW TBLPROPERTIES {namespace.spark_name}.upgrade_table")
+        .toPandas()
+        .set_index("key")
+    )
+    assert table_props.loc["format-version"]["value"] == "3"
+
+    # Verify data is still readable after upgrade
+    pdf = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.upgrade_table ORDER BY id"
+    ).toPandas()
+    assert pdf["id"].tolist() == [1, 2]
+
+    # Verify we can still write to the table after upgrade
+    spark.sql(f"INSERT INTO {namespace.spark_name}.upgrade_table VALUES (3)")
+    pdf = spark.sql(
+        f"SELECT * FROM {namespace.spark_name}.upgrade_table ORDER BY id"
+    ).toPandas()
+    assert pdf["id"].tolist() == [1, 2, 3]
+
+
 @pytest.mark.skipif(
     conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
 )
@@ -1099,3 +1335,427 @@ def test_create_table_v3(spark, namespace):
     assert pdf["my_ints"].tolist() == [1, 3, 4]
     assert pdf["my_floats"].tolist() == [1.2, 3.2, 4.2]
     assert pdf["strings"].tolist() == ["foo", "baz", "qux"]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_create_table(spark, namespace):
+    """Test creating an Iceberg v3 table with a VARIANT column."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_table (
+            id BIGINT,
+            properties VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    table_props = (
+        spark.sql(f"SHOW TBLPROPERTIES {namespace.spark_name}.variant_table")
+        .toPandas()
+        .set_index("key")
+    )
+    assert table_props.loc["format-version"]["value"] == "3"
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_insert_and_read(spark, namespace):
+    """Test inserting and reading JSON data stored in a VARIANT column."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_rw (
+            id BIGINT,
+            data VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.variant_rw (id, data) VALUES
+            (1, parse_json('{{"name":"Alice","age":30}}')),
+            (2, parse_json('{{"name":"Bob","age":25}}')),
+            (3, parse_json('{{"name":"Carol","age":35}}'))
+        """
+    )
+    # Using variant_get in the projection forces Spark to use the non-vectorized
+    # (row-based) Parquet reader. Selecting a plain non-VARIANT column (e.g.
+    # just `id`) can still trigger VectorizedSparkParquetReaders which scans the
+    # full file schema and throws "Not implemented for variant" on Iceberg 1.10.
+    pdf = spark.sql(
+        f"""
+        SELECT id,
+               variant_get(data, '$.name', 'string') AS name,
+               CAST(variant_get(data, '$.age', 'int') AS INT) AS age
+        FROM {namespace.spark_name}.variant_rw
+        ORDER BY id
+        """
+    ).toPandas()
+    assert len(pdf) == 3
+    assert pdf["id"].tolist() == [1, 2, 3]
+    assert pdf["name"].tolist() == ["Alice", "Bob", "Carol"]
+    assert pdf["age"].tolist() == [30, 25, 35]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_get_scalar_fields(spark, namespace):
+    """Test extracting scalar fields from a VARIANT column using variant_get."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_scalar (
+            id BIGINT,
+            properties VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.variant_scalar (id, properties) VALUES
+            (1, parse_json('{{"name":"Alice","address":{{"city":"NYC"}}}}')),
+            (2, parse_json('{{"name":"Bob","address":{{"city":"LA"}}}}')),
+            (3, parse_json('{{"name":"Carol","address":{{"city":"Chicago"}}}}'))
+        """
+    )
+    pdf = spark.sql(
+        f"""
+        SELECT
+            id,
+            variant_get(properties, '$.name', 'string') AS name,
+            variant_get(properties, '$.address.city', 'string') AS city
+        FROM {namespace.spark_name}.variant_scalar
+        ORDER BY id
+        """
+    ).toPandas()
+    assert len(pdf) == 3
+    assert pdf["name"].tolist() == ["Alice", "Bob", "Carol"]
+    assert pdf["city"].tolist() == ["NYC", "LA", "Chicago"]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_join_on_extracted_fields(spark, namespace):
+    """Test joining two Iceberg v3 tables on values extracted from VARIANT columns.
+
+    Mirrors the pattern from:
+    https://medium.com/@shahsoumil519/deep-dive-joining-apache-iceberg-tables-on-variant-columns-with-spark-sql-5c6eca8841de
+    """
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.users (
+            id BIGINT,
+            properties VARIANT,
+            region STRING
+        ) USING iceberg
+        PARTITIONED BY (region)
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.orders (
+            order_id BIGINT,
+            user_info VARIANT,
+            region STRING
+        ) USING iceberg
+        PARTITIONED BY (region)
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.users (id, properties, region) VALUES
+            (1, parse_json('{{"name":"Alice","address":{{"city":"NYC"}}}}'), 'us-east'),
+            (2, parse_json('{{"name":"Bob","address":{{"city":"LA"}}}}'), 'us-west'),
+            (3, parse_json('{{"name":"Carol","address":{{"city":"Chicago"}}}}'), 'us-central')
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.orders (order_id, user_info, region) VALUES
+            (100, parse_json('{{"user_id":"1","product":"Laptop","price":"1200"}}'), 'us-east'),
+            (101, parse_json('{{"user_id":"2","product":"Phone","price":"800"}}'), 'us-west'),
+            (102, parse_json('{{"user_id":"1","product":"Tablet","price":"600"}}'), 'us-east')
+        """
+    )
+
+    pdf = spark.sql(
+        f"""
+        WITH users_cte AS (
+            SELECT
+                id AS user_id,
+                region,
+                lower(trim(variant_get(properties, '$.name', 'string'))) AS user_name,
+                lower(trim(variant_get(properties, '$.address.city', 'string'))) AS city
+            FROM {namespace.spark_name}.users
+        ),
+        orders_cte AS (
+            SELECT
+                order_id,
+                region,
+                CAST(trim(variant_get(user_info, '$.user_id', 'string')) AS BIGINT) AS user_id,
+                variant_get(user_info, '$.product', 'string') AS product,
+                CAST(trim(variant_get(user_info, '$.price', 'string')) AS DOUBLE) AS price
+            FROM {namespace.spark_name}.orders
+        )
+        SELECT
+            o.order_id,
+            o.product,
+            o.price,
+            u.user_id,
+            u.user_name,
+            u.city,
+            o.region
+        FROM orders_cte o
+        JOIN users_cte u ON o.user_id = u.user_id AND o.region = u.region
+        ORDER BY o.order_id
+        """
+    ).toPandas()
+
+    assert len(pdf) == 3
+    assert pdf["order_id"].tolist() == [100, 101, 102]
+    assert pdf["product"].tolist() == ["Laptop", "Phone", "Tablet"]
+    assert pdf["price"].tolist() == [1200.0, 800.0, 600.0]
+    assert pdf["user_id"].tolist() == [1, 2, 1]
+    assert pdf["user_name"].tolist() == ["alice", "bob", "alice"]
+    assert pdf["city"].tolist() == ["nyc", "la", "nyc"]
+    assert pdf["region"].tolist() == ["us-east", "us-west", "us-east"]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_nested_objects(spark, namespace):
+    """Test reading deeply nested objects from a VARIANT column."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_nested (
+            id BIGINT,
+            payload VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.variant_nested (id, payload) VALUES
+            (1, parse_json('{{"user":{{"profile":{{"score":42,"active":true}},"tags":["admin","editor"]}}}}')),
+            (2, parse_json('{{"user":{{"profile":{{"score":7,"active":false}},"tags":["viewer"]}}}}'))
+        """
+    )
+    pdf = spark.sql(
+        f"""
+        SELECT
+            id,
+            CAST(variant_get(payload, '$.user.profile.score', 'int') AS INT) AS score,
+            CAST(variant_get(payload, '$.user.profile.active', 'boolean') AS BOOLEAN) AS active
+        FROM {namespace.spark_name}.variant_nested
+        ORDER BY id
+        """
+    ).toPandas()
+
+    assert len(pdf) == 2
+    assert pdf["score"].tolist() == [42, 7]
+    assert pdf["active"].tolist() == [True, False]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_schema_evolution(spark, namespace):
+    """Test that rows with different JSON shapes coexist in the same VARIANT column."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_schema_evo (
+            id BIGINT,
+            data VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    # Insert rows with different "shapes" — no fixed schema required
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.variant_schema_evo (id, data) VALUES
+            (1, parse_json('{{"type":"user","name":"Alice"}}')),
+            (2, parse_json('{{"type":"product","sku":"ABC-123","price":9.99}}')),
+            (3, parse_json('{{"type":"event","timestamp":"2024-01-01T00:00:00Z","severity":"INFO"}}'))
+        """
+    )
+    pdf = spark.sql(
+        f"SELECT id, variant_get(data, '$.type', 'string') AS record_type FROM {namespace.spark_name}.variant_schema_evo ORDER BY id"
+    ).toPandas()
+
+    assert len(pdf) == 3
+    assert pdf["record_type"].tolist() == ["user", "product", "event"]
+
+
+@pytest.mark.skipif(
+    conftest.settings.spark_supports_v3 is not True, reason="Iceberg v3 not supported"
+)
+def test_variant_null_and_missing_fields(spark, namespace):
+    """Test that variant_get returns NULL for missing or null JSON paths."""
+    spark.sql(
+        f"""
+        CREATE TABLE {namespace.spark_name}.variant_nulls (
+            id BIGINT,
+            data VARIANT
+        ) USING iceberg
+        TBLPROPERTIES ('format-version' = '3')
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {namespace.spark_name}.variant_nulls (id, data) VALUES
+            (1, parse_json('{{"name":"Alice","age":30}}')),
+            (2, parse_json('{{"name":"Bob"}}')),
+            (3, parse_json('{{"age":25}}')),
+            (4, parse_json('{{"name":null,"age":null}}'))
+        """
+    )
+    pdf = spark.sql(
+        f"""
+        SELECT
+            id,
+            variant_get(data, '$.name', 'string') AS name,
+            variant_get(data, '$.age', 'int')     AS age
+        FROM {namespace.spark_name}.variant_nulls
+        ORDER BY id
+        """
+    ).toPandas()
+
+    assert len(pdf) == 4
+    assert pdf["name"].tolist()[0] == "Alice"
+    assert pdf["name"].tolist()[1] == "Bob"
+    assert pdf["name"].isna().tolist()[2]  # missing field → NULL
+    assert pdf["age"].isna().tolist()[1]  # missing field → NULL
+    assert int(pdf["age"].tolist()[2]) == 25
+    assert pdf["name"].isna().tolist()[3]  # explicit null → NULL
+    assert pdf["age"].isna().tolist()[3]  # explicit null → NULL
+
+
+def test_encryption_key_id_immutable(spark, namespace):
+    """Catalog must ensure encryption.key-id cannot be modified or removed (Iceberg spec)."""
+    spark.sql(
+        f"CREATE TABLE {namespace.spark_name}.encrypted_table (id BIGINT, data STRING) USING iceberg "
+        f"TBLPROPERTIES ('encryption.key-id' = 'my-master-key')"
+    )
+
+    # Verify property is set
+    props = (
+        spark.sql(f"SHOW TBLPROPERTIES {namespace.spark_name}.encrypted_table")
+        .toPandas()
+        .set_index("key")
+    )
+    assert props.loc["encryption.key-id"]["value"] == "my-master-key"
+
+    # Modifying encryption.key-id must fail
+    with pytest.raises(Exception) as e:
+        spark.sql(
+            f"ALTER TABLE {namespace.spark_name}.encrypted_table SET TBLPROPERTIES ('encryption.key-id' = 'different-key')"
+        )
+    assert "Cannot modify immutable property" in str(e.value)
+
+    # Removing encryption.key-id must fail
+    with pytest.raises(Exception) as e:
+        spark.sql(
+            f"ALTER TABLE {namespace.spark_name}.encrypted_table UNSET TBLPROPERTIES ('encryption.key-id')"
+        )
+    assert "Cannot remove immutable property" in str(e.value)
+
+    # Verify property is unchanged
+    props = (
+        spark.sql(f"SHOW TBLPROPERTIES {namespace.spark_name}.encrypted_table")
+        .toPandas()
+        .set_index("key")
+    )
+    assert props.loc["encryption.key-id"]["value"] == "my-master-key"
+
+
+def test_view_case_insensitivity(spark, namespace):
+    spark.sql(
+        f"CREATE TABLE {namespace.spark_name}.view_source (id INT, name STRING) USING iceberg"
+    )
+    spark.sql(f"INSERT INTO {namespace.spark_name}.view_source VALUES (1, 'alice')")
+
+    spark.sql(
+        f"CREATE VIEW {namespace.spark_name}.My_View AS SELECT id FROM {namespace.spark_name}.view_source"
+    )
+
+    # Query with different cases
+    pdf = spark.sql(f"SELECT * FROM {namespace.spark_name}.my_view").toPandas()
+    assert pdf["id"].tolist() == [1]
+
+    pdf = spark.sql(f"SELECT * FROM {namespace.spark_name}.MY_VIEW").toPandas()
+    assert pdf["id"].tolist() == [1]
+
+    spark.sql(f"DROP VIEW {namespace.spark_name}.MY_VIEW")
+
+    # Verify the view is gone — check directly via SHOW VIEWS instead of
+    # relying on a broad exception from SELECT (which could false-pass on
+    # unrelated Spark errors and varies by Spark version).
+    views = spark.sql(f"SHOW VIEWS IN {namespace.spark_name}").toPandas()
+    assert views.shape[0] == 0
+
+
+def test_namespace_case_insensitivity(spark, warehouse: conftest.Warehouse):
+    ns_name = f"Mixed_Case_Ns_{uuid.uuid4().hex[:8]}"
+    spark.sql(f"CREATE NAMESPACE {warehouse.normalized_catalog_name}.`{ns_name}`")
+
+    # Create table using lowercase namespace
+    spark.sql(
+        f"CREATE TABLE {warehouse.normalized_catalog_name}.`{ns_name.lower()}`.case_test (id INT) USING iceberg"
+    )
+    spark.sql(
+        f"INSERT INTO {warehouse.normalized_catalog_name}.`{ns_name.upper()}`.case_test VALUES (42)"
+    )
+
+    # Read using mixed case
+    pdf = spark.sql(
+        f"SELECT * FROM {warehouse.normalized_catalog_name}.`{ns_name}`.case_test"
+    ).toPandas()
+    assert pdf["id"].tolist() == [42]
+
+    # Cleanup: the warehouse uses soft-deletion, so DROP TABLE only marks the
+    # table as deleted. Retry DROP NAMESPACE until the soft-deleted entry has
+    # expired from the namespace's child set.
+    spark.sql(f"DROP TABLE {warehouse.normalized_catalog_name}.`{ns_name}`.case_test")
+    deadline = time.time() + 15
+    last_err = None
+    while time.time() < deadline:
+        try:
+            spark.sql(f"DROP NAMESPACE {warehouse.normalized_catalog_name}.`{ns_name}`")
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    if last_err is not None:
+        raise last_err
+
+
+def test_encryption_key_id_set_same_value(spark, namespace):
+    """Setting encryption.key-id to the same value should succeed (idempotent)."""
+    spark.sql(
+        f"CREATE TABLE {namespace.spark_name}.encrypted_idempotent (id BIGINT) USING iceberg "
+        f"TBLPROPERTIES ('encryption.key-id' = 'my-master-key')"
+    )
+
+    # Setting the same value should succeed
+    spark.sql(
+        f"ALTER TABLE {namespace.spark_name}.encrypted_idempotent SET TBLPROPERTIES ('encryption.key-id' = 'my-master-key')"
+    )
+
+    props = (
+        spark.sql(f"SHOW TBLPROPERTIES {namespace.spark_name}.encrypted_idempotent")
+        .toPandas()
+        .set_index("key")
+    )
+    assert props.loc["encryption.key-id"]["value"] == "my-master-key"

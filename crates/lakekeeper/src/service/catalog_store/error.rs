@@ -68,7 +68,7 @@ macro_rules! define_transparent_error {
             )*
         }
 
-        paste::paste! {
+        pastey::paste! {
             const [<$error_name:snake:upper _STACK>]: &str = $stack_msg;
 
             $(
@@ -100,7 +100,7 @@ macro_rules! define_transparent_error {
                 }
             }
 
-            impl From<$error_name> for ErrorModel {
+            impl From<$error_name> for iceberg_ext::catalog::rest::ErrorModel {
                 fn from(err: $error_name) -> Self {
                     match err {
                         $(
@@ -110,9 +110,9 @@ macro_rules! define_transparent_error {
                 }
             }
 
-            impl From<$error_name> for IcebergErrorResponse {
+            impl From<$error_name> for iceberg_ext::catalog::rest::IcebergErrorResponse {
                 fn from(err: $error_name) -> Self {
-                    ErrorModel::from(err).into()
+                    iceberg_ext::catalog::rest::ErrorModel::from(err).into()
                 }
             }
         }
@@ -148,6 +148,8 @@ pub(crate) use define_simple_error;
 pub(crate) use define_transparent_error;
 pub(crate) use impl_error_stack_methods;
 pub(crate) use impl_from_with_detail;
+
+use crate::service::events::impl_authorization_failure_source;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::Display)]
 pub enum CatalogBackendErrorType {
@@ -283,30 +285,30 @@ impl From<CatalogBackendError> for ErrorModel {
         }
         .as_u16();
 
-        ErrorModel {
-            r#type: "CatalogBackendError".to_string(),
-            code,
-            message: format!("Catalog backend error ({type}): {source}"),
-            stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("CatalogBackendError")
+            .code(code)
+            .message(format!("Catalog backend error ({type}): {source}"))
+            .stack(stack)
+            .source(None)
+            .build()
     }
 }
-
 impl From<DatabaseIntegrityError> for ErrorModel {
     fn from(err: DatabaseIntegrityError) -> Self {
         let DatabaseIntegrityError { message, stack } = err;
 
-        ErrorModel {
-            r#type: "DatabaseIntegrityError".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            message: format!("Database integrity error: {message}"),
-            stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("DatabaseIntegrityError")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .message(format!("Database integrity error: {message}"))
+            .stack(stack)
+            .build()
     }
 }
-
+impl_authorization_failure_source!(CatalogBackendError => InternalCatalogError);
+impl_authorization_failure_source!(DatabaseIntegrityError => InternalCatalogError);
+impl_authorization_failure_source!(InvalidPaginationToken => InvalidRequestData);
 #[derive(Debug, PartialEq)]
 pub struct InvalidPaginationToken {
     pub message: String,
@@ -354,13 +356,14 @@ impl From<InvalidPaginationToken> for ErrorModel {
             stack,
         } = err;
 
-        ErrorModel {
-            r#type: "InvalidPaginationToken".to_string(),
-            code: StatusCode::BAD_REQUEST.as_u16(),
-            message: format!("Invalid pagination token - {message}. Got: `{value}`"),
-            stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("InvalidPaginationToken")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(format!(
+                "Invalid pagination token - {message}. Got: `{value}`"
+            ))
+            .stack(stack)
+            .build()
     }
 }
 impl From<InvalidPaginationToken> for IcebergErrorResponse {
@@ -368,3 +371,54 @@ impl From<InvalidPaginationToken> for IcebergErrorResponse {
         ErrorModel::from(err).into()
     }
 }
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+#[error("Database service returned invalid response")]
+pub struct ResultCountMismatch {
+    pub expected_results: usize,
+    pub actual_results: usize,
+    pub type_name: String,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(ResultCountMismatch);
+impl ResultCountMismatch {
+    #[must_use]
+    pub fn new(expected_results: usize, actual_results: usize, type_name: &str) -> Self {
+        Self {
+            expected_results,
+            actual_results,
+            type_name: type_name.to_string(),
+            stack: Vec::new(),
+        }
+    }
+}
+impl From<ResultCountMismatch> for ErrorModel {
+    fn from(err: ResultCountMismatch) -> Self {
+        let message = err.to_string();
+        let ResultCountMismatch {
+            expected_results,
+            actual_results,
+            type_name,
+            stack,
+        } = err;
+
+        ErrorModel::builder()
+            .r#type("ResultCountMismatch")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .message(message)
+            .source(Some(Box::new(InternalErrorMessage(format!(
+                "Result count mismatch for {type_name} batch operation: expected {expected_results}, got {actual_results}."
+            )))))
+            .stack(stack)
+            .build()
+    }
+}
+impl From<ResultCountMismatch> for IcebergErrorResponse {
+    fn from(err: ResultCountMismatch) -> Self {
+        ErrorModel::from(err).into()
+    }
+}
+
+#[derive(thiserror::Error, PartialEq, Debug)]
+#[error("{0}")]
+pub struct InternalErrorMessage(pub String);

@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    sync::{atomic::AtomicI64, Arc},
+    sync::{Arc, atomic::AtomicI64},
     time::Duration,
 };
 
@@ -17,7 +17,9 @@ use http::StatusCode;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::{api::endpoints::Endpoint, request_metadata::RequestMetadata, ProjectId, WarehouseId};
+use crate::{
+    WarehouseId, api::endpoints::Endpoint, request_metadata::RequestMetadata, service::ArcProjectId,
+};
 
 #[cfg(feature = "router")]
 /// Middleware for tracking endpoint statistics.
@@ -47,7 +49,7 @@ pub(crate) async fn endpoint_statistics_middleware_fn(
             .await
         {
             tracing::error!("Failed to send endpoint statistics message: {}", e);
-        };
+        }
     } else {
         tracing::error!(?path_params, "No request metadata found.");
     }
@@ -116,14 +118,14 @@ pub struct EndpointIdentifier {
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum FlushMode {
     Automatic,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     Manual,
 }
 
 #[derive(Debug)]
 pub struct EndpointStatisticsTracker {
     rcv: tokio::sync::mpsc::Receiver<EndpointStatisticsMessage>,
-    endpoint_statistics: HashMap<ProjectId, ProjectStatistics>,
+    endpoint_statistics: HashMap<ArcProjectId, ProjectStatistics>,
     statistic_sinks: Vec<Arc<dyn EndpointStatisticsSink>>,
     flush_interval: Duration,
     flush_mode: FlushMode,
@@ -211,7 +213,7 @@ impl EndpointStatisticsTracker {
                 LoopState::Continue
             }
             EndpointStatisticsMessage::Shutdown => {
-                tracing::info!("Received shutdown message, breaking rcv loop.");
+                tracing::info!("Received shutdown message, exiting endpoint statistics tracker.");
                 LoopState::Break
             }
             EndpointStatisticsMessage::Flush => {
@@ -234,7 +236,7 @@ impl EndpointStatisticsTracker {
         let mut stats = HashMap::new();
         std::mem::swap(&mut stats, &mut self.endpoint_statistics);
 
-        let s: HashMap<ProjectId, HashMap<EndpointIdentifier, i64>> = stats
+        let s: HashMap<ArcProjectId, HashMap<EndpointIdentifier, i64>> = stats
             .into_iter()
             .map(|(k, v)| (k, v.into_consumable()))
             .collect();
@@ -247,7 +249,7 @@ impl EndpointStatisticsTracker {
                     sink.sink_id(),
                     e.error
                 );
-            };
+            }
         }
     }
 
@@ -269,10 +271,10 @@ impl EndpointStatisticsTracker {
             Endpoint::from_method_and_matched_path(request_metadata.request_method(), matched_path)
         else {
             tracing::error!(
-                            "Could not parse endpoint from matched path: '{} {}'. This is likely a bug which will affect the statistics collection.",
-                            request_metadata.request_method(),
-                            matched_path
-                        );
+                "Could not parse endpoint from matched path: '{} {}'. This is likely a bug which will affect the statistics collection.",
+                request_metadata.request_method(),
+                matched_path
+            );
             return;
         };
         let Some(project) = request_metadata.preferred_project_id() else {
@@ -327,7 +329,7 @@ impl EndpointStatisticsTracker {
 pub trait EndpointStatisticsSink: Debug + Send + Sync + 'static {
     async fn consume_endpoint_statistics(
         &self,
-        stats: HashMap<ProjectId, HashMap<EndpointIdentifier, i64>>,
+        stats: HashMap<ArcProjectId, HashMap<EndpointIdentifier, i64>>,
     ) -> crate::api::Result<()>;
 
     fn sink_id(&self) -> &'static str;

@@ -1,0 +1,137 @@
+name: SeaweedFS Tests
+on:
+  push:
+    branches:
+      - main
+      - "manual-release-*"
+      - "rel-*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.94.1
+  RUSTFLAGS: --cfg tracing_unstable -D warnings
+  NEXTEST_PROFILE: s3_compat
+
+permissions:
+  contents: read # Needed to checkout code
+  checks: write # Needed for test reporting
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      # Required by the catalog-level S3 tests, which are `#[sqlx::test]`s.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      RUSTFLAGS: --cfg tracing_unstable -D warnings -C debuginfo=0
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Start SeaweedFS Docker Container
+        run: |
+          # SeaweedFS mini serves S3 plus the STS AssumeRole API in one process.
+          # -bucket pre-creates the `tests` bucket so the non-admin lakekeeper
+          # identity (which cannot CreateBucket) suffices; its vended-credentials
+          # tests (S3Compat flavor) call sts:AssumeRole, which needs the STS
+          # signing key in .github/seaweedfs-iam.json (an ephemeral, CI-only value).
+          docker run -d --name seaweedfs -p 8333:8333 \
+            -e "AWS_ACCESS_KEY_ID=some_access_key1" \
+            -e "AWS_SECRET_ACCESS_KEY=some_secret_key1" \
+            -v "${GITHUB_WORKSPACE}/.github/seaweedfs-iam.json:/etc/seaweedfs/iam.json:ro" \
+            chrislusf/seaweedfs:4.36 mini -dir=/data -bucket=tests -ip.bind=0.0.0.0 \
+            -s3.config=/etc/seaweedfs/iam.json -s3.iam.config=/etc/seaweedfs/iam.json
+
+      - name: Wait for SeaweedFS S3 to be healthy
+        shell: bash
+        run: |
+          for i in {1..30}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8333 || true)
+            if [ "$CODE" == "200" ] || [ "$CODE" == "403" ]; then
+              echo "SeaweedFS S3 is healthy (Code: $CODE)"
+              exit 0
+            else
+              echo "Waiting for SeaweedFS S3 to be healthy (Code: $CODE)..."
+              sleep 2
+            fi
+          done
+          echo "SeaweedFS S3 did not become healthy in time"
+          echo "=== Last Curl Output ==="
+          curl -v http://127.0.0.1:8333
+          echo "=== SeaweedFS Container Logs ==="
+          docker logs seaweedfs
+          echo "=== Process List ==="
+          ps aux
+          echo "=== Open Ports ==="
+          netstat -tlnp
+          exit 1
+
+      - name: Setup Rust toolchain and cache
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+        env:
+          RUST_CACHE_KEY_OS: rust-${{ env.RUST_TOOLCHAIN }}-cache-ubuntu-24.04
+
+      - name: Setup cargo nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Migrate database
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
+          cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
+          sqlx database create
+          sqlx migrate run --source crates/lakekeeper-storage-postgres/migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+      - name: Test
+        timeout-minutes: 25
+        run: cargo nextest run --profile ${{ env.NEXTEST_PROFILE }} --all-targets --all-features --workspace
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # seaweedfs test envs
+          LAKEKEEPER_TEST__S3_BUCKET: tests
+          LAKEKEEPER_TEST__S3_REGION: local
+          LAKEKEEPER_TEST__S3_ACCESS_KEY: some_access_key1
+          LAKEKEEPER_TEST__S3_SECRET_KEY: some_secret_key1
+          LAKEKEEPER_TEST__S3_ENDPOINT: http://127.0.0.1:8333
+
+      - name: Dump SeaweedFS Logs
+        if: always()
+        run: |
+          echo "=== SeaweedFS Container Logs ==="
+          docker logs seaweedfs || echo "seaweedfs container not found"
+          echo "=== Process List ==="
+          ps aux || echo "ps failed"
+          echo "=== Open Ports ==="
+          netstat -tlnp || echo "netstat failed"
+
+      - name: Upload junit
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit
+          path: target/nextest/${{ env.NEXTEST_PROFILE }}/junit.xml

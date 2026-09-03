@@ -1,4 +1,4 @@
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use iceberg::spec::TableMetadata;
 use iceberg_ext::catalog::rest::IcebergErrorResponse;
 use lakekeeper_io::{
@@ -84,7 +84,17 @@ pub(crate) async fn list_location<'a>(
     page_size: Option<usize>,
 ) -> Result<BoxStream<'a, std::result::Result<Vec<Location>, IOError>>, InvalidLocationError> {
     tracing::debug!("Listing location: {}", location);
-    let entries = io.list(location, page_size).await?;
+    let entries = io.list(location.as_str(), page_size).await?;
+    let entries = entries
+        .map(|entry| {
+            entry.map(|file_infos| {
+                file_infos
+                    .into_iter()
+                    .map(|file_info| file_info.location().clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .boxed();
     Ok(entries)
 }
 
@@ -140,28 +150,22 @@ impl IOErrorExt {
 impl From<IOErrorExt> for ErrorModel {
     fn from(value: IOErrorExt) -> Self {
         let typ = value.to_type();
-        let boxed = Box::new(value);
-        let message = boxed.to_string();
+        let message = value.to_string();
 
-        tracing::info!(?boxed, "IO Error: {message}");
-
-        match boxed.as_ref() {
-            IOErrorExt::FileDecompression(_) => {
-                ErrorModel::failed_dependency(message, typ, Some(boxed))
+        match value {
+            IOErrorExt::FileDecompression(e) => {
+                ErrorModel::failed_dependency(message, typ, Some(e))
             }
-            IOErrorExt::FileCompression(_) | IOErrorExt::Serialization(_) => {
-                ErrorModel::internal(message, typ, Some(boxed))
+            IOErrorExt::FileCompression(e) => ErrorModel::internal(message, typ, Some(e)),
+            IOErrorExt::Serialization(e) => ErrorModel::internal(message, typ, Some(Box::new(e))),
+            IOErrorExt::Deserialization(e) => {
+                ErrorModel::bad_request(message, typ, Some(Box::new(e)))
             }
-            IOErrorExt::Deserialization(_) | IOErrorExt::InvalidLocation(_) => {
-                ErrorModel::bad_request(message, typ, Some(boxed))
+            IOErrorExt::InvalidLocation(e) => {
+                ErrorModel::bad_request(message, typ, Some(Box::new(e)))
             }
             IOErrorExt::IOError(e) => {
-                let context = e
-                    .context()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                ErrorModel::bad_request(message, typ, Some(boxed)).append_details(context)
+                ErrorModel::from_io_error(e, "Lakekeeper IO operation failed.")
             }
         }
     }
@@ -217,32 +221,39 @@ mod tests {
         // Assert that one of the items contains file1
         assert!(list_f1.iter().any(|entry| entry.as_str().contains("file1")));
         // Assert that "folder-2" is nowhere in the list
-        assert!(!list_f1
-            .iter()
-            .any(|entry| entry.as_str().contains("folder-2")));
+        assert!(
+            !list_f1
+                .iter()
+                .any(|entry| entry.as_str().contains("folder-2"))
+        );
 
         // List full location - we should see both folders
         let list = list_simple(&io, &location).await;
-        assert!(list
-            .iter()
-            .any(|entry| entry.as_str().contains("folder/file1")));
-        assert!(list
-            .iter()
-            .any(|entry| entry.as_str().contains("folder-2/file2")));
+        assert!(
+            list.iter()
+                .any(|entry| entry.as_str().contains("folder/file1"))
+        );
+        assert!(
+            list.iter()
+                .any(|entry| entry.as_str().contains("folder-2/file2"))
+        );
 
         // Remove folder 1 - file 2 should still be here:
         remove_all(&io, &folder_1).await.unwrap();
-        assert!(read_file(&io, &file_2, CompressionCodec::Gzip)
-            .await
-            .is_ok());
+        assert!(
+            read_file(&io, &file_2, CompressionCodec::Gzip)
+                .await
+                .is_ok()
+        );
 
         let list = list_simple(&io, &location).await;
         // Assert that "folder/" / file1 is gone
         assert!(!list.iter().any(|entry| entry.as_str().contains("file1")));
         // and that "folder-2/" / file2 is still here
-        assert!(list
-            .iter()
-            .any(|entry| entry.as_str().contains("folder-2/file2")));
+        assert!(
+            list.iter()
+                .any(|entry| entry.as_str().contains("folder-2/file2"))
+        );
 
         // Listing location 1 should return an empty list
         let folder_1_list = list_simple(&io, &folder_1).await;
@@ -258,7 +269,7 @@ mod tests {
     pub(crate) mod aws_integration_tests {
         use super::*;
         use crate::service::storage::{
-            s3::test::aws_integration_tests::get_storage_profile, StorageCredential, StorageProfile,
+            StorageCredential, StorageProfile, s3::test::aws_integration_tests::get_storage_profile,
         };
 
         #[tokio::test]
@@ -274,8 +285,8 @@ mod tests {
     pub(crate) mod azure_integration_tests {
         use super::*;
         use crate::service::storage::{
-            az::test::azure_integration_tests::{azure_profile, client_creds},
             StorageCredential, StorageProfile,
+            az::test::azure_integration_tests::{azure_profile, client_creds},
         };
 
         #[tokio::test]
@@ -290,8 +301,8 @@ mod tests {
     pub(crate) mod gcs_integration_tests {
         use super::*;
         use crate::service::storage::{
-            gcs::test::gcs_integration_tests::get_storage_profile, StorageCredential,
-            StorageProfile,
+            StorageCredential, StorageProfile,
+            gcs::test::gcs_integration_tests::get_storage_profile,
         };
 
         #[tokio::test]

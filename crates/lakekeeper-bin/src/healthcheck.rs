@@ -1,9 +1,10 @@
 use anyhow::Context;
 use lakekeeper::{
-    implementations::postgres::{get_reader_pool, get_writer_pool, ReadWrite},
+    CONFIG,
     service::health::{HealthExt, HealthState, HealthStatus},
-    tracing, CONFIG,
+    tracing,
 };
+use lakekeeper_storage_postgres::{ReadWrite, get_reader_pool, get_writer_pool};
 
 pub(crate) async fn health(check_db: bool, check_server: bool) -> anyhow::Result<()> {
     tracing::info!("Checking health...");
@@ -42,23 +43,30 @@ pub(crate) async fn health(check_db: bool, check_server: bool) -> anyhow::Result
     Ok(())
 }
 
+pub(crate) fn normalize_checks(
+    check_all: bool,
+    check_db: bool,
+    check_server: bool,
+) -> (bool, bool) {
+    let check_db = check_db || check_all;
+    let check_server = check_server || check_all;
+
+    if !check_db && !check_server {
+        (false, true)
+    } else {
+        (check_db, check_server)
+    }
+}
+
 pub(crate) async fn db_health_check() -> anyhow::Result<()> {
-    let reader = get_reader_pool(
-        CONFIG
-            .to_pool_opts()
-            .acquire_timeout(std::time::Duration::from_secs(CONFIG.pg_acquire_timeout))
-            .max_connections(1),
-    )
-    .await
-    .with_context(|| "Read pool failed.")?;
-    let writer = get_writer_pool(
-        CONFIG
-            .to_pool_opts()
-            .acquire_timeout(std::time::Duration::from_secs(CONFIG.pg_acquire_timeout))
-            .max_connections(1),
-    )
-    .await
-    .with_context(|| "Write pool failed.")?;
+    use lakekeeper_storage_postgres::config::CONFIG as PG_CONFIG;
+    let _ = &*CONFIG; // ensure lakekeeper config is eager-init for parity
+    let reader = get_reader_pool(PG_CONFIG.to_pool_opts().max_connections(1))
+        .await
+        .with_context(|| "Read pool failed.")?;
+    let writer = get_writer_pool(PG_CONFIG.to_pool_opts().max_connections(1))
+        .await
+        .with_context(|| "Write pool failed.")?;
 
     let db = ReadWrite::from_pools(reader.clone(), writer.clone());
     db.update_health().await;
@@ -73,5 +81,24 @@ pub(crate) async fn db_health_check() -> anyhow::Result<()> {
         Ok(())
     } else {
         Err(anyhow::anyhow!("Database is not healthy."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bare_healthcheck_checks_server() {
+        assert_eq!(super::normalize_checks(false, false, false), (false, true));
+    }
+
+    #[test]
+    fn check_all_checks_db_and_server() {
+        assert_eq!(super::normalize_checks(true, false, false), (true, true));
+    }
+
+    #[test]
+    fn explicit_checks_are_preserved() {
+        assert_eq!(super::normalize_checks(false, true, false), (true, false));
+        assert_eq!(super::normalize_checks(false, false, true), (false, true));
     }
 }

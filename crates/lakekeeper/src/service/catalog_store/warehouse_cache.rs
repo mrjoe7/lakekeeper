@@ -3,71 +3,69 @@ use std::{
     time::Duration,
 };
 
-use axum_prometheus::metrics;
-use moka::{future::Cache, notification::RemovalCause};
+use moka::{
+    future::Cache,
+    notification::RemovalCause,
+    ops::compute::{CompResult, Op},
+};
 use unicase::UniCase;
 
+use super::secondary_index_get_or_load;
 #[cfg(feature = "router")]
+use crate::service::events::{self, EventListener};
 use crate::{
-    api::{
-        management::v1::warehouse::{
-            RenameWarehouseRequest, UpdateWarehouseCredentialRequest,
-            UpdateWarehouseDeleteProfileRequest, UpdateWarehouseStorageRequest,
-        },
-        RequestMetadata,
+    CONFIG, WarehouseId,
+    service::{
+        ArcProjectId, ResolvedWarehouse,
+        cache_metrics::{record_cache_hit, record_cache_miss, set_cache_size},
+        cache_ttl::JitteredTtl,
     },
-    service::endpoint_hooks::EndpointHook,
-    SecretId,
 };
-use crate::{service::ResolvedWarehouse, ProjectId, WarehouseId, CONFIG};
-
-const METRIC_WAREHOUSE_CACHE_SIZE: &str = "lakekeeper_warehouse_cache_size";
-const METRIC_WAREHOUSE_CACHE_HITS: &str = "lakekeeper_warehouse_cache_hits_total";
-const METRIC_WAREHOUSE_CACHE_MISSES: &str = "lakekeeper_warehouse_cache_misses_total";
-
-/// Initialize metric descriptions for STC cache metrics
-static METRICS_INITIALIZED: LazyLock<()> = LazyLock::new(|| {
-    metrics::describe_gauge!(
-        METRIC_WAREHOUSE_CACHE_SIZE,
-        "Current number of entries in the warehouse cache"
-    );
-    metrics::describe_counter!(
-        METRIC_WAREHOUSE_CACHE_HITS,
-        "Total number of warehouse cache hits"
-    );
-    metrics::describe_counter!(
-        METRIC_WAREHOUSE_CACHE_MISSES,
-        "Total number of warehouse cache misses"
-    );
-});
 
 // Main cache: stores warehouses by ID only
-pub(crate) static WAREHOUSE_CACHE: LazyLock<Cache<WarehouseId, CachedWarehouse>> =
-    LazyLock::new(|| {
-        Cache::builder()
-            .max_capacity(CONFIG.cache.warehouse.capacity)
-            .initial_capacity(50)
-            .time_to_live(Duration::from_secs(
-                CONFIG.cache.warehouse.time_to_live_secs,
-            ))
-            .async_eviction_listener(|key, value: CachedWarehouse, cause| {
-                Box::pin(async move {
-                    // Evictions:
-                    // - Replaced: only invalidate old-name mapping if the current entry
-                    //   either does not exist or has a different (project_id, name).
-                    // - Other causes: primary entry is gone; invalidate mapping.
-                    let should_invalidate = match cause {
-                        RemovalCause::Replaced => {
-                            if let Some(curr) = WAREHOUSE_CACHE.get(&*key).await {
-                                curr.warehouse.project_id != value.warehouse.project_id
-                                    || curr.warehouse.name != value.warehouse.name
-                            } else {
-                                true
+pub static WAREHOUSE_CACHE: LazyLock<Cache<WarehouseId, CachedWarehouse>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(CONFIG.cache.warehouse.capacity)
+        .initial_capacity(50)
+        .time_to_live(Duration::from_secs(
+            CONFIG.cache.warehouse.time_to_live_secs,
+        ))
+        .expire_after(JitteredTtl::with_default_jitter(Duration::from_secs(
+            CONFIG.cache.warehouse.time_to_live_secs,
+        )))
+        .async_eviction_listener(|key, value: CachedWarehouse, cause| {
+            Box::pin(async move {
+                // On Replaced: invalidate the old secondary index mapping immediately,
+                // then spawn a task to re-insert the new mapping (avoids re-entrant
+                // WAREHOUSE_CACHE.get() calls which can deadlock).
+                // On all other causes (expired, explicit): always invalidate.
+                match cause {
+                    RemovalCause::Replaced => {
+                        let key = *key;
+                        // Immediately invalidate the old (project_id, name) → warehouse_id mapping
+                        NAME_TO_ID_CACHE
+                            .invalidate(&(
+                                value.warehouse.project_id.clone(),
+                                UniCase::new(value.warehouse.name.clone()),
+                            ))
+                            .await;
+
+                        // Spawn task to add the new mapping (avoids re-entrant WAREHOUSE_CACHE.get)
+                        tokio::spawn(async move {
+                            if let Some(curr) = WAREHOUSE_CACHE.get(&key).await {
+                                NAME_TO_ID_CACHE
+                                    .insert(
+                                        (
+                                            curr.warehouse.project_id.clone(),
+                                            UniCase::new(curr.warehouse.name.clone()),
+                                        ),
+                                        key,
+                                    )
+                                    .await;
                             }
-                        }
-                        _ => true,
-                    };
-                    if should_invalidate {
+                        });
+                    }
+                    _ => {
                         NAME_TO_ID_CACHE
                             .invalidate(&(
                                 value.warehouse.project_id.clone(),
@@ -75,31 +73,58 @@ pub(crate) static WAREHOUSE_CACHE: LazyLock<Cache<WarehouseId, CachedWarehouse>>
                             ))
                             .await;
                     }
-                })
+                }
             })
-            .build()
-    });
+        })
+        .build()
+});
 
 // Secondary index: (project_id, name) → warehouse_id
 // Uses UniCase for case-insensitive warehouse name lookups
-static NAME_TO_ID_CACHE: LazyLock<Cache<(ProjectId, UniCase<String>), WarehouseId>> =
+static NAME_TO_ID_CACHE: LazyLock<Cache<(ArcProjectId, UniCase<String>), WarehouseId>> =
     LazyLock::new(|| {
         Cache::builder()
             .max_capacity(CONFIG.cache.warehouse.capacity)
             .initial_capacity(50)
+            .time_to_live(Duration::from_secs(
+                CONFIG.cache.warehouse.time_to_live_secs,
+            ))
+            .expire_after(JitteredTtl::with_default_jitter(Duration::from_secs(
+                CONFIG.cache.warehouse.time_to_live_secs,
+            )))
             .build()
     });
 
 #[derive(Debug, Clone)]
-pub(crate) struct CachedWarehouse {
-    pub(super) warehouse: Arc<ResolvedWarehouse>,
+pub struct CachedWarehouse {
+    pub warehouse: Arc<ResolvedWarehouse>,
 }
 
-#[allow(dead_code)] // Not required for all features
-async fn warehouse_cache_invalidate(warehouse_id: WarehouseId) {
+/// Drop a warehouse from this replica's cache.
+///
+/// Call this *after* the mutating transaction commits, never before: the write
+/// methods hand back the updated warehouse while the transaction is still open,
+/// so publishing it earlier would cache a value a rollback discards.
+///
+/// Dropping rather than replacing with the updated row is deliberate. It costs
+/// one reload on the next access — warehouse mutations are rare — and in
+/// exchange it also clears the `(project, name) -> id` index via the eviction
+/// listener, which a rename would otherwise leave resolving the old name.
+pub async fn warehouse_cache_invalidate(warehouse_id: WarehouseId) {
     if CONFIG.cache.warehouse.enabled {
         tracing::debug!("Invalidating warehouse id {warehouse_id} from cache");
-        WAREHOUSE_CACHE.invalidate(&warehouse_id).await;
+        // Remove via the loader's per-key compute lock (`Op::Remove`), not a bare
+        // `invalidate()`: the version-gate fences stale *updates* but not *deletes*
+        // (a delete leaves no entry to compare), so a bare invalidate racing an
+        // in-flight by-id load lets the loader re-`Put` the deleted warehouse until
+        // TTL. `Op::Remove` shares the loader's lock and still fires the eviction
+        // listener (Explicit), preserving the NAME_TO_ID_CACHE cascade. Closes the
+        // by-id path only; the by-name prime path keeps the residual — see
+        // `secondary_index_get_or_load`.
+        WAREHOUSE_CACHE
+            .entry(warehouse_id)
+            .and_compute_with(|_| async { Op::Remove })
+            .await;
         update_cache_size_metric();
     }
 }
@@ -136,13 +161,101 @@ pub(super) async fn warehouse_cache_insert(warehouse: Arc<ResolvedWarehouse>) {
     }
 }
 
+/// Single-flight read-through for the warehouse cache.
+///
+/// Coalesces concurrent misses for the same `warehouse_id`: moka serializes the
+/// per-key compute, so the loader runs once and later callers observe the
+/// just-inserted entry. Returns `Option` — a non-existent warehouse is **not**
+/// negative-cached.
+///
+/// The version-gate is preserved without reworking the writer: before inserting
+/// the loaded value we re-read the current entry and skip if a concurrent
+/// `warehouse_cache_insert` already cached a newer/equal version. (moka's compute
+/// lock does not serialize against the plain `insert()` that writer uses, so the
+/// re-check is required — it carries the same sub-`await` residual the existing
+/// get-then-insert gate already has, i.e. no regression.) The `(project, name) →
+/// id` index is populated alongside, mirroring `warehouse_cache_insert`. The
+/// `enabled` flag and hit/miss metrics are preserved; the loader error is
+/// returned by value (no `Arc`-sharing).
+pub(super) async fn warehouse_cache_get_or_load<Fut, E>(
+    warehouse_id: WarehouseId,
+    load: Fut,
+) -> Result<Option<Arc<ResolvedWarehouse>>, E>
+where
+    Fut: std::future::Future<Output = Result<Option<Arc<ResolvedWarehouse>>, E>> + Send,
+    E: Send + Sync + 'static,
+{
+    if !CONFIG.cache.warehouse.enabled {
+        return load.await;
+    }
+
+    // Fast path records a hit/miss. Note: under contention each coalesced waiter
+    // records a miss here but then hits `Op::Nop` below without loading, so the
+    // miss counter is *cache misses*, not *DB loads* (the two diverge under a herd).
+    if let Some(warehouse) = warehouse_cache_get_by_id(warehouse_id).await {
+        return Ok(Some(warehouse));
+    }
+
+    let outcome = WAREHOUSE_CACHE
+        .entry(warehouse_id)
+        .and_try_compute_with(|maybe_entry| async move {
+            if maybe_entry.is_some() {
+                // Populated by another caller while we waited on the key lock.
+                return Ok::<_, E>(Op::Nop);
+            }
+            let Some(warehouse) = load.await? else {
+                // Missing warehouse — never negative-cached. Coalescing therefore
+                // applies only to a found warehouse; concurrent lookups of a
+                // missing one each re-run the loader (rare, no worse than before).
+                return Ok(Op::Nop);
+            };
+            // Preserve the version-gate against a writer that cached a newer
+            // version via plain `insert()` during our load. Skips on `>=` (newer
+            // *or equal*), mirroring `warehouse_cache_insert`'s reluctance to churn
+            // an equal entry. (The role helper skips only on strictly-newer `<`;
+            // both are safe — re-putting an equal value is harmless either way.)
+            if let Some(current) = WAREHOUSE_CACHE.get(&warehouse_id).await
+                && current.warehouse.version >= warehouse.version
+            {
+                return Ok(Op::Nop);
+            }
+            NAME_TO_ID_CACHE
+                .insert(
+                    (
+                        warehouse.project_id.clone(),
+                        UniCase::new(warehouse.name.clone()),
+                    ),
+                    warehouse_id,
+                )
+                .await;
+            Ok(Op::Put(CachedWarehouse { warehouse }))
+        })
+        .await?;
+    update_cache_size_metric();
+
+    Ok(match outcome {
+        CompResult::Inserted(entry)
+        | CompResult::ReplacedWith(entry)
+        | CompResult::Unchanged(entry) => Some(entry.into_value().warehouse),
+        // `StillNone` means either the loader returned `None` (genuine not-found,
+        // never negative-cached) or the version-gate fired because a concurrent
+        // writer cached a newer version during our load. moka derives the
+        // `Op::Nop` result from the closure's entry snapshot, so it cannot surface
+        // that concurrent `insert()` (a different lock domain) — a final raw read
+        // does, returning the newer value if present and `None` otherwise.
+        // `Removed` is unreachable (the closure only returns `Nop`/`Put`).
+        CompResult::StillNone(_) | CompResult::Removed(_) => WAREHOUSE_CACHE
+            .get(&warehouse_id)
+            .await
+            .map(|c| c.warehouse),
+    })
+}
+
 /// Update the cache size metric with the current number of entries
 #[inline]
-#[allow(clippy::cast_precision_loss)]
 fn update_cache_size_metric() {
-    let () = &*METRICS_INITIALIZED; // Ensure metrics are described
-    metrics::gauge!(METRIC_WAREHOUSE_CACHE_SIZE, "cache_type" => "warehouse")
-        .set(WAREHOUSE_CACHE.entry_count() as f64);
+    set_cache_size("warehouse", WAREHOUSE_CACHE.entry_count());
+    set_cache_size("warehouse_name_to_id", NAME_TO_ID_CACHE.entry_count());
 }
 
 pub(super) async fn warehouse_cache_get_by_id(
@@ -151,123 +264,188 @@ pub(super) async fn warehouse_cache_get_by_id(
     update_cache_size_metric();
     if let Some(value) = WAREHOUSE_CACHE.get(&warehouse_id).await {
         tracing::debug!("Warehouse id {warehouse_id} found in cache");
-        metrics::counter!(METRIC_WAREHOUSE_CACHE_HITS, "cache_type" => "warehouse").increment(1);
+        record_cache_hit("warehouse");
         Some(value.warehouse.clone())
     } else {
-        metrics::counter!(METRIC_WAREHOUSE_CACHE_MISSES, "cache_type" => "warehouse").increment(1);
+        record_cache_miss("warehouse");
         None
     }
 }
 
 pub(super) async fn warehouse_cache_get_by_name(
     name: &str,
-    project_id: &ProjectId,
+    project_id: &ArcProjectId,
 ) -> Option<Arc<ResolvedWarehouse>> {
     update_cache_size_metric();
-    let Some(warehouse_id) = NAME_TO_ID_CACHE
-        .get(&(project_id.clone(), UniCase::new(name.to_string())))
-        .await
-    else {
-        metrics::counter!(METRIC_WAREHOUSE_CACHE_MISSES, "cache_type" => "warehouse").increment(1);
+    let name_key = (project_id.clone(), UniCase::new(name.to_string()));
+    let Some(warehouse_id) = NAME_TO_ID_CACHE.get(&name_key).await else {
+        record_cache_miss("warehouse_name_to_id");
         return None;
     };
-    tracing::debug!("Warehouse name {name} found in name-to-id cache");
+    record_cache_hit("warehouse_name_to_id");
+    tracing::debug!("Warehouse name {name} resolved in name-to-id cache to id {warehouse_id}");
 
     if let Some(value) = WAREHOUSE_CACHE.get(&(warehouse_id)).await {
         tracing::debug!("Warehouse id {warehouse_id} found in cache");
-        metrics::counter!(METRIC_WAREHOUSE_CACHE_HITS, "cache_type" => "warehouse").increment(1);
+        record_cache_hit("warehouse");
         Some(value.warehouse.clone())
     } else {
-        metrics::counter!(METRIC_WAREHOUSE_CACHE_MISSES, "cache_type" => "warehouse").increment(1);
+        tracing::debug!(
+            "Warehouse id {warehouse_id} not found in cache, invalidating stale name mapping for {name}"
+        );
+        NAME_TO_ID_CACHE.invalidate(&name_key).await;
+        record_cache_miss("warehouse");
         None
     }
 }
 
-#[cfg(feature = "router")]
-#[derive(Debug, Clone)]
-pub(crate) struct WarehouseCacheEndpointHook;
+/// Single-flight read-through for the `(project, name) → id` resolution.
+///
+/// Coalesces concurrent **by-name** misses (clients usually address warehouses by
+/// name, so this is the hot cold-start path): the by-name DB query runs once per
+/// `(project, name)`, the loaded warehouse primes the by-id cache + name index, and
+/// every coalesced caller resolves the full warehouse by id. Returns the resolved
+/// `WarehouseId`, or `None` if it does not exist (**not** negative-cached). Thin
+/// wrapper over [`secondary_index_get_or_load`](super::secondary_index_get_or_load).
+pub(super) async fn warehouse_name_to_id_get_or_load<Fut, E>(
+    project_id: ArcProjectId,
+    name: &str,
+    load: Fut,
+) -> Result<Option<WarehouseId>, E>
+where
+    Fut: std::future::Future<Output = Result<Option<Arc<ResolvedWarehouse>>, E>> + Send,
+    E: Send + Sync + 'static,
+{
+    secondary_index_get_or_load(
+        CONFIG.cache.warehouse.enabled,
+        &NAME_TO_ID_CACHE,
+        (project_id, UniCase::new(name.to_string())),
+        load,
+        |warehouse: &Arc<ResolvedWarehouse>| warehouse.warehouse_id,
+        warehouse_cache_insert,
+    )
+    .await
+}
 
 #[cfg(feature = "router")]
-impl std::fmt::Display for WarehouseCacheEndpointHook {
+#[derive(Debug, Clone)]
+pub struct WarehouseCacheEventListener;
+
+#[cfg(feature = "router")]
+impl std::fmt::Display for WarehouseCacheEventListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WarehouseCacheEndpointHook")
+        write!(f, "WarehouseCacheEventListener")
     }
 }
 
 #[cfg(feature = "router")]
 #[async_trait::async_trait]
-impl EndpointHook for WarehouseCacheEndpointHook {
-    async fn create_warehouse(
-        &self,
-        warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
-    ) -> anyhow::Result<()> {
+impl EventListener for WarehouseCacheEventListener {
+    async fn warehouse_created(&self, event: events::CreateWarehouseEvent) -> anyhow::Result<()> {
+        let events::CreateWarehouseEvent {
+            warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(warehouse).await;
         Ok(())
     }
 
-    async fn delete_warehouse(
-        &self,
-        warehouse_id: WarehouseId,
-        _request_metadata: Arc<RequestMetadata>,
-    ) -> anyhow::Result<()> {
+    async fn warehouse_deleted(&self, event: events::DeleteWarehouseEvent) -> anyhow::Result<()> {
+        let events::DeleteWarehouseEvent {
+            warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         // When we invalidate by warehouse_id, the eviction listener will handle
         // removing the entry from NAME_TO_ID_CACHE
-        warehouse_cache_invalidate(warehouse_id).await;
+        warehouse_cache_invalidate(warehouse.warehouse_id).await;
         Ok(())
     }
 
-    async fn set_warehouse_protection(
+    async fn warehouse_protection_set(
         &self,
-        _requested_protected: bool,
-        updated_warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
+        event: events::SetWarehouseProtectionEvent,
     ) -> anyhow::Result<()> {
+        let events::SetWarehouseProtectionEvent {
+            requested_protected: _requested_protected,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(updated_warehouse).await;
         Ok(())
     }
 
-    async fn rename_warehouse(
+    async fn warehouse_managed_by_set(
         &self,
-        _request: Arc<RenameWarehouseRequest>,
-        updated_warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
+        event: events::SetWarehouseManagedByEvent,
     ) -> anyhow::Result<()> {
+        let events::SetWarehouseManagedByEvent {
+            requested_managed_by: _requested_managed_by,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(updated_warehouse).await;
         Ok(())
     }
 
-    async fn update_warehouse_delete_profile(
-        &self,
-        _request: Arc<UpdateWarehouseDeleteProfileRequest>,
-        updated_warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
-    ) -> anyhow::Result<()> {
-        println!(
-            "Updating delete profile in cache hook for warehouse id {}",
-            updated_warehouse.warehouse_id
-        );
+    async fn warehouse_renamed(&self, event: events::RenameWarehouseEvent) -> anyhow::Result<()> {
+        let events::RenameWarehouseEvent {
+            request: _request,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(updated_warehouse).await;
         Ok(())
     }
 
-    async fn update_warehouse_storage(
+    async fn warehouse_delete_profile_updated(
         &self,
-        _request: Arc<UpdateWarehouseStorageRequest>,
-        updated_warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
+        event: events::UpdateWarehouseDeleteProfileEvent,
     ) -> anyhow::Result<()> {
+        let events::UpdateWarehouseDeleteProfileEvent {
+            request: _request,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(updated_warehouse).await;
         Ok(())
     }
 
-    async fn update_warehouse_storage_credential(
+    async fn warehouse_format_version_policy_updated(
         &self,
-        _request: Arc<UpdateWarehouseCredentialRequest>,
-        _old_secret_id: Option<SecretId>,
-        updated_warehouse: Arc<ResolvedWarehouse>,
-        _request_metadata: Arc<RequestMetadata>,
+        event: events::UpdateWarehouseFormatVersionPolicyEvent,
     ) -> anyhow::Result<()> {
+        let events::UpdateWarehouseFormatVersionPolicyEvent {
+            request: _request,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
+        warehouse_cache_insert(updated_warehouse).await;
+        Ok(())
+    }
+
+    async fn warehouse_storage_updated(
+        &self,
+        event: events::UpdateWarehouseStorageEvent,
+    ) -> anyhow::Result<()> {
+        let events::UpdateWarehouseStorageEvent {
+            request: _request,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
+        warehouse_cache_insert(updated_warehouse).await;
+        Ok(())
+    }
+
+    async fn warehouse_storage_credential_updated(
+        &self,
+        event: events::UpdateWarehouseStorageCredentialEvent,
+    ) -> anyhow::Result<()> {
+        let events::UpdateWarehouseStorageCredentialEvent {
+            request: _request,
+            old_secret_id: _old_secret_id,
+            updated_warehouse,
+            request_metadata: _request_metadata,
+        } = event;
         warehouse_cache_insert(updated_warehouse).await;
         Ok(())
     }
@@ -279,6 +457,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        ProjectId,
         api::management::v1::warehouse::TabularDeleteProfile,
         service::{catalog_store::warehouse::WarehouseStatus, storage::MemoryProfile},
     };
@@ -287,7 +466,7 @@ mod tests {
     fn test_warehouse(
         warehouse_id: WarehouseId,
         name: String,
-        project_id: ProjectId,
+        project_id: ArcProjectId,
         updated_at: Option<chrono::DateTime<chrono::Utc>>,
         version: i64,
     ) -> Arc<ResolvedWarehouse> {
@@ -300,6 +479,9 @@ mod tests {
             status: WarehouseStatus::Active,
             tabular_delete_profile: TabularDeleteProfile::Hard {},
             protected: false,
+            managed_by: crate::service::ManagedBy::SelfManaged,
+            allowed_format_versions: crate::service::AllowedFormatVersions::default(),
+            default_format_version: None,
             updated_at,
             version: version.into(),
         })
@@ -308,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_insert_and_get_by_id() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse".to_string();
         let warehouse = test_warehouse(
             warehouse_id,
@@ -333,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_get_by_name() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-by-name".to_string();
         let warehouse = test_warehouse(
             warehouse_id,
@@ -358,8 +540,8 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_get_by_name_different_project() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
-        let different_project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
+        let different_project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-project".to_string();
         let warehouse = test_warehouse(
             warehouse_id,
@@ -380,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_invalidate() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-invalidate".to_string();
         let warehouse = test_warehouse(
             warehouse_id,
@@ -410,9 +592,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_name_to_id_cache_has_ttl_matching_primary() {
+        let primary_ttl = WAREHOUSE_CACHE.policy().time_to_live();
+        let secondary_ttl = NAME_TO_ID_CACHE.policy().time_to_live();
+        assert_eq!(
+            primary_ttl, secondary_ttl,
+            "NAME_TO_ID_CACHE TTL must match WAREHOUSE_CACHE TTL"
+        );
+        assert!(
+            secondary_ttl.is_some(),
+            "NAME_TO_ID_CACHE must have a TTL configured"
+        );
+    }
+
+    #[tokio::test]
     async fn test_warehouse_cache_miss() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "nonexistent-warehouse".to_string();
 
         // Try to get a warehouse that was never cached
@@ -426,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_insert_newer_timestamp() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-timestamp".to_string();
 
         let old_time = Utc::now();
@@ -466,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_insert_older_timestamp_ignored() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-old-timestamp".to_string();
 
         let new_time = Utc::now();
@@ -506,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_insert_same_timestamp_ignored() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-same-timestamp".to_string();
 
         let timestamp = Utc::now();
@@ -540,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_rename_updates_name_to_id_cache() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let old_name = "old-warehouse-name".to_string();
         let new_name = "new-warehouse-name".to_string();
 
@@ -587,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn test_warehouse_cache_insert_none_timestamp() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "test-warehouse-none-timestamp".to_string();
 
         // Insert warehouse without timestamp
@@ -618,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_warehouse_cache_multiple_warehouses() {
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
 
         // Create multiple warehouses
         let warehouse1_id = WarehouseId::new_random();
@@ -659,21 +855,27 @@ mod tests {
         assert!(warehouse_cache_get_by_id(warehouse3_id).await.is_some());
 
         // Verify all are cached by name
-        assert!(warehouse_cache_get_by_name("warehouse1", &project_id)
-            .await
-            .is_some());
-        assert!(warehouse_cache_get_by_name("warehouse2", &project_id)
-            .await
-            .is_some());
-        assert!(warehouse_cache_get_by_name("warehouse3", &project_id)
-            .await
-            .is_some());
+        assert!(
+            warehouse_cache_get_by_name("warehouse1", &project_id)
+                .await
+                .is_some()
+        );
+        assert!(
+            warehouse_cache_get_by_name("warehouse2", &project_id)
+                .await
+                .is_some()
+        );
+        assert!(
+            warehouse_cache_get_by_name("warehouse3", &project_id)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn test_warehouse_cache_same_name_different_projects() {
-        let project_id1 = ProjectId::new_random();
-        let project_id2 = ProjectId::new_random();
+        let project_id1 = Arc::new(ProjectId::new_random());
+        let project_id2 = Arc::new(ProjectId::new_random());
         let name = "same-warehouse-name".to_string();
 
         let warehouse1_id = WarehouseId::new_random();
@@ -708,10 +910,114 @@ mod tests {
         assert_eq!(cached2.unwrap().warehouse_id, warehouse2_id);
     }
 
+    /// `warehouse_cache_get_or_load` must coalesce concurrent misses for the same
+    /// id into ONE loader run, with every caller observing the cached entry.
+    #[tokio::test]
+    async fn warehouse_get_or_load_coalesces_concurrent_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let warehouse_id = WarehouseId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
+        warehouse_cache_invalidate(warehouse_id).await;
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let warehouse = test_warehouse(
+            warehouse_id,
+            "wh-coalesce".to_string(),
+            project_id,
+            Some(Utc::now()),
+            0,
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let loads = Arc::clone(&loads);
+            let warehouse = warehouse.clone();
+            handles.push(tokio::spawn(async move {
+                warehouse_cache_get_or_load(warehouse_id, async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    // Widen the load window so all callers queue on the key lock
+                    // before the first load completes.
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, std::convert::Infallible>(Some(warehouse))
+                })
+                .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().unwrap().expect("warehouse exists"));
+        }
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent misses must coalesce to a single loader run"
+        );
+        for r in &results[1..] {
+            assert_eq!(r.warehouse_id, warehouse_id);
+        }
+
+        warehouse_cache_invalidate(warehouse_id).await;
+    }
+
+    /// The in-closure version-gate must not let a slow loader overwrite a newer
+    /// value cached concurrently. We model the race by having the loader itself
+    /// insert a newer version (as a concurrent `warehouse_cache_insert` would)
+    /// before returning a stale older one — the helper must keep the newer entry
+    /// and return it, never the stale load.
+    #[tokio::test]
+    async fn warehouse_get_or_load_version_gate_keeps_newer_concurrent_insert() {
+        let warehouse_id = WarehouseId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
+        warehouse_cache_invalidate(warehouse_id).await;
+
+        let name = "wh-version-gate".to_string();
+        let newer = test_warehouse(
+            warehouse_id,
+            name.clone(),
+            project_id.clone(),
+            Some(Utc::now()),
+            5,
+        );
+        let older = test_warehouse(warehouse_id, name, project_id, Some(Utc::now()), 3);
+
+        let returned = warehouse_cache_get_or_load(warehouse_id, {
+            let newer = newer.clone();
+            let older = older.clone();
+            async move {
+                // A concurrent writer caches a newer version while we "load".
+                warehouse_cache_insert(newer).await;
+                Ok::<_, std::convert::Infallible>(Some(older))
+            }
+        })
+        .await
+        .unwrap()
+        .expect("warehouse exists");
+
+        assert_eq!(
+            *returned.version, 5,
+            "helper must return the newer concurrently-cached value, not the stale load"
+        );
+        assert_eq!(
+            *warehouse_cache_get_by_id(warehouse_id)
+                .await
+                .unwrap()
+                .version,
+            5,
+            "stale older load must be version-gated out of the cache"
+        );
+
+        warehouse_cache_invalidate(warehouse_id).await;
+    }
+
     #[tokio::test]
     async fn test_warehouse_cache_case_insensitive_lookup() {
         let warehouse_id = WarehouseId::new_random();
-        let project_id = ProjectId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
         let name = "Test-Warehouse".to_string();
         let warehouse = test_warehouse(
             warehouse_id,
@@ -740,5 +1046,111 @@ mod tests {
         let cached_exact = warehouse_cache_get_by_name(&name, &project_id).await;
         assert!(cached_exact.is_some());
         assert_eq!(cached_exact.unwrap().warehouse_id, warehouse_id);
+    }
+
+    /// `warehouse_name_to_id_get_or_load` must coalesce concurrent by-name misses
+    /// into ONE loader run, with every caller resolving the same id.
+    #[tokio::test]
+    async fn warehouse_name_to_id_get_or_load_coalesces_concurrent_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let warehouse_id = WarehouseId::new_random();
+        let project_id = Arc::new(ProjectId::new_random());
+        let name = "wh-name-coalesce".to_string();
+        warehouse_cache_invalidate(warehouse_id).await;
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let warehouse = test_warehouse(
+            warehouse_id,
+            name.clone(),
+            project_id.clone(),
+            Some(Utc::now()),
+            0,
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let loads = Arc::clone(&loads);
+            let warehouse = warehouse.clone();
+            let project_id = project_id.clone();
+            let name = name.clone();
+            handles.push(tokio::spawn(async move {
+                warehouse_name_to_id_get_or_load(project_id, &name, async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, std::convert::Infallible>(Some(warehouse))
+                })
+                .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().unwrap().expect("warehouse exists"));
+        }
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent by-name misses must coalesce to a single loader run"
+        );
+        for id in &results {
+            assert_eq!(*id, warehouse_id);
+        }
+
+        warehouse_cache_invalidate(warehouse_id).await;
+    }
+
+    /// A `None` result (warehouse not found) must NOT be negative-cached or
+    /// coalesced: concurrent missing-lookups each re-run the loader, and the entry
+    /// stays absent so a later real insert is visible immediately.
+    #[tokio::test]
+    async fn warehouse_get_or_load_does_not_negative_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let warehouse_id = WarehouseId::new_random();
+        warehouse_cache_invalidate(warehouse_id).await;
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let calls = 4;
+
+        let mut handles = Vec::new();
+        for _ in 0..calls {
+            let loads = Arc::clone(&loads);
+            handles.push(tokio::spawn(async move {
+                warehouse_cache_get_or_load(warehouse_id, async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    // Widen the window so callers contend; a missing entry must
+                    // still not coalesce (nothing is cached to coalesce onto).
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, std::convert::Infallible>(None)
+                })
+                .await
+            }));
+        }
+
+        for h in handles {
+            assert!(
+                h.await.unwrap().unwrap().is_none(),
+                "a missing warehouse resolves to None"
+            );
+        }
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            calls,
+            "a missing warehouse is not negative-cached, so each concurrent caller \
+             re-runs the loader"
+        );
+        assert!(
+            warehouse_cache_get_by_id(warehouse_id).await.is_none(),
+            "None must not be cached"
+        );
+
+        warehouse_cache_invalidate(warehouse_id).await;
     }
 }

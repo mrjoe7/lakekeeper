@@ -14,7 +14,7 @@ macro_rules! generate_endpoints {
         )*
     ) => {
         $(
-            paste::paste! {
+            pastey::paste! {
                 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::EnumIter)]
                 #[allow(clippy::enum_variant_names)]
                 pub enum [<$enum_name Endpoint>] {
@@ -43,12 +43,12 @@ macro_rules! generate_endpoints {
             }
         )*
 
-        paste::paste! {
+        pastey::paste! {
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::EnumIter, strum::Display)]
-            #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+            #[cfg_attr(feature = "sqlx-postgres", derive(sqlx::Type))]
             #[strum(serialize_all = "kebab-case")]
             // Only apply the sqlx attribute if the feature is enabled
-            #[cfg_attr(feature = "sqlx", sqlx(type_name = "api_endpoints", rename_all = "kebab-case"))]
+            #[cfg_attr(feature = "sqlx-postgres", sqlx(type_name = "api_endpoints", rename_all = "kebab-case"))]
             pub enum EndpointFlat {
                 $(
                     $(
@@ -123,6 +123,7 @@ macro_rules! generate_endpoints {
 }
 
 impl CatalogV1Endpoint {
+    #[must_use]
     pub fn unimplemented(self) -> bool {
         matches!(
             self,
@@ -134,6 +135,19 @@ impl CatalogV1Endpoint {
     }
 }
 
+// A literal segment beside a path parameter is resolved in the literal's favour, with
+// no warning. That is only safe where the parameter is UUID-typed and so can never
+// equal the literal — never beside a name-typed parameter (`{project_id}`, `{user_id}`,
+// `{tag_name}`, `{queue_name}`, `{namespace}`, `{table}`, `{view}`), where it would make
+// resources with that name unaddressable. Use a `by-id/` style disambiguator or a query
+// parameter instead. The catalog `{prefix}` is safe only because it must parse as a
+// warehouse id.
+//
+// `/management/v1/project/...` is the standing exception: `grants`, `actions`, `rename`
+// and the rest sit beside the deprecated `/project/{project_id}` routes and shadow a
+// project literally named for one of them. Those routes are superseded by the
+// `x-project-id` header and are not extended; new project-scoped endpoints go under the
+// header-addressed form, which has no parameter to shadow.
 generate_endpoints! {
     enum CatalogV1 {
         GetConfig(GET, "/catalog/v1/config"),
@@ -167,14 +181,25 @@ generate_endpoints! {
         FetchScanTasks(POST, "/catalog/v1/{prefix}/namespaces/{namespace}/tables/{table}/tasks"),
     }
 
+    enum GenericTableV1 {
+        CreateGenericTable(POST, "/lakekeeper/v1/{prefix}/namespaces/{namespace}/generic-tables"),
+        ListGenericTables(GET, "/lakekeeper/v1/{prefix}/namespaces/{namespace}/generic-tables"),
+        LoadGenericTable(GET, "/lakekeeper/v1/{prefix}/namespaces/{namespace}/generic-tables/{table}"),
+        DropGenericTable(DELETE, "/lakekeeper/v1/{prefix}/namespaces/{namespace}/generic-tables/{table}"),
+        RenameGenericTable(POST, "/lakekeeper/v1/{prefix}/generic-tables/rename"),
+        LoadGenericTableCredentials(GET, "/lakekeeper/v1/{prefix}/namespaces/{namespace}/generic-tables/{table}/credentials"),
+    }
+
     enum Sign {
         S3RequestGlobal(POST, "/catalog/v1/aws/s3/sign"),
         S3RequestPrefix(POST, "/catalog/v1/{prefix}/v1/aws/s3/sign"),
         S3RequestTabular(POST, "/catalog/v1/signer/{prefix}/tabular-id/{tabular_id}/v1/aws/s3/sign"),
+        S3RequestByTableName(POST, "/catalog/v1/{prefix}/namespaces/{namespace}/tables/{table}/sign"),
     }
 
     enum ManagementV1 {
         ServerInfo(GET, "/management/v1/info"),
+        GetServerActions(GET, "/management/v1/server/actions"),
         Bootstrap(POST, "/management/v1/bootstrap"),
         CreateUser(POST, "/management/v1/user"),
         SearchUser(POST, "/management/v1/search/user"),
@@ -183,51 +208,143 @@ generate_endpoints! {
         UpdateUser(PUT, "/management/v1/user/{user_id}"),
         ListUser(GET, "/management/v1/user"),
         DeleteUser(DELETE, "/management/v1/user/{user_id}"),
+        GetUserActions(GET, "/management/v1/user/{user_id}/actions"),
         CreateRole(POST, "/management/v1/role"),
         SearchRole(POST, "/management/v1/search/role"),
         ListRole(GET, "/management/v1/role"),
         DeleteRole(DELETE, "/management/v1/role/{role_id}"),
         GetRole(GET, "/management/v1/role/{role_id}"),
         UpdateRole(POST, "/management/v1/role/{role_id}"),
+        UpdateRoleSourceSystem(PUT, "/management/v1/role/{role_id}/source-system"),
+        GetRoleActions(GET, "/management/v1/role/{role_id}/actions"),
+        GetRoleMetadata(GET, "/management/v1/role/{role_id}/metadata"),
+        ListRoleMembers(GET, "/management/v1/role/{role_id}/members"),
+        AddRoleMembers(POST, "/management/v1/role/{role_id}/members"),
+        RemoveRoleMember(DELETE, "/management/v1/role/{role_id}/members/{member_type}/{member_id}"),
+        ListRoleMemberOf(GET, "/management/v1/role/{role_id}/member-of"),
+        ListUserRoles(GET, "/management/v1/user/{user_id}/roles"),
+        ListRoleTransitiveMembers(GET, "/management/v1/role/{role_id}/members/transitive"),
+        ListUserTransitiveRoles(GET, "/management/v1/user/{user_id}/roles/transitive"),
+        ListRoleTransitiveMemberOf(GET, "/management/v1/role/{role_id}/member-of/transitive"),
+        CreateTagDefinition(POST, "/management/v1/tag-definition"),
+        ListTagDefinitions(GET, "/management/v1/tag-definition"),
+        GetTagDefinition(GET, "/management/v1/tag-definition/{tag_definition_id}"),
+        UpdateTagDefinition(POST, "/management/v1/tag-definition/{tag_definition_id}"),
+        DeleteTagDefinition(DELETE, "/management/v1/tag-definition/{tag_definition_id}"),
+        ListTagAttachments(GET, "/management/v1/tag-definition/{tag_definition_id}/attachments"),
+        GetTagActions(GET, "/management/v1/tag-definition/{tag_definition_id}/actions"),
+        SetWarehouseTag(PUT, "/management/v1/warehouse/{warehouse_id}/tags/{tag_name}"),
+        DeleteWarehouseTag(DELETE, "/management/v1/warehouse/{warehouse_id}/tags/{tag_name}"),
+        ListWarehouseTags(GET, "/management/v1/warehouse/{warehouse_id}/tags"),
+        SetNamespaceTag(PUT, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/tags/{tag_name}"),
+        DeleteNamespaceTag(DELETE, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/tags/{tag_name}"),
+        ListNamespaceTags(GET, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/tags"),
+        SetTableTag(PUT, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/tags/{tag_name}"),
+        DeleteTableTag(DELETE, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/tags/{tag_name}"),
+        ListTableTags(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/tags"),
+        SetTableColumnTag(PUT, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/column/{column_name}/tags/{tag_name}"),
+        DeleteTableColumnTag(DELETE, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/column/{column_name}/tags/{tag_name}"),
+        ListTableColumnTags(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/column/{column_name}/tags"),
+        ListColumnTags(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/column-tags"),
+        SetViewTag(PUT, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/tags/{tag_name}"),
+        DeleteViewTag(DELETE, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/tags/{tag_name}"),
+        ListViewTags(GET, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/tags"),
+        SetGenericTableTag(PUT, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/tags/{tag_name}"),
+        DeleteGenericTableTag(DELETE, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/tags/{tag_name}"),
+        ListGenericTableTags(GET, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/tags"),
+        // Two endpoints per resource level, plus the project-wide listing and the
+        // vocabulary. This enum is checked against the generated OpenAPI, so a
+        // declaration without a route fails the build.
+        ListGrants(GET, "/management/v1/grants"),
+        GetGrantablePrivileges(GET, "/management/v1/grants/grantable-privileges"),
+        ListServerGrants(GET, "/management/v1/server/grants"),
+        ApplyServerGrants(POST, "/management/v1/server/grants"),
+        ListProjectGrants(GET, "/management/v1/project/grants"),
+        ApplyProjectGrants(POST, "/management/v1/project/grants"),
+        ListWarehouseGrants(GET, "/management/v1/warehouse/{warehouse_id}/grants"),
+        ApplyWarehouseGrants(POST, "/management/v1/warehouse/{warehouse_id}/grants"),
+        ListNamespaceGrants(GET, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/grants"),
+        ApplyNamespaceGrants(POST, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/grants"),
+        ListTagGrants(GET, "/management/v1/tag-definition/{tag_definition_id}/grants"),
+        ApplyTagGrants(POST, "/management/v1/tag-definition/{tag_definition_id}/grants"),
+        ListTableGrants(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/grants"),
+        ApplyTableGrants(POST, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/grants"),
+        ListViewGrants(GET, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/grants"),
+        ApplyViewGrants(POST, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/grants"),
+        ListGenericTableGrants(GET, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/grants"),
+        ApplyGenericTableGrants(POST, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/grants"),
+        // "Which privileges may I grant here" — one per level, same final segment as the
+        // deployment-wide vocabulary above: the prefix carries the scope.
+        GetServerGrantablePrivileges(GET, "/management/v1/server/grants/grantable-privileges"),
+        GetProjectGrantablePrivileges(GET, "/management/v1/project/grants/grantable-privileges"),
+        GetWarehouseGrantablePrivileges(GET, "/management/v1/warehouse/{warehouse_id}/grants/grantable-privileges"),
+        GetNamespaceGrantablePrivileges(GET, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/grants/grantable-privileges"),
+        GetTableGrantablePrivileges(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/grants/grantable-privileges"),
+        GetViewGrantablePrivileges(GET, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/grants/grantable-privileges"),
+        GetGenericTableGrantablePrivileges(GET, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/grants/grantable-privileges"),
+        GetTagGrantablePrivileges(GET, "/management/v1/tag-definition/{tag_definition_id}/grants/grantable-privileges"),
         CreateWarehouse(POST, "/management/v1/warehouse"),
+        ValidateWarehouse(POST, "/management/v1/warehouse-creation-validation"),
         ListProjects(GET, "/management/v1/project-list"),
         CreateProject(POST, "/management/v1/project"),
-        GetDefaultProject(GET, "/management/v1/project"),
-        GetDefaultProjectById(GET, "/management/v1/project/{project_id}"),
-        DeleteDefaultProject(DELETE, "/management/v1/project"),
-        DeleteProjectById(DELETE, "/management/v1/project/{project_id}"),
-        RenameDefaultProject(POST, "/management/v1/project/rename"),
-        RenameProjectById(POST, "/management/v1/project/{project_id}/rename"),
+        GetProject(GET, "/management/v1/project"),
+        DeleteProject(DELETE, "/management/v1/project"),
+        RenameProject(POST, "/management/v1/project/rename"),
+        GetProjectActions(GET, "/management/v1/project/actions"),
         ListWarehouses(GET, "/management/v1/warehouse"),
         GetWarehouse(GET, "/management/v1/warehouse/{warehouse_id}"),
+        GetWarehouseActions(GET, "/management/v1/warehouse/{warehouse_id}/actions"),
         DeleteWarehouse(DELETE, "/management/v1/warehouse/{warehouse_id}"),
         RenameWarehouse(POST, "/management/v1/warehouse/{warehouse_id}/rename"),
         UpdateWarehouseDeleteProfile(POST, "/management/v1/warehouse/{warehouse_id}/delete-profile"),
+        UpdateWarehouseFormatVersionPolicy(POST, "/management/v1/warehouse/{warehouse_id}/format-version-policy"),
         DeactivateWarehouse(POST, "/management/v1/warehouse/{warehouse_id}/deactivate"),
         ActivateWarehouse(POST, "/management/v1/warehouse/{warehouse_id}/activate"),
         UpdateStorageProfile(POST, "/management/v1/warehouse/{warehouse_id}/storage"),
         UpdateStorageCredential(POST, "/management/v1/warehouse/{warehouse_id}/storage-credential"),
+        ValidateStorageProfile(POST, "/management/v1/warehouse/{warehouse_id}/storage/validate-profile"),
+        ValidateStorageCredential(POST, "/management/v1/warehouse/{warehouse_id}/storage/validate-credential"),
+        ValidateStorageAccess(POST, "/management/v1/warehouse/{warehouse_id}/storage/validate-access"),
         GetWarehouseStatistics(GET, "/management/v1/warehouse/{warehouse_id}/statistics"),
         LoadEndpointStatistics(POST, "/management/v1/endpoint-statistics"),
         SearchTabular(POST, "/management/v1/warehouse/{warehouse_id}/search-tabular"),
         ListDeletedTabulars(GET, "/management/v1/warehouse/{warehouse_id}/deleted-tabulars"),
-        UndropTabularsDeprecated(POST, "/management/v1/warehouse/{warehouse_id}/deleted_tabulars/undrop"),
         UndropTabulars(POST, "/management/v1/warehouse/{warehouse_id}/deleted-tabulars/undrop"),
         GetTableProtection(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/protection"),
         SetTableProtection(POST, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/protection"),
+        GetTableActions(GET, "/management/v1/warehouse/{warehouse_id}/table/{table_id}/actions"),
         GetViewProtection(GET, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/protection"),
         SetViewProtection(POST, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/protection"),
+        GetViewActions(GET, "/management/v1/warehouse/{warehouse_id}/view/{view_id}/actions"),
+        GetGenericTableActions(GET, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/actions"),
+        GetGenericTableProtection(GET, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/protection"),
+        SetGenericTableProtection(POST, "/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/protection"),
         SetNamespaceProtection(POST, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/protection"),
         GetNamespaceProtection(GET, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/protection"),
+        GetNamespaceActions(GET, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/actions"),
+        MoveNamespace(POST, "/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/move"),
         SetWarehouseProtection(POST, "/management/v1/warehouse/{warehouse_id}/protection"),
-        GetDefaultProjectDeprecated(GET, "/management/v1/default-project"),
-        DeleteDefaultProjectDeprecated(DELETE, "/management/v1/default-project"),
-        RenameDefaultProjectDeprecated(POST, "/management/v1/default-project/rename"),
+        SetWarehouseManagedBy(POST, "/management/v1/warehouse/{warehouse_id}/managed-by"),
         SetTaskQueueConfig(POST, "/management/v1/warehouse/{warehouse_id}/task-queue/{queue_name}/config"),
         GetTaskQueueConfig(GET, "/management/v1/warehouse/{warehouse_id}/task-queue/{queue_name}/config"),
+        ScheduleTask(POST, "/management/v1/warehouse/{warehouse_id}/task-queue/{queue_name}/schedule"),
         ListTasks(POST, "/management/v1/warehouse/{warehouse_id}/task/list"),
         GetTaskDetails(GET, "/management/v1/warehouse/{warehouse_id}/task/by-id/{task_id}"),
         ControlTasks(POST, "/management/v1/warehouse/{warehouse_id}/task/control"),
+        SetProjectTaskQueueConfig(POST, "/management/v1/project/task-queue/{queue_name}/config"),
+        GetProjectTaskQueueConfig(GET, "/management/v1/project/task-queue/{queue_name}/config"),
+        ListProjectTasks(POST, "/management/v1/project/task/list"),
+        GetProjectTaskDetails(GET, "/management/v1/project/task/by-id/{task_id}"),
+        ControlProjectTasks(POST, "/management/v1/project/task/control"),
+        BatchCheckActions(POST, "/management/v1/action/batch-check"),
+        // --------- Deprecated endpoints ---------
+        GetDefaultProjectDeprecated(GET, "/management/v1/default-project"),
+        DeleteDefaultProjectDeprecated(DELETE, "/management/v1/default-project"),
+        RenameDefaultProjectDeprecated(POST, "/management/v1/default-project/rename"),
+        RenameProjectByIdDeprecated(POST, "/management/v1/project/{project_id}/rename"),
+        DeleteProjectByIdDeprecated(DELETE, "/management/v1/project/{project_id}"),
+        GetProjectByIdDeprecated(GET, "/management/v1/project/{project_id}"),
+        UndropTabularsDeprecated(POST, "/management/v1/warehouse/{warehouse_id}/deleted_tabulars/undrop"),
     }
 
     enum PermissionV1 {
@@ -240,6 +357,7 @@ generate_endpoints! {
 }
 
 impl ManagementV1Endpoint {
+    #[must_use]
     pub fn path_in_management_v1(self) -> &'static str {
         &self.path()["/management/v1".len()..]
     }
@@ -332,6 +450,9 @@ mod test {
         let variants: Vec<Endpoint> = PermissionV1Endpoint::iter().map(Into::into).collect_vec();
         all_variants.extend(variants);
 
+        let variants: Vec<Endpoint> = GenericTableV1Endpoint::iter().map(Into::into).collect_vec();
+        all_variants.extend(variants);
+
         let endpoint_variants = Endpoint::iter().collect_vec();
 
         // Check no duplicates in all_variants
@@ -364,6 +485,7 @@ mod test {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_endpoint_completeness() {
         use std::collections::HashSet;
 
@@ -373,18 +495,23 @@ mod test {
 
         use crate::api::endpoints::Endpoint;
         let exempt_config_paths = [
-            "management/v1/warehouse/{warehouse_id}/task-queue/tabular_expiration/config",
+            "management/v1/warehouse/{warehouse_id}/task-queue/soft_deletion/config",
             "management/v1/warehouse/{warehouse_id}/task-queue/tabular_purge/config",
+            "management/v1/project/task-queue/task_log_cleanup/config",
         ];
         // Load YAML files
         let management_yaml = include_str!("../../../../docs/docs/api/management-open-api.yaml");
         let catalog_yaml = include_str!("../../../../docs/docs/api/rest-catalog-open-api.yaml");
+        let generic_table_yaml =
+            include_str!("../../../../docs/docs/api/generic-table-open-api.yaml");
 
         // Parse YAML files
         let management: Value =
             serde_norway::from_str(management_yaml).expect("Failed to parse management YAML");
         let catalog: Value =
             serde_norway::from_str(catalog_yaml).expect("Failed to parse catalog YAML");
+        let generic_table: Value =
+            serde_norway::from_str(generic_table_yaml).expect("Failed to parse generic-table YAML");
 
         // Extract endpoints from management YAML
         let mut expected_endpoints = HashSet::new();
@@ -424,13 +551,42 @@ mod test {
             }
         }
 
+        // Process generic-table YAML paths (already prefixed with /lakekeeper/v1)
+        if let Value::Mapping(paths) = &generic_table["paths"] {
+            for (path, methods) in paths {
+                let path_str = path.as_str().expect("Path is not a string");
+                if let Value::Mapping(methods_map) = methods {
+                    for (method, _) in methods_map {
+                        let method_str = method.as_str().expect("Method is not a string");
+                        if method_str != "parameters" {
+                            let normalized_path = path_str.trim_start_matches('/');
+                            expected_endpoints
+                                .insert((method_str.to_uppercase(), normalized_path.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
         // Extract endpoints from Endpoints enum
         let mut actual_endpoints = HashSet::new();
         for endpoint in Endpoint::iter() {
-            // Only catalog and management endpoints are relevant for this test
             if matches!(endpoint, Endpoint::PermissionV1(_))
                 || matches!(endpoint, Endpoint::Sign(_))
             {
+                continue;
+            }
+
+            // Deprecated endpoints
+            if matches!(
+                endpoint,
+                Endpoint::ManagementV1(
+                    ManagementV1Endpoint::DeleteDefaultProjectDeprecated
+                        | ManagementV1Endpoint::GetDefaultProjectDeprecated
+                        | ManagementV1Endpoint::RenameDefaultProjectDeprecated
+                        | ManagementV1Endpoint::UndropTabularsDeprecated
+                )
+            ) {
                 continue;
             }
 
@@ -465,7 +621,9 @@ mod test {
                 .map(|(method, path)| format!("{method} /{path}"))
                 .join("\n");
 
-            panic!("The following endpoints are in the OpenAPI YAML but missing from the Endpoints enum:\n{missing_formatted}");
+            panic!(
+                "The following endpoints are in the OpenAPI YAML but missing from the Endpoints enum:\n{missing_formatted}"
+            );
         }
 
         // Find extra endpoints
@@ -477,7 +635,10 @@ mod test {
                 // registered queues
                 !path.starts_with(
                     "management/v1/warehouse/{warehouse_id}/task-queue/{queue_name}/config",
-                )
+                ) && !path.starts_with("management/v1/project/task-queue/{queue_name}/config")
+                    && !path.starts_with(
+                        "management/v1/warehouse/{warehouse_id}/task-queue/{queue_name}/schedule",
+                    )
             })
             .collect_vec();
         if !extra_endpoints.is_empty() {
@@ -487,7 +648,9 @@ mod test {
                 .map(|(method, path)| format!("{method} /{path}"))
                 .join("\n");
 
-            panic!("The following endpoints are in the Endpoints enum but missing from the OpenAPI YAML:\n{extra_formatted}");
+            panic!(
+                "The following endpoints are in the Endpoints enum but missing from the OpenAPI YAML:\n{extra_formatted}"
+            );
         }
     }
 
@@ -505,7 +668,7 @@ mod test {
     fn test_can_resolve_all_tuples() {
         let paths = Endpoint::iter().map(Endpoint::path).collect_vec();
         let methods = Endpoint::iter().map(Endpoint::method).collect_vec();
-        for (method, path) in methods.iter().zip(paths.into_iter()) {
+        for (method, path) in methods.iter().zip(paths) {
             let endpoint = Endpoint::from_method_and_matched_path(method, path);
             assert_eq!(
                 endpoint.unwrap().as_http_route(),

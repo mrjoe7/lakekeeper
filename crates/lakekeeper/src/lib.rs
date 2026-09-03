@@ -13,33 +13,31 @@
 mod config;
 pub mod server;
 pub mod service;
-pub use config::{AuthZBackend, PgSslMode, SecretBackend, CONFIG, DEFAULT_PROJECT_ID};
+pub use config::{
+    AuthZBackend, CONFIG, DEFAULT_PROJECT_ID, KubernetesSubjectSource, MatchedEngines,
+    SecretBackend, TrinoEngineConfig, TrustedEngine,
+};
 pub use service::{ProjectId, SecretId, WarehouseId};
 
 #[cfg(feature = "router")]
 #[cfg_attr(docsrs, doc(cfg(feature = "router")))]
 pub mod serve;
 
-pub mod implementations;
-pub(crate) mod utils;
+pub mod utils;
 
 pub mod api;
 mod request_metadata;
 
 pub use async_trait;
 pub use axum;
+pub use axum_extra;
 pub use iceberg;
 pub use limes;
-#[cfg(feature = "kafka")]
-#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
-pub use rdkafka;
 pub use request_metadata::{
-    determine_base_uri, determine_forwarded_prefix, X_FORWARDED_HOST_HEADER,
-    X_FORWARDED_PORT_HEADER, X_FORWARDED_PREFIX_HEADER, X_FORWARDED_PROTO_HEADER,
-    X_PROJECT_ID_HEADER_NAME, X_REQUEST_ID_HEADER_NAME,
+    TokenRoles, X_BREAK_GLASS_HEADER_NAME, X_FORWARDED_HOST_HEADER, X_FORWARDED_PORT_HEADER,
+    X_FORWARDED_PREFIX_HEADER, X_FORWARDED_PROTO_HEADER, X_PROJECT_ID_HEADER_NAME,
+    X_REQUEST_ID_HEADER_NAME, determine_base_uri, determine_forwarded_prefix,
 };
-#[cfg(feature = "sqlx")]
-pub use sqlx;
 pub use tokio;
 pub use tokio_util::sync::CancellationToken;
 #[cfg(feature = "router")]
@@ -52,6 +50,25 @@ pub use tower_http;
 #[cfg_attr(docsrs, doc(cfg(feature = "open-api")))]
 pub use utoipa;
 
+/// Exists only while `open-api` is **off**, so an authorizer crate can detect the one
+/// feature combination it cannot otherwise diagnose.
+///
+/// `Authorizer::api_doc` is required only under this crate's `open-api`, while an
+/// authorizer implements it under its *own* `open-api`. Cargo features propagate
+/// downward only, so enabling ours does not enable theirs, and that build fails with
+/// "missing `api_doc`" pointing at an implementation that is plainly present — its help
+/// text even suggests writing the method that already exists. An authorizer crate that
+/// imports this under `cfg(not(feature = "open-api"))` fails instead on the name below,
+/// which says what to do.
+#[cfg(not(feature = "open-api"))]
+#[doc(hidden)]
+pub mod enable_the_open_api_feature_of_your_authorizer_crate_too {
+    /// Name this from an authorizer crate in a type position — a `use` of the module
+    /// would warn as unused in the build where it resolves.
+    #[derive(Debug)]
+    pub struct Marker;
+}
+
 #[cfg(feature = "router")]
 #[cfg_attr(docsrs, doc(cfg(feature = "router")))]
 pub mod metrics;
@@ -60,5 +77,5 @@ pub mod metrics;
 pub mod request_tracing;
 
 pub use tracing;
-#[cfg(any(test, feature = "test-utils"))]
-pub mod tests;
+
+pub type XXHashSet<T> = std::collections::HashSet<T, xxhash_rust::xxh3::Xxh3Builder>;

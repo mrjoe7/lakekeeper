@@ -3,7 +3,7 @@ use iceberg::spec::ViewMetadataRef;
 #[cfg(feature = "axum")]
 use crate::catalog::rest::impl_into_response;
 use crate::{
-    catalog::{rest::ViewUpdate, TableIdent, ViewRequirement},
+    catalog::{TableIdent, ViewRequirement, rest::ViewUpdate},
     spec::{Schema, ViewVersion},
 };
 
@@ -17,7 +17,7 @@ pub struct CreateViewRequest {
     pub schema: Schema,
     #[serde(rename = "view-version")]
     pub view_version: ViewVersion,
-    #[serde(rename = "properties")]
+    #[serde(default, rename = "properties")]
     pub properties: std::collections::HashMap<String, String>,
 }
 

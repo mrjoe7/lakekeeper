@@ -1,10 +1,15 @@
+---
+description: "Contribute to Lakekeeper: development setup, pull request and CI expectations, conventional commits, and the contributor licence agreement."
+---
+
 # Developer Guide
 
-All commits to main go through a PR. CI checks have to pass before merging the PR. Keep in mind that CI checks include lints. Before merge, commits are squashed, but GitHub is taking care of this, so don't worry. PR titles should follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). We encourage small and orthogonal PRs. If you want to work on a bigger feature, please open an issue and discuss it with us first. 
+All commits to main go through a PR. CI checks have to pass before merging the PR. Keep in mind that CI checks include lints. Before merge, commits are squashed, but GitHub is taking care of this, so don't worry. PR titles should follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). We encourage small and orthogonal PRs. If you want to work on a bigger feature, please open an issue and discuss it with us first.
 
 If you want to work on something but don't know what, take a look at our issues tagged with `help wanted`. If you're still unsure, please reach out to us via the [Lakekeeper Discord](https://discord.gg/jkAGG8p93B). If you have questions while working on something, please use the GitHub issue or our Discord. We are happy to guide you!
 
 ## Foundation & CLA
+
 We hate red tape. Currently, all committers need to sign the CLA in GitHub. To ensure the future of Lakekeeper, we want to donate the project to a foundation. We are not sure yet if this is going to be Apache, Linux, a Lakekeeper foundation or something else. Currently, we prefer to spend our time on adding cool new features to Lakekeeper, but we will revisit this topic during 2026.
 
 ## Initial Setup
@@ -21,10 +26,10 @@ echo 'export ICEBERG_REST__PG_DATABASE_URL_READ="postgresql://postgres:postgres@
 echo 'export ICEBERG_REST__PG_DATABASE_URL_WRITE="postgresql://postgres:postgres@localhost/postgres"' >> .env
 source .env
 
-# Migrate db (make sure you have sqlx installed `cargo install sqlx-cli`)
-cd crates/lakekeeper
-sqlx database create && sqlx migrate run
-cd ../..
+# Migrate db (make sure you have sqlx installed `cargo install sqlx-cli`).
+# sqlx-cli auto-loads `.env` from the workspace root, so DATABASE_URL is picked up.
+sqlx database create
+sqlx migrate run --source crates/lakekeeper-storage-postgres/migrations
 
 # Run tests (make sure you have cargo nextest installed, `cargo install cargo-nextest`)
 cargo nextest run --all-features
@@ -35,15 +40,36 @@ just check-clippy
 # You may have to install nightly rust toolchain
 just fix-format
 ```
+
 Keep in mind that some tests are excluded by the `default-filter` in `.config/nextest.toml`. You can find a list of them in the [Testing section](#test-cloud-storage-profiles) below or by searching for modules whose name contains `_integration_tests` within files ending with `.rs`.
 There are a few cargo commands we run on CI. You may install [just](https://crates.io/crates/just) to run them conveniently.
 If you made any changes to SQL queries, please follow [Working with SQLx](#working-with-sqlx) before submitting your PR.
+
+### Required tools for OpenAPI regeneration
+
+The `just update-management-openapi` and `just update-generic-table-openapi` recipes — plus several `add-*-to-rest-openapi` recipes — require **Go yq** ([mikefarah/yq](https://github.com/mikefarah/yq)).
+
+The Python `yq` (kislyuk) shipped via `pip install yq` is **not compatible**: it uses different flags (`-y -i` instead of `-i`) and its YAML emitter formats lists differently, which produces large whitespace-only diffs.
+
+Install Go yq:
+
+```bash
+# macOS
+brew install yq
+
+# Linux (download the static binary)
+curl -L "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
+  -o ~/.local/bin/yq && chmod +x ~/.local/bin/yq
+
+# Verify (must say "mikefarah" in the version output)
+yq --version
+```
 
 ## Code structure
 
 ### What is where?
 
-We have three crates, `lakekeeper`, `lakekeeper-bin` and `iceberg-ext`. The bulk of the code is in `lakekeeper`. The `lakekeeper-bin` crate contains the main entry point for the catalog. The `iceberg-ext` crate contains extensions to `iceberg-rust`. 
+We have three crates, `lakekeeper`, `lakekeeper-bin` and `iceberg-ext`. The bulk of the code is in `lakekeeper`. The `lakekeeper-bin` crate contains the main entry point for the catalog. The `iceberg-ext` crate contains extensions to `iceberg-rust`.
 
 **lakekeeper**
 
@@ -80,19 +106,56 @@ This crate uses sqlx. For development and compilation a Postgres Database is req
 If your database credentials used differ, please modify the `.env` accordingly and run `source .env` again.
 
 Run:
+
 ```sh
 # Migrate db. Make sure you have sqlx-cli install with `cargo install sqlx-cli`
-# Run this locally if you change the db schema via `crates/lakekeeper/migrations`,
+# Run this locally if you change the db schema via `crates/lakekeeper-storage-postgres/migrations`,
 # e.g. after adding a table or dropping a column.
-cd crates/lakekeeper
-sqlx database create && sqlx migrate run
-cd ../..
+sqlx database create
+sqlx migrate run --source crates/lakekeeper-storage-postgres/migrations
 
 # If you changed any of the SQL statements embedded in Rust code, run this before pushing to GitHub.
 just sqlx-prepare
 ```
+
 This will update the sqlx queries in `.sqlx` to enable static checking of the queries without a migrated database. Remember to `git add .sqlx` before committing. If you forget, your PR will fail to build on GitHub.
 Be careful, if the command failed, `.sqlx` will be empty. But do not worry, it wouldn't build on GitHub so there's no way of really breaking things.
+
+### ⚠️ Schema Qualification Warning
+
+**IMPORTANT**: When adding new migrations, do **NOT** schema qualify references to any database objects. Schema qualification will break deployments that place the application in a schema different than the public one.
+
+**❌ Incorrect - Do NOT do this:**
+
+```sql
+-- This will break deployments in non-public schemas
+CREATE TABLE public.my_new_table (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255)
+);
+
+INSERT INTO public.my_new_table (name) VALUES ('example');
+
+ALTER TABLE public.existing_table ADD COLUMN new_column INTEGER;
+```
+
+**✅ Correct - Do this instead:**
+
+```sql
+-- This will work in any schema
+CREATE TABLE my_new_table (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255)
+);
+
+INSERT INTO my_new_table (name) VALUES ('example');
+
+ALTER TABLE existing_table ADD COLUMN new_column INTEGER;
+```
+
+The migration system will automatically apply the migration in the correct schema context, so explicit schema qualification is unnecessary and will cause issues in deployments where Lakekeeper is deployed to a custom schema.
+
+Operators pick that schema with [`LAKEKEEPER__PG_SCHEMA`](configuration.md#using-a-non-public-postgres-schema). Do not export it in a shell you build or test from: `cargo sqlx prepare` ignores it and uses `DATABASE_URL`, and the postgres crate reads `LAKEKEEPER_TEST__` in its own tests but `LAKEKEEPER__` when compiled as a dependency, so it would apply unevenly.
 
 ### Inspecting the db
 
@@ -114,6 +177,109 @@ pg_dump --schema-only "postgresql://postgres:postgres@localhost:5432/postgres" >
 # Copy it out of the container and then inspect it or pass it as context to LLMs
 docker cp postgres-16:/home/lakekeeper_schema.sql .
 ```
+
+### Extension tables (`ext_*` prefix)
+
+Lakekeeper reserves the `ext_*` table-name prefix for downstream extensions
+that need to store their own state in the catalog database. The convention is
+an operational contract between upstream and any extension:
+
+| Rule | What it means |
+|---|---|
+| Reserved prefix | Upstream core migrations **never** create tables matching `ext_*`. Extensions own that namespace. The integration test `test_core_does_not_create_ext_objects` enforces this. |
+| FK direction | Extension tables FK *into* upstream tables. Upstream never FKs into `ext_*`. |
+| CASCADE required | Every FK from an `ext_*` table to an upstream table should be `ON DELETE CASCADE` or `ON DELETE SET NULL`. Enforce in the extension crate's own CI — upstream cannot inspect downstream migration sets. |
+| Scope of allowed objects | `ext_*` may name tables and objects owned by those tables (indexes, sequences). Triggers, functions, indexes, or views attached to upstream-owned objects are not permitted under the prefix — they would survive extension removal and could brick OSS. |
+| Tracker tables | Each registered extension migration source uses its own SQLx tracker, named `ext_<name>_sqlx_migrations`. Core's `_sqlx_migrations` is untouched. |
+
+#### Registering extension migrations
+
+Extensions call upstream's `migrate(pool, extensions)` with their own
+migration source. Every registered source runs **inside the same outer
+transaction** as core migrations — either every migration commits or the
+entire upgrade rolls back. Partial state is impossible.
+
+```rust
+use lakekeeper_storage_postgres::migrations::{ExtensionMigrations, migrate};
+
+// `name` must be 1–40 chars: first [a-z_], remaining [a-z0-9_]; rejected at
+// the start of `migrate()` otherwise. Derives `ext_my_extension_sqlx_migrations`.
+let extensions = vec![ExtensionMigrations::builder()
+    .name("my_extension")
+    .migrator(sqlx::migrate!("./migrations")) // embedded at compile time
+    .build()];
+let server_id = migrate(&pool, extensions).await?;
+```
+
+Optional fields not shown: `.data_hooks(map)` for Rust-side hooks tied to
+specific migration versions, and `.sha_patches(set)` for in-place edits to
+already-shipped migrations.
+
+The `data_hooks` field on `ExtensionMigrations` is a
+`HashMap<i64, Box<dyn MigrationHook>>` keyed by the migration's version id.
+Each entry's `MigrationHook` runs immediately after the matching extension
+migration is applied, inside the same transaction — use it for Rust-side
+data backfills tied to a specific SQL migration. Pass `HashMap::new()`
+when no hooks are needed (the common case in the snippet above).
+
+Callers that don't register extensions use the back-compat shim
+`migrate_core_only(pool)`. Core upstream tooling and tests already do.
+
+#### Recovery: removing an extension's state
+
+Dropping the extension binary and removing its tables restores the database
+to a working OSS-only state. The SQL below scans every relation kind that
+the `ext_*` prefix may name and drops it:
+
+```sql
+-- Run inside the catalog database. Drops every ext_* table and tracker
+-- (CASCADE handles dependent indexes, sequences, and constraints).
+DO $$
+DECLARE r record;
+BEGIN
+    -- Tables (covers extension state + per-source `_sqlx_migrations` trackers).
+    FOR r IN SELECT c.relname
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema()
+               AND c.relkind IN ('r', 'p')
+               AND c.relname LIKE 'ext\_%' ESCAPE '\'
+    LOOP
+        EXECUTE format('DROP TABLE %I CASCADE', r.relname);
+    END LOOP;
+
+    -- Defensive sweeps for object kinds the convention forbids extensions
+    -- from creating on upstream-owned tables, but that may exist if a
+    -- non-conforming extension was deployed.
+    FOR r IN SELECT t.tgname, c.relname AS tbl
+             FROM pg_trigger t
+             JOIN pg_class c ON c.oid = t.tgrelid
+             WHERE NOT t.tgisinternal
+               AND t.tgname LIKE 'ext\_%' ESCAPE '\'
+    LOOP
+        EXECUTE format('DROP TRIGGER %I ON %I', r.tgname, r.tbl);
+    END LOOP;
+
+    FOR r IN SELECT typname FROM pg_type t
+             JOIN pg_namespace n ON n.oid = t.typnamespace
+             WHERE n.nspname = current_schema()
+               AND typname LIKE 'ext\_%' ESCAPE '\'
+    LOOP
+        EXECUTE format('DROP TYPE %I CASCADE', r.typname);
+    END LOOP;
+
+    FOR r IN SELECT p.proname FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = current_schema()
+               AND p.proname LIKE 'ext\_%' ESCAPE '\'
+    LOOP
+        EXECUTE format('DROP FUNCTION %I CASCADE', r.proname);
+    END LOOP;
+END $$;
+```
+
+After running this, the OSS binary boots cleanly against the remaining
+catalog state.
 
 ## KV2 / Vault
 
@@ -153,11 +319,11 @@ export LAKEKEEPER_TEST__AZURE_CLIENT_SECRET=<your entra id app registration clie
 # Auth Method 2: Shared Key
 export LAKEKEEPER_TEST__AZURE_STORAGE_SHARED_KEY=<shared key>
 
-export AWS_S3_BUCKET=<your aws s3 bucket>
-export AWS_S3_REGION=<your aws s3 region>
-export AWS_S3_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-export AWS_S3_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-export AWS_S3_STS_ROLE_ARN=arn:aws:iam::123456789012:role/role-name
+export LAKEKEEPER_TEST__AWS_S3_BUCKET=<your aws s3 bucket>
+export LAKEKEEPER_TEST__AWS_S3_REGION=<your aws s3 region>
+export LAKEKEEPER_TEST__AWS_S3_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export LAKEKEEPER_TEST__AWS_S3_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export LAKEKEEPER_TEST__AWS_S3_STS_ROLE_ARN=arn:aws:iam::123456789012:role/role-name
 
 # the values below should work with the default minio in our docker-compose
 export LAKEKEEPER_TEST__S3_BUCKET=tests
@@ -179,6 +345,14 @@ cargo nextest run --all-features --ignore-default-filter -E "test(::aws_integrat
 # see .config/nextest.toml for all filters
 ```
 
+To check a new S3-compatible store, point the `LAKEKEEPER_TEST__S3_*` variables at it and run the `s3_compat` profile, which selects exactly the tests that use those variables and nothing else:
+
+```sh
+cargo nextest run --profile s3_compat --all-features --all-targets --workspace
+```
+
+This is what the SeaweedFS workflow runs.
+
 ## Running integration test
 
 Our integration tests are written in Python and use pytest. They are located in the `tests` folder. The integration tests spin up Lakekeeper and all the dependencies via `docker compose`. Please check the [Integration Test Docs](https://github.com/lakekeeper/lakekeeper/tree/main/tests) for more information.
@@ -189,7 +363,7 @@ Some authorization unit tests need to be run against an OpenFGA server. They are
 
 ```bash
 # Start an OpenFGA server in a docker container
-docker rm --force openfga-client && docker run -d --name openfga-client -p 36080:8080 -p 36081:8081 -p 36300:3000 openfga/openfga:v1.8 run
+docker rm --force openfga-client && docker run -d --name openfga-client -p 36080:8080 -p 36081:8081 -p 36300:3000 openfga/openfga:v1.14 run
 
 # Set Lakekeeper's OpenFGA endpoint
 export LAKEKEEPER_TEST__OPENFGA__ENDPOINT="http://localhost:36081"
@@ -200,44 +374,25 @@ cargo nextest run --all-features --ignore-default-filter -E "test(::openfga_inte
 
 ## Extending Authz
 
-When adding a new endpoint, you may need to extend the authorization model. Please check the [Authorization Docs](./authorization.md) for more information. For openfga, you'll have to perform the following steps:
+When adding a new endpoint, you may need to extend the authorization model. Please check the [Authorization Docs](./authorization.md) for more information. For OpenFGA, perform the following steps:
 
-1. extend the respective enum in `crate::service::authz` by adding the new action, e.g. `crate::service::authz::CatalogViewAction::CanUndrop`
-1. add the relation to `crate::service::authz::implementations::openfga::relations`, e.g. add `ViewRelation::CanUndrop`
-1. add the mapping from the `implementations` type to the `service` type in `openfga::relations`, e.g. `CatalogViewAction::CanUndrop => ViewRelation::CanUndrop`
-1. create a new authz schema version by renaming the version for backward compatible changes, e.g. `authz/openfga/v2.1/` to `authz/openfga/v2.2/`. For non-backward compatible changes create a new major version folder.
-1. apply your changes, e.g. add `define can_undrop: modify` to the `view` type in `authz/openfga/v2.2/schema.fga`
-1. regenerate `schema.json` via `./fga model transform --file authz/openfga/v2.2/schema.fga > authz/openfga/v2.2/schema.json` (download the `fga` binary from the [OpenFGA repo](https://github.com/openfga/cli/releases/))
-1. Head to `crate::service::authz::implementations::openfga::migration.rs`, modify `ACTIVE_MODEL_VERSION` to the newer version. For backwards compatible changes, change the `add_model` section. For changes that require migrations, add an additional `add_model` section that includes the migration fn.
+1. Add the new action to the relevant enum in `crate::service::authz`, e.g. `CatalogViewAction::CanUndrop`. Actions that must carry request context for policy-based authorizers are parameterized variants — see `CatalogProjectAction::CreateWarehouse`.
+1. In the `lakekeeper-authz-openfga` crate (`crates/authz-openfga/src/relations.rs`), add or reuse a relation on the resource enum (e.g. `RoleRelation::CanUndrop`) and map the action to it in the `ReducedRelation` impl (e.g. `CatalogViewAction::CanUndrop => ViewRelation::CanUndrop`).
+1. Bump the model version by **renaming the latest folder** — e.g. `git mv authz/openfga/v4.7 authz/openfga/v4.8`. Do **not** create a new folder alongside the old one. For a **backward-compatible** change (adding a type, relation, or action; no rewrite of existing tuples) the rename is all you need: existing stores re-migrate to the new model id on startup and their tuples keep authorizing the same actions. This holds **whether or not the previous version was already released** — a released store simply re-migrates to the new id. The **only** exception is a change that rewrites/migrates existing tuples: that one gets a brand-new folder while the old folder is kept for the migration chain (see `v4.0`, which introduced `lakekeeper_table` / `lakekeeper_view` and migrated tuples). Rule of thumb: backward-compatible ⇒ rename the folder; tuple migration ⇒ add a new folder.
+1. Edit the relevant component(s) under `authz/openfga/<version>/components/*.fga` (e.g. add `define can_undrop: modify` to `view.fga`), then regenerate and validate:
 
-```rust
-pub(super) static ACTIVE_MODEL_VERSION: LazyLock<AuthorizationModelVersion> =
-    LazyLock::new(|| AuthorizationModelVersion::new(3, 0)); // <- Change this for every change in the model
+   ```bash
+   just update-openfga   # fga model transform <latest>/fga.mod > <latest>/schema.json
+   just test-openfga     # runs the <latest>/store.fga.yaml assertions
+   ```
 
+   (Requires the `fga` CLI — download from the [OpenFGA repo](https://github.com/openfga/cli/releases/).)
+1. In `crates/authz-openfga/src/migration.rs` bump `ACTIVE_MODEL_VERSION` to the new version. For backward-compatible changes, repoint the current `add_model_*_current` call (schema-path `include_str!` + version). For tuple-migrating changes, add another `add_model` call carrying the migration fn.
+1. Record the change under the new version heading in `authz/openfga/README.md`.
 
-fn get_model_manager(
-    client: &BasicOpenFgaServiceClient,
-    store_name: Option<String>,
-) -> openfga_client::migration::TupleModelManager<BasicAuthLayer> {
-    openfga_client::migration::TupleModelManager::new(
-        client.clone(),
-        &store_name.unwrap_or(AUTH_CONFIG.store_name.clone()),
-        &AUTH_CONFIG.authorization_model_prefix,
-    )
-    .add_model(
-        serde_json::from_str(include_str!(
-            // Change this for backward compatible changes.
-            // For non-backward compatible changes that require tuple migrations, add another `add_model` call.
-            "../../../../../../../authz/openfga/v3.0/schema.json"
-        ))
-        // Change also the model version in this string:
-        .expect("Model v3.0 is a valid AuthorizationModel in JSON format."),
-        AuthorizationModelVersion::new(3, 0),
-        // For major version upgrades, this is where tuple migrations go.
-        None::<MigrationFn<_>>,
-        None::<MigrationFn<_>>,
-    )
-}
+## Building the docs locally
+
+```bash
+cd site
+just serve
 ```
-
-

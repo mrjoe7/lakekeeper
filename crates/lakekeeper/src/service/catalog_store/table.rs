@@ -2,24 +2,24 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use iceberg::{
-    spec::{TableMetadata, TableMetadataRef},
     TableIdent, TableUpdate,
+    spec::{TableMetadata, TableMetadataRef},
 };
-use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
+use iceberg_ext::catalog::rest::ErrorModel;
 use lakekeeper_io::Location;
 
 use crate::{
+    WarehouseId,
     api::iceberg::v1::tables::LoadTableFilters,
     server::tables::TableMetadataDiffs,
     service::{
-        define_simple_error, define_simple_tabular_err, define_transparent_error,
-        impl_error_stack_methods, impl_from_with_detail, CatalogBackendError, CatalogStore,
-        ConversionError, CreateTabularError, InternalBackendErrors, InternalParseLocationError,
+        CatalogBackendError, CatalogStore, ConcurrentUpdateError, ConversionError,
+        CreateTabularError, InternalBackendErrors, InternalParseLocationError,
         InvalidNamespaceIdentifier, LocationAlreadyTaken, NamespaceId, SerializationError, TableId,
         TableInfo, TabularAlreadyExists, TabularNotFound, Transaction, UnexpectedTabularInResponse,
-        WarehouseVersion,
+        WarehouseVersion, define_simple_error, define_simple_tabular_err, define_transparent_error,
+        impl_error_stack_methods, impl_from_with_detail,
     },
-    WarehouseId,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,13 +55,12 @@ define_simple_tabular_err!(
 );
 impl From<RequiredTableComponentMissing> for ErrorModel {
     fn from(err: RequiredTableComponentMissing) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "RequiredTableComponentMissing".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("RequiredTableComponentMissing")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -71,13 +70,12 @@ define_simple_tabular_err!(
 );
 impl From<InternalTableMetadataBuildFailed> for ErrorModel {
     fn from(err: InternalTableMetadataBuildFailed) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "TableMetadataBuildFailed".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("TableMetadataBuildFailed")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -87,26 +85,24 @@ define_simple_tabular_err!(
 );
 impl From<TableMetadataValidationFailedInternal> for ErrorModel {
     fn from(err: TableMetadataValidationFailedInternal) -> Self {
-        ErrorModel {
-            message: err.to_string(),
-            r#type: "TableMetadataValidationFailedInternal".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            source: None,
-            stack: err.stack,
-        }
+        ErrorModel::builder()
+            .message(err.to_string())
+            .r#type("TableMetadataValidationFailedInternal")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .stack(err.stack)
+            .build()
     }
 }
 
 define_simple_error!(TooManyUpdatesInCommit, "Too many updates in single commit");
 impl From<TooManyUpdatesInCommit> for ErrorModel {
     fn from(err: TooManyUpdatesInCommit) -> Self {
-        ErrorModel {
-            code: StatusCode::BAD_REQUEST.as_u16(),
-            r#type: "TooManyUpdatesInCommit".to_string(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .r#type("TooManyUpdatesInCommit")
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -179,7 +175,8 @@ define_transparent_error! {
         InternalParseLocationError,
         ConversionError,
         InvalidNamespaceIdentifier,
-        UnexpectedTabularInResponse
+        UnexpectedTabularInResponse,
+        ConcurrentUpdateError
     ]
 }
 impl From<InternalBackendErrors> for CommitTableTransactionError {

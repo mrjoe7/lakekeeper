@@ -1,42 +1,53 @@
-use std::{str::FromStr as _, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    str::FromStr as _,
+    sync::Arc,
+};
 
+use http::StatusCode;
 use iceberg::spec::{ViewFormatVersion, ViewMetadata, ViewMetadataBuilder};
-use iceberg_ext::catalog::{rest::ViewUpdate, ViewRequirement};
+use iceberg_ext::catalog::{ViewRequirement, rest::ViewUpdate};
 use lakekeeper_io::Location;
 use uuid::Uuid;
 
 use crate::{
-    api::iceberg::v1::{
-        ApiContext, CommitViewRequest, DataAccessMode, ErrorModel, LoadViewResult, Result,
-        ViewParameters,
+    SecretId,
+    api::{
+        endpoints::EndpointFlat,
+        iceberg::v1::{
+            ApiContext, CommitViewRequest, DataAccessMode, ErrorModel, LoadViewResult, Result,
+            ViewParameters, views::LoadViewRequest,
+        },
     },
+    config::MatchedEngines,
     request_metadata::RequestMetadata,
     server::{
         compression_codec::CompressionCodec,
         io::{remove_all, write_file},
         require_warehouse_id,
         tables::{
-            determine_table_ident, extract_count_from_metadata_location,
-            validate_table_or_view_ident, MAX_RETRIES_ON_CONCURRENT_UPDATE,
+            MAX_RETRIES_ON_CONCURRENT_UPDATE, determine_table_ident,
+            extract_count_from_metadata_location, validate_table_or_view_ident,
         },
         views::validate_view_updates,
     },
     service::{
-        authz::{AuthZViewOps, Authorizer, AuthzWarehouseOps, CatalogViewAction},
+        AuthZViewInfo, CONCURRENT_UPDATE_ERROR_TYPE, CatalogIdempotencyOps, CatalogStore,
+        CatalogView, CatalogViewOps, InternalParseLocationError, State, TabularListFlags,
+        Transaction, ViewCommit, ViewId, ViewInfo,
+        authz::{AuthZViewOps, Authorizer, CatalogViewAction},
         contract_verification::ContractVerification,
+        events::{APIEventContext, ViewEventTransition, context::ResolvedView},
+        idempotency::{IdempotencyInfo, IdempotencyKey},
         secrets::SecretStore,
-        storage::{StorageLocations as _, StoragePermissions, StorageProfile},
-        AuthZViewInfo, CatalogStore, CatalogTabularOps, CatalogView, CatalogViewOps,
-        CatalogWarehouseOps, InternalParseLocationError, State, TabularListFlags, Transaction,
-        ViewCommit, ViewId, ViewInfo, CONCURRENT_UPDATE_ERROR_TYPE,
+        storage::{StoragePermissions, StorageProfile},
     },
-    SecretId,
 };
 
 /// Commit updates to a view
 // TODO: break up into smaller fns
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+pub async fn commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
     parameters: ViewParameters,
     request: CommitViewRequest,
     state: ApiContext<State<A, C, S>>,
@@ -47,42 +58,82 @@ pub(crate) async fn commit_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
     // ------------------- VALIDATIONS -------------------
     let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
 
-    let CommitViewRequest {
-        identifier,
-        requirements,
-        updates,
-    } = &request;
-
-    let view_ident = determine_table_ident(&parameters.view, identifier.as_ref())?;
+    let view_ident = determine_table_ident(&parameters.view, request.identifier.as_ref())?;
     validate_table_or_view_ident(&view_ident)?;
-    validate_view_updates(updates)?;
+    validate_view_updates(&request.updates)?;
 
-    // ------------------- AUTHZ -------------------
-    let authorizer = state.v1_state.authz.clone();
-
-    let (warehouse, view_info) = tokio::join!(
-        C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()),
-        C::get_view_info(
+    // ------------------- IDEMPOTENCY CHECK -------------------
+    let idempotency_key = request_metadata.idempotency_key().copied();
+    if let Some(ref key) = idempotency_key {
+        let check = C::check_idempotency_key(
             warehouse_id,
-            view_ident.clone(),
-            TabularListFlags::active(),
+            key,
+            EndpointFlat::CatalogV1ReplaceView,
             state.v1_state.catalog.clone(),
         )
-    );
-    let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-    let view_info = authorizer
-        .require_view_action(
-            &request_metadata,
-            warehouse_id,
-            view_ident,
-            view_info,
-            CatalogViewAction::CanCommit,
-        )
         .await?;
+        if check.is_replay() {
+            return super::load::load_view::<C, A, S>(
+                parameters,
+                LoadViewRequest {
+                    data_access,
+                    referenced_by: None,
+                },
+                state,
+                request_metadata,
+            )
+            .await;
+        }
+    }
+
+    // ------------------- AUTHZ + BUSINESS LOGIC -------------------
+    let authorizer = state.v1_state.authz.clone();
+
+    let (property_updates, property_removals) = parse_view_property_updates(&request.updates);
+
+    // Security: Trusted engine properties (e.g. `trino.run-as-owner`) determine the
+    // DEFINER/INVOKER security model. Only the corresponding trusted engine may set or
+    // remove these properties — otherwise a user could escalate privileges.
+    validate_trusted_engine_property_changes(
+        &property_updates,
+        &property_removals,
+        &request_metadata,
+    )?;
+
+    let action = CatalogViewAction::Commit {
+        updated_properties: Arc::new(property_updates.clone()),
+        removed_properties: Arc::new(property_removals.clone()),
+    };
+
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(request_metadata),
+        state.v1_state.events.clone(),
+        warehouse_id,
+        parameters.view,
+        action.clone(),
+    );
+
+    let authz_result = authorizer
+        .load_and_authorize_view_operation::<C>(
+            event_ctx.request_metadata(),
+            event_ctx.user_provided_entity(),
+            TabularListFlags::active(),
+            event_ctx.action().clone(),
+            state.v1_state.catalog.clone(),
+        )
+        .await;
+
+    let (event_ctx, (warehouse, _namespace, view_info)) = event_ctx.emit_authz(authz_result)?;
+
+    let view_id = view_info.view_id();
+    let event_ctx = event_ctx.resolve(ResolvedView {
+        warehouse: warehouse.clone(),
+        view: Arc::new(view_info),
+    });
 
     // ------------------- BUSINESS LOGIC -------------------
     // Verify assertions
-    check_requirements(requirements.as_ref(), view_info.view_id())?;
+    check_requirements(request.requirements.as_ref(), view_id)?;
 
     let storage_profile = &warehouse.storage_profile;
     let storage_secret_id = warehouse.storage_secret_id;
@@ -93,31 +144,21 @@ pub(crate) async fn commit_view<C: CatalogStore, A: Authorizer + Clone, S: Secre
     loop {
         let result = try_commit_view::<C, A, S>(
             CommitViewContext {
-                view_info: &view_info,
+                view_info: &event_ctx.resolved().view,
                 storage_profile,
                 storage_secret_id,
                 request: request.as_ref(),
                 data_access,
             },
             &state,
-            &request_metadata,
+            event_ctx.request_metadata(),
+            idempotency_key.as_ref(),
         )
         .await;
 
         match result {
             Ok((result, commit)) => {
-                state
-                    .v1_state
-                    .hooks
-                    .commit_view(
-                        warehouse_id,
-                        parameters,
-                        request.clone(),
-                        Arc::new(commit),
-                        data_access,
-                        Arc::new(request_metadata),
-                    )
-                    .await;
+                event_ctx.emit_view_committed_async(Arc::new(commit), data_access, request);
 
                 return Ok(result);
             }
@@ -157,7 +198,9 @@ async fn try_commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
     ctx: CommitViewContext<'_>,
     state: &ApiContext<State<A, C, S>>,
     request_metadata: &RequestMetadata,
-) -> Result<(LoadViewResult, crate::service::endpoint_hooks::ViewCommit)> {
+    idempotency_key: Option<&IdempotencyKey>,
+) -> Result<(LoadViewResult, ViewEventTransition)> {
+    let warehouse_id = ctx.view_info.warehouse_id;
     let mut t = C::Transaction::begin_write(state.v1_state.catalog.clone()).await?;
 
     // These operations need fresh data on each retry
@@ -210,7 +253,6 @@ async fn try_commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
 
     C::commit_view(
         ViewCommit {
-            view_ident: &ctx.view_info.tabular_ident,
             previous_view: &previous_view,
             namespace_id: ctx.view_info.namespace_id,
             warehouse_id: ctx.view_info.warehouse_id,
@@ -226,16 +268,17 @@ async fn try_commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             state
                 .v1_state
                 .secrets
-                .get_secret_by_id(secret_id)
+                .require_storage_secret_by_id(secret_id)
                 .await?
                 .secret,
         )
     } else {
         None
     };
+    let storage_secret_ref = storage_secret.as_deref();
 
     // Write metadata file
-    let file_io = ctx.storage_profile.file_io(storage_secret.as_ref()).await?;
+    let file_io = ctx.storage_profile.file_io(storage_secret_ref).await?;
     write_file(
         &file_io,
         &new_view.metadata_location,
@@ -254,14 +297,44 @@ async fn try_commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         .storage_profile
         .generate_table_config(
             ctx.data_access,
-            storage_secret.as_ref(),
+            storage_secret_ref,
             &new_view.metadata_location,
             StoragePermissions::ReadWriteDelete,
             request_metadata,
-            ctx.view_info.warehouse_id,
-            ctx.view_info.tabular_id.into(),
+            ctx.view_info,
         )
         .await?;
+
+    // Insert idempotency key in the same transaction.
+    if let Some(key) = idempotency_key
+        && !C::try_insert_idempotency_key(
+            warehouse_id,
+            &IdempotencyInfo::builder()
+                .key(*key)
+                .endpoint(EndpointFlat::CatalogV1ReplaceView)
+                .http_status(StatusCode::OK)
+                .build(),
+            t.transaction(),
+        )
+        .await?
+    {
+        t.rollback()
+            .await
+            .inspect_err(|e| {
+                tracing::warn!("Rollback failed after idempotency conflict: {e}");
+            })
+            .ok();
+        // Best-effort cleanup: delete the metadata file we wrote before rollback.
+        let _ = remove_all(&file_io, &new_view.metadata_location)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to clean up metadata file after idempotency rollback"
+                );
+            });
+        return Err(ErrorModel::request_in_progress().into());
+    }
 
     // Commit transaction
     t.commit().await?;
@@ -287,7 +360,7 @@ async fn try_commit_view<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             metadata: new_metadata.clone(),
             config: Some(config.config.into()),
         },
-        crate::service::endpoint_hooks::ViewCommit {
+        ViewEventTransition {
             old_metadata: previous_view.metadata,
             new_metadata,
             old_metadata_location: previous_metadata_location,
@@ -325,6 +398,10 @@ fn build_new_metadata(
     before_location: &Location,
 ) -> Result<(ViewMetadata, Option<DeleteLocation<'_>>)> {
     let previous_location = before_update_metadata.location().to_string();
+    // Snapshot persisted schemas before the builder consumes the metadata, to reject a commit that
+    // recycles a schema id onto different content (defense-in-depth: views have no RemoveSchema
+    // update today, so this cannot currently trip — but the storage store diffs schemas by id).
+    let previous_schemas: Vec<_> = before_update_metadata.schemas_iter().cloned().collect();
 
     let mut m = ViewMetadataBuilder::new_from_metadata(before_update_metadata);
     let mut delete_old_location = None;
@@ -339,7 +416,13 @@ fn build_new_metadata(
                 .into());
             }
             ViewUpdate::SetLocation { location } => {
-                if location != previous_location {
+                // Compared without trailing slashes, because that is the only
+                // difference the builder erases: `set_location` trims before
+                // storing, so `s3://b/v/` and `s3://b/v` become the same location.
+                // Comparing raw, a client that sends the location it already has
+                // with a slash reads as a move to itself -- and `delete_old_location`
+                // then purges the directory this commit just wrote its metadata into.
+                if location.trim_end_matches('/') != previous_location.trim_end_matches('/') {
                     delete_old_location = Some(DeleteLocation(before_location));
                 }
                 m.set_location(location)
@@ -388,206 +471,352 @@ fn build_new_metadata(
             Some(Box::new(e)),
         )
     })?;
+    crate::server::commit_tables::ensure_schema_content_stable(
+        previous_schemas.iter(),
+        requested_update_metadata.metadata.schemas_iter(),
+    )?;
     Ok((requested_update_metadata.metadata, delete_old_location))
 }
 
-#[cfg(test)]
-mod test {
-    use chrono::Utc;
-    use iceberg::TableIdent;
-    use iceberg_ext::catalog::rest::CommitViewRequest;
-    use maplit::hashmap;
-    use serde_json::json;
-    use sqlx::PgPool;
-    use uuid::Uuid;
+pub(crate) fn parse_view_property_updates(
+    updates: &[ViewUpdate],
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut property_updates = BTreeMap::new();
+    let mut property_removals = Vec::new();
 
-    use crate::{
-        api::iceberg::v1::{views, DataAccess, Prefix, ViewParameters},
-        server::views::{create::test::create_view, test::setup},
-        tests::create_view_request,
-        WarehouseId,
-    };
-
-    #[sqlx::test]
-    async fn test_commit_view(pool: PgPool) {
-        let (api_context, namespace, whi) = setup(pool, None).await;
-        let prefix = whi.to_string();
-        let view_name = "myview";
-        let view = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            create_view_request(Some(view_name), None),
-            Some(prefix.clone()),
-        ))
-        .await
-        .unwrap();
-
-        let rq: CommitViewRequest = spark_commit_update_request(whi, Some(view.metadata.uuid()));
-
-        let res = Box::pin(super::commit_view(
-            views::ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(
-                    namespace.inner().into_iter().chain([view_name.into()]),
-                )
-                .unwrap(),
-            },
-            rq,
-            api_context,
-            DataAccess {
-                vended_credentials: true,
-                remote_signing: false,
-            },
-            crate::request_metadata::RequestMetadata::new_unauthenticated(),
-        ))
-        .await
-        .unwrap();
-
-        assert_eq!(res.metadata.current_version_id(), 2);
-        assert_eq!(res.metadata.schemas_iter().len(), 3);
-        assert_eq!(res.metadata.versions().len(), 2);
-        let max_schema = res.metadata.schemas_iter().map(|s| s.schema_id()).max();
-        assert_eq!(
-            res.metadata.current_version().schema_id(),
-            max_schema.unwrap()
-        );
-
-        assert_eq!(
-            res.metadata.properties(),
-            &hashmap! {
-                "create_engine_version".to_string() => "Spark 3.5.1".to_string(),
-                "spark.query-column-names".to_string() => "id".to_string(),
+    for update in updates {
+        match update {
+            ViewUpdate::SetProperties { updates } => {
+                property_updates.extend(updates.clone());
             }
+            ViewUpdate::RemoveProperties { removals } => {
+                property_removals.extend(removals.clone());
+            }
+            _ => {}
+        }
+    }
+
+    (property_updates, property_removals)
+}
+
+/// Checks that none of the given property keys correspond to a trusted engine's
+/// owner property unless the request comes from that engine.
+///
+/// These properties control delegated execution and are a privilege escalation
+/// vector if modifiable by untrusted users.
+fn check_protected_properties<'a>(
+    property_keys: impl Iterator<Item = &'a str>,
+    protected_properties: &HashSet<String>,
+    matched_engines: &MatchedEngines,
+) -> Result<()> {
+    if protected_properties.is_empty() {
+        return Ok(());
+    }
+
+    for key in property_keys {
+        // Case-insensitive match: a key that differs only in casing from a
+        // protected property is still rejected unless the caller is the owning
+        // engine *and* uses the exact configured casing. Engines read these
+        // properties with fixed casing, so a case variant would silently have
+        // no effect on the security model while misleading readers.
+        let matches_protected = protected_properties
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(key));
+
+        if matches_protected && !matched_engines.owns_property(key) {
+            return Err(ErrorModel::builder()
+                .code(StatusCode::FORBIDDEN.as_u16())
+                .r#type("ProtectedPropertyModification")
+                .message(format!(
+                    "Property '{key}' controls the view security model and may only be modified by the corresponding trusted engine using the exact configured property key"
+                ))
+                .build()
+                .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_trusted_engine_property_changes(
+    property_updates: &BTreeMap<String, String>,
+    property_removals: &[String],
+    request_metadata: &RequestMetadata,
+) -> Result<()> {
+    let all_keys = property_updates
+        .keys()
+        .map(String::as_str)
+        .chain(property_removals.iter().map(String::as_str));
+    check_protected_properties(
+        all_keys,
+        &crate::config::CONFIG.protected_properties,
+        request_metadata.engines(),
+    )
+}
+
+pub(super) fn validate_trusted_engine_properties_on_create(
+    properties: &std::collections::HashMap<String, String>,
+    request_metadata: &RequestMetadata,
+) -> Result<()> {
+    check_protected_properties(
+        properties.keys().map(String::as_str),
+        &crate::config::CONFIG.protected_properties,
+        request_metadata.engines(),
+    )
+}
+
+#[cfg(test)]
+mod test_check_protected_properties {
+    use std::collections::{HashMap, HashSet};
+
+    use super::check_protected_properties;
+    use crate::config::{MatchedEngines, TrinoEngineConfig, TrustedEngine};
+
+    fn protected() -> HashSet<String> {
+        ["trino.run-as-owner".to_string()].into_iter().collect()
+    }
+
+    #[test]
+    fn allows_unrelated_property() {
+        let result = check_protected_properties(
+            ["some.other.property"].into_iter(),
+            &protected(),
+            &MatchedEngines::default(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_protected_property_from_non_engine() {
+        let result = check_protected_properties(
+            ["trino.run-as-owner"].into_iter(),
+            &protected(),
+            &MatchedEngines::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_protected_property_from_wrong_engine() {
+        let other_matched = MatchedEngines::single(TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "other.property".to_string(),
+            identities: HashMap::new(),
+        }));
+        let result = check_protected_properties(
+            ["trino.run-as-owner"].into_iter(),
+            &protected(),
+            &other_matched,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allows_protected_property_from_correct_engine() {
+        let trino = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "trino.run-as-owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let result = check_protected_properties(
+            ["trino.run-as-owner"].into_iter(),
+            &protected(),
+            &MatchedEngines::single(trino),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn allows_all_properties_when_no_engines_configured() {
+        let result = check_protected_properties(
+            ["trino.run-as-owner"].into_iter(),
+            &HashSet::new(),
+            &MatchedEngines::default(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_when_one_of_many_properties_is_protected() {
+        let result = check_protected_properties(
+            ["safe.prop", "trino.run-as-owner", "another.safe"].into_iter(),
+            &protected(),
+            &MatchedEngines::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_case_variant_of_protected_property_from_non_engine() {
+        let result = check_protected_properties(
+            ["Trino.Run-As-Owner"].into_iter(),
+            &protected(),
+            &MatchedEngines::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_case_variant_of_protected_property_from_correct_engine() {
+        let trino = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "trino.run-as-owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let result = check_protected_properties(
+            ["TRINO.RUN-AS-OWNER"].into_iter(),
+            &protected(),
+            &MatchedEngines::single(trino),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allows_exact_casing_configured_by_admin() {
+        let protected: HashSet<String> = ["Trino.Run-As-Owner".to_string()].into_iter().collect();
+        let trino = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "Trino.Run-As-Owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let result = check_protected_properties(
+            ["Trino.Run-As-Owner"].into_iter(),
+            &protected,
+            &MatchedEngines::single(trino),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_lowercase_when_admin_configured_mixed_case() {
+        let protected: HashSet<String> = ["Trino.Run-As-Owner".to_string()].into_iter().collect();
+        let trino = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "Trino.Run-As-Owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let result = check_protected_properties(
+            ["trino.run-as-owner"].into_iter(),
+            &protected,
+            &MatchedEngines::single(trino),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allows_property_when_any_matched_engine_owns_it() {
+        let trino_a = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "trino.run-as-owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let trino_b = TrustedEngine::Trino(TrinoEngineConfig {
+            owner_property: "spark.run-as-owner".to_string(),
+            identities: HashMap::new(),
+        });
+        let protected: HashSet<String> = ["trino.run-as-owner", "spark.run-as-owner"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let matched = MatchedEngines::new(vec![trino_a, trino_b]);
+        let result =
+            check_protected_properties(["trino.run-as-owner"].into_iter(), &protected, &matched);
+        assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, str::FromStr as _};
+
+    use iceberg::{
+        NamespaceIdent,
+        spec::{
+            NestedField, PrimitiveType, Schema, SqlViewRepresentation, Type as IcebergType,
+            ViewFormatVersion, ViewMetadata, ViewMetadataBuilder, ViewRepresentation,
+            ViewRepresentations, ViewVersion,
+        },
+    };
+    use iceberg_ext::catalog::rest::{CommitViewRequest, ViewUpdate};
+    use lakekeeper_io::Location;
+
+    use super::build_new_metadata;
+
+    fn view_metadata(location: &str) -> ViewMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", IcebergType::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let representations = ViewRepresentations::builder()
+            .add_representation(ViewRepresentation::Sql(SqlViewRepresentation {
+                sql: "select 1".to_string(),
+                dialect: "ansi".to_string(),
+            }))
+            .build()
+            .unwrap();
+        let version = ViewVersion::builder()
+            .with_schema_id(1)
+            .with_timestamp_ms(0)
+            .with_default_namespace(NamespaceIdent::from_vec(vec!["ns".to_string()]).unwrap())
+            .with_representations(representations)
+            .build();
+
+        ViewMetadataBuilder::new(
+            location.to_string(),
+            schema,
+            version,
+            ViewFormatVersion::V1,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    fn set_location(location: &str) -> CommitViewRequest {
+        CommitViewRequest {
+            identifier: None,
+            requirements: None,
+            updates: vec![ViewUpdate::SetLocation {
+                location: location.to_string(),
+            }],
+        }
+    }
+
+    /// Committing a view's own location back with a trailing slash is not a move,
+    /// so the old location must not be scheduled for deletion.
+    ///
+    /// It is the same directory: `ViewMetadataBuilder::set_location` trims, so the
+    /// new location is byte-identical to the old one. Treating it as a move purges
+    /// the prefix the commit has just written its metadata into, which leaves the
+    /// view unloadable and its data gone.
+    #[test]
+    fn recommitting_the_same_location_with_a_slash_deletes_nothing() {
+        let before = Location::from_str("s3://bucket/view").unwrap();
+        let (metadata, delete_old) = build_new_metadata(
+            set_location("s3://bucket/view/"),
+            view_metadata("s3://bucket/view"),
+            &before,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.location(), "s3://bucket/view");
+        assert!(
+            delete_old.is_none(),
+            "a view's own location was scheduled for deletion"
         );
     }
 
-    #[sqlx::test]
-    async fn test_commit_view_fails_with_wrong_assertion(pool: PgPool) {
-        let (api_context, namespace, whi) = setup(pool, None).await;
-        let prefix = whi.to_string();
-        let view_name = "myview";
-        let _ = Box::pin(create_view(
-            api_context.clone(),
-            namespace.clone(),
-            create_view_request(Some(view_name), None),
-            Some(prefix.clone()),
-        ))
-        .await
+    /// A genuine relocation still schedules the old location for deletion.
+    #[test]
+    fn relocating_a_view_deletes_the_old_location() {
+        let before = Location::from_str("s3://bucket/view").unwrap();
+        let (metadata, delete_old) = build_new_metadata(
+            set_location("s3://bucket/elsewhere"),
+            view_metadata("s3://bucket/view"),
+            &before,
+        )
         .unwrap();
 
-        let rq: CommitViewRequest = spark_commit_update_request(whi, Some(Uuid::now_v7()));
-
-        let err = Box::pin(super::commit_view(
-            ViewParameters {
-                prefix: Some(Prefix(prefix.clone())),
-                view: TableIdent::from_strs(
-                    namespace.inner().into_iter().chain([view_name.into()]),
-                )
-                .unwrap(),
-            },
-            rq,
-            api_context,
-            DataAccess {
-                vended_credentials: true,
-                remote_signing: false,
-            },
-            crate::request_metadata::RequestMetadata::new_unauthenticated(),
-        ))
-        .await
-        .expect_err("This unexpectedly didn't fail the uuid assertion.");
-        assert_eq!(err.error.code, 400);
-        assert_eq!(err.error.r#type, "ViewUuidMismatch");
-    }
-
-    fn spark_commit_update_request(
-        warehouse_id: WarehouseId,
-        asserted_uuid: Option<Uuid>,
-    ) -> CommitViewRequest {
-        let uuid = asserted_uuid.map_or("019059cb-9277-7ff0-b71a-537df05b33f8".into(), |u| {
-            u.to_string()
-        });
-        serde_json::from_value(json!({
-  "requirements": [
-    {
-      "type": "assert-view-uuid",
-      "warehouse-uuid": *warehouse_id,
-      "uuid": &uuid
-    }
-  ],
-  "updates": [
-    {
-      "action": "set-properties",
-      "updates": {
-        "create_engine_version": "Spark 3.5.1",
-        "spark.query-column-names": "id",
-        "engine_version": "Spark 3.5.1"
-      }
-    },
-    {
-      "action": "add-schema",
-      "schema": {
-        "schema-id": 1,
-        "type": "struct",
-        "fields": [
-          {
-            "id": 0,
-            "name": "id",
-            "required": false,
-            "type": "long",
-            "doc": "id of thing"
-          }
-        ]
-      },
-      "last-column-id": 1
-    },
-    {
-      "action": "add-schema",
-      "schema": {
-        "schema-id": 2,
-        "type": "struct",
-        "fields": [
-          {
-            "id": 0,
-            "name": "idx",
-            "required": false,
-            "type": "long",
-            "doc": "idx of thing"
-          }
-        ]
-      },
-      "last-column-id": 1
-    },
-    {
-      "action": "add-view-version",
-      "view-version": {
-        "version-id": 2,
-        "schema-id": -1,
-        "timestamp-ms": Utc::now().timestamp_millis(),
-        "summary": {
-          "engine-name": "spark",
-          "engine-version": "3.5.1",
-          "iceberg-version": "Apache Iceberg 1.5.2 (commit cbb853073e681b4075d7c8707610dceecbee3a82)",
-          "app-id": "local-1719494665567"
-        },
-        "representations": [
-          {
-            "type": "sql",
-            "sql": "select id from spark_demo.my_table",
-            "dialect": "spark"
-          }
-        ],
-        "default-namespace": []
-      }
-    },
-    {
-        "action": "remove-properties",
-        "removals": ["engine_version"]
-    },
-    {
-      "action": "set-current-view-version",
-      "view-version-id": -1
-    }
-  ]
-})).unwrap()
+        assert_eq!(metadata.location(), "s3://bucket/elsewhere");
+        assert!(delete_old.is_some(), "the vacated location was left behind");
     }
 }

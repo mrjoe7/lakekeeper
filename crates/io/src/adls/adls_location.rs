@@ -1,10 +1,11 @@
 use std::str::FromStr as _;
 
+use percent_encoding::percent_decode_str;
 use url::Host;
 
 use crate::{
-    adls::{ADLS_CUSTOM_SCHEMES, DEFAULT_HOST},
     InvalidLocationError, Location,
+    adls::{ADLS_CUSTOM_SCHEMES, DEFAULT_HOST},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +73,7 @@ impl AdlsLocation {
 
         validate_filesystem_name(&filesystem)
             .map_err(|e| InvalidLocationError::new(location_dbg.clone(), e.to_string()))?;
-        validate_account_name(&account_name)
+        validate_adls_host_account(&account_name)
             .map_err(|e| InvalidLocationError::new(location_dbg.clone(), e.to_string()))?;
 
         for path_segment in key {
@@ -80,6 +81,29 @@ impl AdlsLocation {
                 return Err(InvalidLocationError::new(
                     location_dbg.clone(),
                     format!("ADLS path segment `{path_segment}` must not contain slashes."),
+                ));
+            }
+            // Reject segments whose decoded form would create silent
+            // path-divergence bugs. Our `Location` stores the raw URL input,
+            // but `url::Url::parse` (used by the SDK during request-URL
+            // construction) normalises encoded dot-segments and may decode
+            // `%2F`. The result is a Lakekeeper-side path that disagrees with
+            // what Azure actually receives. Reject up-front rather than let
+            // it surface as InvalidUri / silent 403 / wrong-path writes.
+            //   - `%20` (and other whitespace) → Azure rejects InvalidUri
+            //   - `%2E` / `%2E%2E` → `url::Url` strips, path silently shrinks
+            //   - `%2F` (or any encoded slash) → ambiguous nesting
+            let decoded = percent_decode_str(path_segment).decode_utf8_lossy();
+            let invalid = decoded.contains('/')
+                || decoded == "."
+                || decoded == ".."
+                || (!decoded.is_empty() && decoded.trim().is_empty());
+            if invalid {
+                return Err(InvalidLocationError::new(
+                    location_dbg.clone(),
+                    format!(
+                        "ADLS path segment `{path_segment}` decodes to a value that is normalised or rejected by URL/Azure handling."
+                    ),
                 ));
             }
         }
@@ -135,11 +159,18 @@ impl AdlsLocation {
 
     #[must_use]
     pub fn blob_name(&self) -> String {
-        self.location
-            .path()
-            .unwrap_or_default()
-            .to_string()
-            .replace('?', "%3F")
+        // The azure_storage_datalake SDK constructs the wire URL via
+        // `Url::join`, which interprets `%XX` triplets in the blob name as
+        // already percent-encoded — so a stored blob name `%41bc` would go
+        // out on the wire as `%41bc` and the server would URL-decode it to
+        // `Abc`, aliasing two distinct keys. To keep the byte-literal model,
+        // pre-encode `%` (and the other URL-syntactic chars `?`/`#`) here so
+        // the SDK's join produces the right wire bytes for one server-side
+        // decode pass to land on our intended key.
+        use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+        const SDK_ESCAPE: &AsciiSet = &CONTROLS.add(b'%').add(b'?').add(b'#');
+        let path = self.location.path().unwrap_or_default();
+        utf8_percent_encode(path, SDK_ESCAPE).to_string()
     }
 
     /// Create a new `AdlsLocation` from a Location.
@@ -315,19 +346,22 @@ pub fn normalize_host(host: String) -> Result<Option<String>, InvalidADLSHost> {
     }
 }
 
-/// Validates the ADLS account name.
+/// Strict validation for a generic Azure Storage account name, as documented
+/// in <https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata>.
+///
+/// 3-24 chars, lowercase letters and digits only. Use this for the
+/// `account_name` field a user supplies on a `GenericAdlsProfile`.
 ///
 /// # Errors
 /// - If the length is not between 3 and 24 characters.
-/// - If the account name contains uppercase letters or special characters.
-pub fn validate_account_name(account_name: &str) -> Result<(), InvalidADLSAccountName> {
+/// - If the name contains anything other than `[a-z0-9]`.
+pub fn validate_storage_account_name(account_name: &str) -> Result<(), InvalidADLSAccountName> {
     if account_name.len() < 3 || account_name.len() > 24 {
         return Err(InvalidADLSAccountName {
             reason: "Must be between 3 and 24 characters long.".to_string(),
             account: account_name.to_string(),
         });
     }
-
     if !account_name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -337,7 +371,55 @@ pub fn validate_account_name(account_name: &str) -> Result<(), InvalidADLSAccoun
             account: account_name.to_string(),
         });
     }
+    Ok(())
+}
 
+/// Permissive validation for the first DNS label of an ADLS-compatible host
+/// (the `<account>` segment in `abfss://<filesystem>@<account>.<suffix>/...`).
+///
+/// Accepts the union of what supported backends actually use as a first label:
+/// generic Azure Storage accounts (`[a-z0-9]{3,24}`), Fabric / `OneLake` global
+/// (`onelake`), regional (`<region>-onelake`), and workspace-scoped
+/// private-link hosts (32 lowercase-hex workspace IDs). The check is therefore
+/// a generic DNS label (RFC 1035-ish): 1-63 chars, `[a-z0-9-]`, no leading or
+/// trailing hyphen, no consecutive hyphens.
+///
+/// Strict per-backend rules live with the profile types — this is only meant
+/// to be called when parsing a user-supplied URL where the backend variant
+/// isn't yet known.
+///
+/// # Errors
+/// - If the label is empty or longer than 63 characters.
+/// - If it contains anything other than `[a-z0-9-]`.
+/// - If it starts or ends with a hyphen, or contains consecutive hyphens.
+pub fn validate_adls_host_account(account_name: &str) -> Result<(), InvalidADLSAccountName> {
+    if account_name.is_empty() || account_name.len() > 63 {
+        return Err(InvalidADLSAccountName {
+            reason: "Must be between 1 and 63 characters long.".to_string(),
+            account: account_name.to_string(),
+        });
+    }
+    if !account_name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(InvalidADLSAccountName {
+            reason: "Must contain only lowercase letters, digits, and hyphens.".to_string(),
+            account: account_name.to_string(),
+        });
+    }
+    if account_name.starts_with('-') || account_name.ends_with('-') {
+        return Err(InvalidADLSAccountName {
+            reason: "Must not start or end with a hyphen.".to_string(),
+            account: account_name.to_string(),
+        });
+    }
+    if account_name.contains("--") {
+        return Err(InvalidADLSAccountName {
+            reason: "Must not contain consecutive hyphens.".to_string(),
+            account: account_name.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -428,16 +510,90 @@ mod test {
     }
 
     #[test]
-    fn test_validate_account_name() {
-        for name in &["abc", "a1b2c3", "abc123", "123abc"] {
-            assert!(validate_account_name(name).is_ok(), "{}", name);
+    fn test_validate_storage_account_name_accepts_valid() {
+        let max = "a".repeat(24);
+        let cases: &[&str] = &["abc", "a1b2c3", "abc123", "123abc", "onelake", &max];
+        for name in cases {
+            assert!(validate_storage_account_name(name).is_ok(), "{name}");
         }
     }
 
     #[test]
-    fn test_invalid_account_names() {
+    fn test_validate_storage_account_name_rejects_invalid() {
+        let too_long = "a".repeat(25);
+        // Strict path rejects hyphens — the Fabric host shapes
+        // (`centralus-onelake`, 32-hex workspace IDs > 24 chars) are
+        // intentionally NOT valid generic storage account names.
+        let cases: &[&str] = &[
+            "",
+            "ab",
+            &too_long,
+            "Abc",
+            "abc!",
+            "abc-def",
+            "centralus-onelake",
+            "c5e8a1f37b2d4e8a9f1c3b6d8e5a2f47",
+        ];
+        for name in cases {
+            assert!(validate_storage_account_name(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_validate_adls_host_account_accepts_valid() {
+        let max = "a".repeat(63);
+        let cases: &[&str] = &[
+            "abc",
+            "onelake",
+            "centralus-onelake",
+            // Fabric private-link workspace ID (32 lowercase hex chars).
+            "c5e8a1f37b2d4e8a9f1c3b6d8e5a2f47",
+            "westus-onelake",
+            "a",
+            &max,
+        ];
+        for name in cases {
+            assert!(validate_adls_host_account(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_validate_adls_host_account_rejects_invalid() {
+        let too_long = "a".repeat(64);
+        let cases: &[&str] = &[
+            "", &too_long, "-foo", "foo-", "a--b", "Abc", "abc.def", "abc!",
+        ];
+        for name in cases {
+            assert!(validate_adls_host_account(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_try_from_location_onelake_regional() {
+        let loc = Location::from_str(
+            "abfss://c5e8a1f3-7b2d-4e8a-9f1c-3b6d8e5a2f47@centralus-onelake.dfs.fabric.microsoft.com/lh/Files/test/",
+        )
+        .unwrap();
+        let adls = AdlsLocation::try_from_location(&loc, false).unwrap();
+        assert_eq!(adls.account_name(), "centralus-onelake");
+        assert_eq!(adls.endpoint_suffix(), "dfs.fabric.microsoft.com");
+    }
+
+    #[test]
+    fn test_try_from_location_onelake_private_link() {
+        let loc = Location::from_str(
+            "abfss://c5e8a1f3-7b2d-4e8a-9f1c-3b6d8e5a2f47@c5e8a1f37b2d4e8a9f1c3b6d8e5a2f47.zc5.dfs.fabric.microsoft.com/lh/Files/test/",
+        )
+        .unwrap();
+        let adls = AdlsLocation::try_from_location(&loc, false).unwrap();
+        assert_eq!(adls.account_name(), "c5e8a1f37b2d4e8a9f1c3b6d8e5a2f47");
+        assert_eq!(adls.endpoint_suffix(), "zc5.dfs.fabric.microsoft.com");
+    }
+
+    #[test]
+    fn test_strict_storage_account_name_rejects_assorted_invalid_chars() {
         for name in &["Abc", "abc!", "abc.def", "abc_def", "abc/def"] {
-            assert!(validate_account_name(name).is_err(), "{}", name);
+            assert!(validate_storage_account_name(name).is_err(), "{name}");
         }
     }
 
@@ -496,6 +652,10 @@ mod test {
 
     #[test]
     fn test_invalid_adls_location() {
+        // Each input must be rejected SOMEWHERE in the parse chain — either
+        // by `Location::from_str` (e.g. host trailing dot is now globally
+        // rejected for backend-aliasing safety) or by ADLS-specific
+        // validation. The original test asserted only the latter.
         let cases = vec![
             "abfss://filesystem@account_name",
             "abfss://filesystem@account_name.example.com./foo",
@@ -503,10 +663,49 @@ mod test {
             "abfss://account_name.dfs.core.windows/foo",
         ];
 
-        for location in cases {
-            let location = Location::from_str(location).unwrap();
-            let parsed_location = AdlsLocation::try_from_location(&location, false);
-            assert!(parsed_location.is_err(), "{parsed_location:?}");
+        for input in cases {
+            let result = Location::from_str(input).and_then(|loc| {
+                AdlsLocation::try_from_location(&loc, false).map_err(|e| {
+                    crate::location::LocationParseError {
+                        value: input.to_string(),
+                        reason: e.to_string(),
+                    }
+                })
+            });
+            assert!(
+                result.is_err(),
+                "{input:?} unexpectedly accepted: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_problematic_decoded_segments() {
+        for bad in [
+            // whitespace-only — Azure rejects InvalidUri
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%20/bar",
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%09/bar",
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%20%20/bar",
+            // dot-segments — `url::Url` normalises these, path silently shrinks
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%2E/bar",
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%2e%2e/bar",
+            // encoded slash — ambiguous nesting once decoded
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/%2F/bar",
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/x%2Fy/bar",
+        ] {
+            let loc = Location::from_str(bad).unwrap();
+            let res = AdlsLocation::try_from_location(&loc, false);
+            assert!(res.is_err(), "expected reject for `{bad}`");
+        }
+        // Non-empty segments that include but do not decode-to one of the
+        // forbidden values are fine.
+        for ok in [
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/x%20y/bar",
+            "abfss://filesystem@account0name.dfs.core.windows.net/foo/x%2Ey/bar",
+        ] {
+            let loc = Location::from_str(ok).unwrap();
+            AdlsLocation::try_from_location(&loc, false)
+                .unwrap_or_else(|e| panic!("expected accept for `{ok}`: {e}"));
         }
     }
 

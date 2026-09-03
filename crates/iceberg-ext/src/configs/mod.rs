@@ -104,6 +104,16 @@ impl ParseFromStr for bool {
     }
 }
 
+impl ParseFromStr for i64 {
+    fn parse_value(value: &str) -> Result<Self, ParseError> {
+        value.parse::<i64>().map_err(|_| ParseError {
+            value: value.to_string(),
+            typ: "i64".to_string(),
+            reasoning: String::new(),
+        })
+    }
+}
+
 impl ParseFromStr for url::Url {
     fn parse_value(value: &str) -> Result<Self, ParseError> {
         value.parse().map_err(|_| ParseError {
@@ -282,11 +292,11 @@ macro_rules! impl_config_value {
 
         impl NotCustomProp for $struct_name {}
 
-        paste::paste! {
+        pastey::paste! {
             impl [<$prop_type Property>] for $struct_name {}
         }
 
-        paste::paste! {
+        pastey::paste! {
             impl [<$prop_type Properties>] {
                 #[must_use]
                 pub fn [<$accessor:snake>](&self) -> Option<$typ> {

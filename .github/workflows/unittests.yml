@@ -5,16 +5,18 @@ on:
     branches:
       - main
       - "manual-release-*"
+      - "rel-*"
   pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: 1.87
+  RUST_TOOLCHAIN: 1.94.1
+  RUSTFLAGS: --cfg tracing_unstable -D warnings
 
 permissions:
-  contents: read  # Needed to checkout code
-  checks: write   # Needed for test reporting
+  contents: read # Needed to checkout code
+  checks: write # Needed for test reporting
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -30,27 +32,111 @@ jobs:
       - clippy
       - check-generated-openapi-matches
       - test
+      - msrv-check
+      - unused-deps
     steps:
       - run: exit 0
-  sqlx-check:
+
+  msrv-check:
+    name: MSRV check
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: --cfg tracing_unstable --cfg tokio_unstable # drop -D warnings; MSRV builds may emit new warnings
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          python3 -c "
+          import tomllib, pathlib, sys
+          cargo = tomllib.loads(pathlib.Path('Cargo.toml').read_text())
+          v = cargo.get('workspace', {}).get('package', {}).get('rust-version') \
+              or cargo.get('package', {}).get('rust-version')
+          if not v:
+              print('::error::rust-version not found in Cargo.toml')
+              sys.exit(1)
+          print(f'version={v}')
+          " >> "$GITHUB_OUTPUT"
+      - name: Setup Rust ${{ steps.msrv.outputs.version }}
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+        env:
+          RUST_CACHE_KEY_OS: rust-msrv-${{ steps.msrv.outputs.version }}-cache-ubuntu-24.04
+      - name: cargo check
+        run: cargo check --workspace
+        env:
+          SQLX_OFFLINE: "true"
+
+  unused-deps:
+    name: Unused dependencies
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - name: Cargo sqlx-check
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: cargo-machete
+      - name: Check unused dependencies
+        run: cargo machete
+
+  sqlx-check:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install sqlx-cli and migrate database
         run: |
-          export DEBIAN_FRONTEND=noninteractive 
+          export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
           cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
-          cargo sqlx prepare --check --workspace -- --all-features
+          sqlx database create
+          sqlx migrate run --source crates/lakekeeper-storage-postgres/migrations
+      - name: Cargo sqlx-check
+        # Exclude lakekeeper-bin so --all-features doesn't enable `ui` (pulls
+        # the `lakekeeper-console` git dep); it has no sqlx::query! macros.
+        # Must match `just sqlx-prepare` invocation.
+        run: cargo sqlx prepare --check --workspace -- --workspace --exclude lakekeeper-bin --all-features
 
   check-format:
     runs-on: ubuntu-24.04
     steps:
       - run: sudo snap install --edge --classic just
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           components: rustfmt
           toolchain: ${{ env.RUST_TOOLCHAIN }},nightly
@@ -69,10 +155,12 @@ jobs:
       - run: |
           sudo snap install --edge --classic just
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           components: clippy
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -89,9 +177,11 @@ jobs:
     steps:
       - run: |
           sudo snap install --edge --classic just
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           components: clippy
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -99,31 +189,63 @@ jobs:
           RUST_CACHE_KEY_OS: rust-${{ env.RUST_TOOLCHAIN }}-cache-ubuntu-24.04
       - name: Regenerate management openapi
         run: just update-management-openapi
+      - name: Regenerate generic-table openapi
+        run: just update-generic-table-openapi
       - name: Fail on diff
         run: git diff -I ".*version.*" -w --ignore-blank-lines --exit-code Cargo.lock docs/docs/api/
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
-          node-version: 22
+          node-version: 24
       - name: Build TS Client
-        run: npx @hey-api/openapi-ts -i docs/docs/api/management-open-api.yaml -o src/gen/management -c @hey-api/client-fetch
+        # Pin both the generator and typescript: typescript 7.x (native rewrite)
+        # dropped ts.SyntaxKind, which openapi-ts relies on, and the tool's dep
+        # range would otherwise float to it and crash codegen.
+        run: npx -p @hey-api/openapi-ts@0.98.2 -p typescript@5.9.3 openapi-ts -i docs/docs/api/management-open-api.yaml -o src/gen/management -c @hey-api/client-fetch
+      - name: Build TS Client (generic tables)
+        run: npx -p @hey-api/openapi-ts@0.98.2 -p typescript@5.9.3 openapi-ts -i docs/docs/api/generic-table-open-api.yaml -o src/gen/generic-tables -c @hey-api/client-fetch
+      # Smoke-test the generator the downstream SDKs actually use. hey-api above
+      # exercises a different code path and has repeatedly been happy with specs
+      # openapi-generator rejects. This asserts only that generation succeeds —
+      # whether the emitted client behaves correctly is covered by the SDK repos.
+      # Pinned to the version go-lakekeeper generates with.
+      - name: Generate clients with openapi-generator
+        run: |
+          for spec in management-open-api generic-table-open-api; do
+            for lang in go python typescript-fetch; do
+              echo "=== $spec -> $lang"
+              docker run --rm -v "$PWD:/local" \
+                openapitools/openapi-generator-cli:v7.10.0 generate \
+                -i "/local/docs/docs/api/$spec.yaml" -g "$lang" -o "/local/target/openapi-smoke/$spec-$lang" \
+                --global-property=apiDocs=false,apiTests=false,modelDocs=false,modelTests=false
+            done
+          done
 
   test:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: ["15", "18"]
     services:
       vault:
-        image: hashicorp/vault:latest
+        # Recent vault images run as non-root and hard-require IPC_LOCK; the
+        # old SKIP_SETCAP escape hatch is now ignored. Granting the capability
+        # via `options: --cap-add IPC_LOCK` is the supported workaround. Pin
+        # to a specific patch so an image refresh can't break CI again.
+        image: hashicorp/vault:1.21.4
         ports:
           - 8200:8200
         env:
           VAULT_DEV_ROOT_TOKEN_ID: myroot
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
         options: >-
+          --cap-add IPC_LOCK
           --health-cmd "vault status -address http://localhost:8200"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres-version }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -136,10 +258,13 @@ jobs:
         ports:
           - 5432:5432
     env:
+      RUSTFLAGS: --cfg tracing_unstable -D warnings -C debuginfo=0
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       GCS_CREDENTIAL: ${{ secrets.GCS_CREDENTIAL }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Start Minio Docker Container
         run: |
@@ -147,7 +272,7 @@ jobs:
             -e "MINIO_ROOT_USER=minio-root-user" \
             -e "MINIO_ROOT_PASSWORD=minio-root-password" \
             minio/minio:RELEASE.2025-07-23T15-54-02Z server --console-address ":9001" /data
-      
+
       - name: Wait for Minio to be healthy
         shell: bash
         run: |
@@ -168,7 +293,7 @@ jobs:
           docker exec minio /usr/bin/mc alias set local http://localhost:9000 minio-root-user minio-root-password
           docker exec minio /usr/bin/mc mb local/tests
 
-      - uses: azure/login@v2
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         if: ${{ env.AZURE_CLIENT_ID != '' }}
         with:
           creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
@@ -180,12 +305,14 @@ jobs:
         shell: bash
 
       - name: Setup Rust toolchain and cache
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
         env:
           RUST_CACHE_KEY_OS: rust-${{ env.RUST_TOOLCHAIN }}-cache-ubuntu-24.04
 
       - name: Setup cargo nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
         with:
           tool: cargo-nextest
 
@@ -205,9 +332,8 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive 
           sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
           cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
-          cd crates/lakekeeper
           sqlx database create
-          sqlx migrate run
+          sqlx migrate run --source crates/lakekeeper-storage-postgres/migrations
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
@@ -228,10 +354,16 @@ jobs:
           vault write -address "${VAULT_ADDR}" auth/userpass/users/test password=test policies=app
 
       - name: Setup openfga
-        run: docker run -d -p 35081:8081 openfga/openfga:v1.8 run
+        # v1.11+ required: reconcile/rebuild calls write_with_options(idempotent),
+        # which relies on the on_duplicate/on_missing fields added in v1.11.
+        run: docker run -d -p 35081:8081 openfga/openfga:v1.14 run
 
       - name: Test
-        run: cargo nextest run --profile ${{ env.NEXTEST_PROFILE }} --all-targets --all-features --workspace
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
+        with:
+          max_attempts: 2
+          timeout_minutes: 25
+          command: cargo nextest run --profile ${{ env.NEXTEST_PROFILE }} --all-targets --all-features --workspace
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           LAKEKEEPER_TEST__KV2__URL: http://localhost:8200
@@ -249,6 +381,11 @@ jobs:
           LAKEKEEPER_TEST__ENABLE_GCP_SYSTEM_CREDENTIALS: true
 
           LAKEKEEPER_TEST__OPENFGA__ENDPOINT: http://localhost:35081
+          # The lakekeeper-integration-tests OpenFGA e2e harness links authz-openfga
+          # as a NON-test dependency, so it reads the `LAKEKEEPER__` config prefix
+          # (not `LAKEKEEPER_TEST__`, which only applies to authz-openfga's own
+          # cfg(test) builds). Point both at the same store.
+          LAKEKEEPER__OPENFGA__ENDPOINT: http://localhost:35081
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcs.json
 
           LAKEKEEPER_TEST__AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -258,13 +395,13 @@ jobs:
           LAKEKEEPER_TEST__AZURE_STORAGE_FILESYSTEM: ${{ secrets.AZURE_STORAGE_FILESYSTEM }}
           LAKEKEEPER_TEST__AZURE_STORAGE_SHARED_KEY: ${{ secrets.AZURE_STORAGE_SHARED_KEY }}
 
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-          AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
-          AWS_S3_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ACCESS_KEY_ID }}
-          AWS_S3_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_SECRET_ACCESS_KEY }}
-          AWS_S3_STS_ROLE_ARN: ${{ secrets.AWS_S3_STS_ROLE_ARN }}
-          AWS_KMS_S3_BUCKET: ${{ secrets.AWS_KMS_S3_BUCKET }}
-          AWS_S3_KMS_ARN: ${{ secrets.AWS_S3_KMS_ARN }}
+          LAKEKEEPER_TEST__AWS_S3_BUCKET: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_BUCKET }}
+          LAKEKEEPER_TEST__AWS_S3_REGION: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_REGION }}
+          LAKEKEEPER_TEST__AWS_S3_ACCESS_KEY_ID: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_ACCESS_KEY_ID }}
+          LAKEKEEPER_TEST__AWS_S3_SECRET_ACCESS_KEY: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_SECRET_ACCESS_KEY }}
+          LAKEKEEPER_TEST__AWS_S3_STS_ROLE_ARN: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_STS_ROLE_ARN }}
+          LAKEKEEPER_TEST__AWS_KMS_S3_BUCKET: ${{ secrets.LAKEKEEPER_TEST__AWS_KMS_S3_BUCKET }}
+          LAKEKEEPER_TEST__AWS_S3_KMS_ARN: ${{ secrets.LAKEKEEPER_TEST__AWS_S3_KMS_ARN }}
 
           TEST_R2: ${{ secrets.TEST_R2 }}
           LAKEKEEPER_TEST__R2_BUCKET: ${{ secrets.LAKEKEEPER_TEST__R2_BUCKET }}
@@ -274,14 +411,31 @@ jobs:
           LAKEKEEPER_TEST__R2_ACCOUNT_ID: ${{ secrets.LAKEKEEPER_TEST__R2_ACCOUNT_ID }}
           LAKEKEEPER_TEST__R2_ENDPOINT: ${{ secrets.LAKEKEEPER_TEST__R2_ENDPOINT }}
 
+          LAKEKEEPER_TEST__OSS_BUCKET: ${{ secrets.LAKEKEEPER_TEST__OSS_BUCKET }}
+          LAKEKEEPER_TEST__OSS_REGION: ${{ secrets.LAKEKEEPER_TEST__OSS_REGION }}
+          LAKEKEEPER_TEST__OSS_ENDPOINT: ${{ secrets.LAKEKEEPER_TEST__OSS_ENDPOINT }}
+          LAKEKEEPER_TEST__OSS_ACCESS_KEY_ID: ${{ secrets.LAKEKEEPER_TEST__OSS_ACCESS_KEY_ID }}
+          LAKEKEEPER_TEST__OSS_SECRET_ACCESS_KEY: ${{ secrets.LAKEKEEPER_TEST__OSS_SECRET_ACCESS_KEY }}
+          LAKEKEEPER_TEST__OSS_STS_ROLE_ARN: ${{ secrets.LAKEKEEPER_TEST__OSS_STS_ROLE_ARN }}
+
+          # Only the secret key is a credential; the rest are repo variables.
+          # _ENDPOINT is the interim dataplatform grid, the only STACKIT storage
+          # with an STS endpoint until object.storage reaches StorageGRID 12.0.
+          LAKEKEEPER_TEST__STACKIT_BUCKET: ${{ vars.LAKEKEEPER_TEST__STACKIT_BUCKET }}
+          LAKEKEEPER_TEST__STACKIT_REGION: ${{ vars.LAKEKEEPER_TEST__STACKIT_REGION }}
+          LAKEKEEPER_TEST__STACKIT_ENDPOINT: ${{ vars.LAKEKEEPER_TEST__STACKIT_ENDPOINT }}
+          LAKEKEEPER_TEST__STACKIT_ACCESS_KEY_ID: ${{ vars.LAKEKEEPER_TEST__STACKIT_ACCESS_KEY_ID }}
+          LAKEKEEPER_TEST__STACKIT_SECRET_ACCESS_KEY: ${{ secrets.LAKEKEEPER_TEST__STACKIT_SECRET_ACCESS_KEY }}
+          LAKEKEEPER_TEST__STACKIT_CREDENTIALS_GROUP_URN: ${{ vars.LAKEKEEPER_TEST__STACKIT_CREDENTIALS_GROUP_URN }}
+
           LAKEKEEPER_TEST__GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
           LAKEKEEPER_TEST__GCS_HNS_BUCKET: ${{ secrets.GCS_HNS_BUCKET }}
           LAKEKEEPER_TEST__GCS_CREDENTIAL: ${{ secrets.GCS_CREDENTIAL }}
       - name: Upload junit
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: junit
-          path: target/nextest/ci/junit.xml
+          name: junit-pg${{ matrix.postgres-version }}
+          path: target/nextest/${{ env.NEXTEST_PROFILE }}/junit.xml
       - name: Doc Test
         run: cargo test --no-fail-fast --doc --all-features --workspace
         env:

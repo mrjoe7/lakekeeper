@@ -1,11 +1,11 @@
 //! Get `OpenFGA` clients
 
-use lakekeeper::service::ServerId;
+use lakekeeper::{api::management::v1::grant::MAX_GRANTS_PER_REQUEST, service::ServerId};
 use openfga_client::client::{
     BasicOpenFgaClient, BasicOpenFgaServiceClient, ConsistencyPreference,
 };
 
-use super::{OpenFGAAuthorizer, OpenFGAError, OpenFGAResult, AUTH_CONFIG};
+use super::{AUTH_CONFIG, OpenFGAAuthorizer, OpenFGAError, OpenFGAResult};
 use crate::{config::OpenFGAAuth, migration::get_active_auth_model_id};
 
 pub type UnauthenticatedOpenFGAAuthorizer = OpenFGAAuthorizer;
@@ -31,7 +31,9 @@ pub async fn new_client_from_default_config() -> OpenFGAResult<BasicOpenFgaServi
             } else {
                 vec![]
             };
-            tracing::info!("Building OpenFGA Client with Client Credential Authorization. Token Endpoint: {token_endpoint}, Client ID: {client_id}, Scopes: {scopes:?}");
+            tracing::info!(
+                "Building OpenFGA Client with Client Credential Authorization. Token Endpoint: {token_endpoint}, Client ID: {client_id}, Scopes: {scopes:?}"
+            );
             BasicOpenFgaServiceClient::new_with_client_credentials(
                 endpoint,
                 client_id,
@@ -69,6 +71,33 @@ pub async fn new_authorizer_from_default_config(
     .await
 }
 
+/// Create an `OpenFGA` authorizer backed by a freshly-created, migrated store.
+///
+/// Test-only: each call provisions an isolated store (`test_store_<uuid>`) so
+/// parallel integration tests never share assignment tuples. Endpoint/auth come
+/// from the process config (as a non-test dependency that is
+/// `LAKEKEEPER__OPENFGA__ENDPOINT`). Uses `HigherConsistency` so a write is
+/// visible to the immediately-following read — exactly what assertion-driven
+/// tests need.
+///
+/// # Errors
+/// - `OpenFGA` is unreachable, or store creation / migration fails.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn new_authorizer_in_empty_store_from_default_config() -> OpenFGAResult<OpenFGAAuthorizer>
+{
+    let client = new_client_from_default_config().await?;
+    let server_id = ServerId::new_random();
+    let store_name = format!("test_store_{}", uuid::Uuid::now_v7());
+    crate::migration::migrate(&client, Some(store_name.clone()), server_id).await?;
+    new_authorizer(
+        client,
+        Some(store_name),
+        ConsistencyPreference::HigherConsistency,
+        server_id,
+    )
+    .await
+}
+
 /// Create a new `OpenFGA` authorizer with the given client.
 /// This must be run after migration.
 ///
@@ -93,6 +122,21 @@ pub(crate) async fn new_authorizer(
 
     let client = BasicOpenFgaClient::new(service_client, &store.id, &auth_model_id)
         .set_consistency(default_consistency);
+
+    // A grant diff is written as one batch, so the API's cap and this client's batch
+    // limit are a single invariant split across two crates with nothing linking them.
+    // This pins the two Rust constants to each other only: the client value is a
+    // local default, never negotiated with the server, so a server configured with
+    // `OPENFGA_MAX_TUPLES_PER_WRITE` below the cap still fails such writes at
+    // runtime. Documented as a production requirement next to the minimum-version
+    // note in `authorization-openfga.md`.
+    let max_tuples = client.max_tuples_per_write();
+    if usize::try_from(max_tuples).unwrap_or(0) < MAX_GRANTS_PER_REQUEST {
+        return Err(OpenFGAError::GrantBatchLimitTooSmall {
+            required: MAX_GRANTS_PER_REQUEST,
+            max: max_tuples,
+        });
+    }
 
     Ok(OpenFGAAuthorizer::new(client, server_id))
 }

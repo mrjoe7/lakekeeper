@@ -1,28 +1,39 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use futures::future::try_join_all;
 use lakekeeper::{
-    api::{ApiContext, IcebergErrorResponse, RequestMetadata},
+    ProjectId, WarehouseId,
+    api::{ApiContext, IcebergErrorResponse, RequestMetadata, iceberg::v1::PaginationQuery},
     async_trait,
     axum::Router,
     service::{
+        Actor, ArcProjectId, AuthZGenericTableInfo, AuthZNamespaceInfo, AuthZTableInfo,
+        AuthZViewInfo, CatalogStore, ErrorModel, GenericTableId, InternalErrorMessage, NamespaceId,
+        NamespaceWithParent, ResolvedWarehouse, Role, RoleId, SecretStore, ServerId, State,
+        TableId, TagDefinition, TagDefinitionId, UserId, ViewId,
         authz::{
-            AuthorizationBackendUnavailable, Authorizer, CatalogProjectAction, CatalogRoleAction,
-            CatalogServerAction, CatalogUserAction, ListProjectsResponse, NamespaceParent,
+            ActionOnGenericTable, ActionOnTable, ActionOnView, AddRoleAssignmentsError,
+            AuthorizationBackendUnavailable, AuthorizationDecision, Authorizer,
+            AuthzBackendErrorOrBadRequest, CannotInspectPermissions, CatalogProjectAction,
+            CatalogUserAction, GrantAuthorityCheck, GrantTarget, IsAllowedActionError,
+            ListProjectsResponse, ListRoleAssignmentsError, ListRoleAssignmentsResultPage,
+            MalformedRoleAssignment, ManagesGrants, ManagesRoleAssignments, NamespaceParent,
+            PrivilegeDescriptor, ResourceType, RoleAssignmentFilter, RoleAssignmentRow, UserOrRole,
+            UserOrRoleId,
         },
+        events::context::authz_to_error_no_audit,
         health::Health,
-        Actor, AuthZTableInfo, AuthZViewInfo, CatalogStore, ErrorModel, NamespaceHierarchy,
-        NamespaceId, ResolvedWarehouse, RoleId, SecretStore, ServerId, State, TableId, UserId,
-        ViewId,
     },
     tokio::sync::RwLock,
-    ProjectId, WarehouseId,
 };
 use openfga_client::{
     client::{
-        batch_check_single_result::CheckResult, BasicOpenFgaClient, BatchCheckItem,
-        CheckRequestTupleKey, ConsistencyPreference, ReadRequestTupleKey, ReadResponse, Tuple,
-        TupleKey, TupleKeyWithoutCondition,
+        BasicOpenFgaClient, BatchCheckItem, CheckRequestTupleKey, ConsistencyPreference,
+        ReadRequestTupleKey, ReadResponse, Tuple, TupleKey, TupleKeyWithoutCondition, WriteOptions,
+        batch_check_single_result::CheckResult,
     },
     tonic,
 };
@@ -30,6 +41,7 @@ use openfga_client::{
 use utoipa::OpenApi as _;
 
 use crate::{
+    AUTH_CONFIG, FgaType, MAX_TUPLES_PER_WRITE,
     entities::{OpenFgaEntity, ParseOpenFgaEntity},
     error::{
         BatchCheckError, MissingItemInBatchCheck, OpenFGABackendUnavailable, OpenFGAError,
@@ -37,10 +49,10 @@ use crate::{
     },
     models::OpenFgaType,
     relations::{
-        self, NamespaceRelation, OpenFgaRelation, ProjectRelation, RoleRelation, ServerRelation,
-        TableRelation, ViewRelation, WarehouseRelation,
+        self, GenericTableRelation, NamespaceRelation, OpenFgaRelation, ProjectRelation,
+        ReducedRelation, RoleRelation, ServerRelation, TableRelation, TagRelation, ViewRelation,
+        WarehouseRelation,
     },
-    FgaType, AUTH_CONFIG, MAX_TUPLES_PER_WRITE,
 };
 
 type AuthorizerResult<T> = std::result::Result<T, IcebergErrorResponse>;
@@ -65,6 +77,14 @@ impl OpenFGAAuthorizer {
             server_id,
         }
     }
+
+    /// Reference to the underlying OpenFGA store client. Exposed for
+    /// maintenance entry points (e.g. reconcile) that need to issue
+    /// store-level reads/writes alongside the authorizer.
+    #[must_use]
+    pub fn client(&self) -> &BasicOpenFgaClient {
+        &self.client
+    }
 }
 
 /// Implements batch checks for the `are_allowed_x_actions` methods.
@@ -76,6 +96,10 @@ impl Authorizer for OpenFGAAuthorizer {
     type NamespaceAction = NamespaceRelation;
     type TableAction = TableRelation;
     type ViewAction = ViewRelation;
+    type GenericTableAction = GenericTableRelation;
+    type UserAction = CatalogUserAction;
+    type RoleAction = RoleRelation;
+    type TagAction = TagRelation;
 
     fn implementation_name() -> &'static str {
         "openfga"
@@ -94,38 +118,19 @@ impl Authorizer for OpenFGAAuthorizer {
         crate::api::new_v1_router()
     }
 
-    /// Check if the requested actor combination is allowed - especially if the user
-    /// is allowed to assume the specified role.
-    async fn check_actor(&self, actor: &Actor) -> AuthorizerResult<()> {
-        match actor {
-            Actor::Principal(_user_id) => Ok(()),
-            Actor::Anonymous => Ok(()),
-            Actor::Role {
-                principal,
-                assumed_role,
-            } => {
-                let assume_role_allowed = self
-                    .check(CheckRequestTupleKey {
-                        user: Actor::Principal(principal.clone()).to_openfga(),
-                        relation: relations::RoleRelation::CanAssume.to_string(),
-                        object: assumed_role.to_openfga(),
-                    })
-                    .await?;
-
-                if assume_role_allowed {
-                    Ok(())
-                } else {
-                    Err(ErrorModel::forbidden(
-                        format!(
-                            "Principal is not allowed to assume the role with id {assumed_role}"
-                        ),
-                        "RoleAssumptionNotAllowed",
-                        None,
-                    )
-                    .into())
-                }
-            }
-        }
+    async fn check_assume_role_impl(
+        &self,
+        principal: &UserId,
+        assumed_role: &Role,
+        _request_metadata: &RequestMetadata,
+    ) -> Result<bool, AuthzBackendErrorOrBadRequest> {
+        self.check(CheckRequestTupleKey {
+            user: Actor::Principal(principal.clone()).to_openfga(),
+            relation: relations::RoleRelation::CanAssume.to_string(),
+            object: assumed_role.id.to_openfga(),
+        })
+        .await
+        .map_err(Into::into)
     }
 
     async fn can_bootstrap(&self, metadata: &RequestMetadata) -> AuthorizerResult<()> {
@@ -159,7 +164,7 @@ impl Authorizer for OpenFGAAuthorizer {
                     "AnonymousBootstrap",
                     None,
                 )
-                .into())
+                .into());
             }
         };
 
@@ -169,16 +174,24 @@ impl Authorizer for OpenFGAAuthorizer {
             ServerRelation::Admin
         };
 
-        self.write(
-            Some(vec![TupleKey {
-                user: user.to_openfga(),
-                relation: relation.to_string(),
-                object: self.openfga_server().clone(),
-                condition: None,
-            }]),
-            None,
-        )
-        .await?;
+        // Idempotent: a re-bootstrap (after `lakekeeper reopen-bootstrap`)
+        // may run against an OpenFGA store that already holds the same
+        // admin/operator tuple — strict writes would fail in that case.
+        self.client
+            .write_with_options(
+                Some(vec![TupleKey {
+                    user: user.to_openfga(),
+                    relation: relation.to_string(),
+                    object: self.openfga_server().clone(),
+                    condition: None,
+                }]),
+                None,
+                WriteOptions::new_idempotent(),
+            )
+            .await
+            .inspect_err(|e| tracing::error!("Failed to write bootstrap tuple to OpenFGA: {e}"))
+            .map_err(crate::error::OpenFGAError::from)
+            .map_err(authz_to_error_no_audit)?;
 
         Ok(())
     }
@@ -186,252 +199,586 @@ impl Authorizer for OpenFGAAuthorizer {
     async fn list_projects_impl(
         &self,
         metadata: &RequestMetadata,
-    ) -> Result<ListProjectsResponse, AuthorizationBackendUnavailable> {
+    ) -> Result<ListProjectsResponse, AuthzBackendErrorOrBadRequest> {
         let actor = metadata.actor();
         self.list_projects_internal(actor).await.map_err(Into::into)
     }
 
-    async fn can_search_users_impl(&self, metadata: &RequestMetadata) -> AuthorizerResult<bool> {
+    async fn can_search_users_impl(
+        &self,
+        metadata: &RequestMetadata,
+    ) -> Result<bool, AuthzBackendErrorOrBadRequest> {
         // Currently all authenticated principals can search users
         Ok(metadata.actor().is_authenticated())
     }
 
-    async fn is_allowed_role_action_impl(
+    async fn are_allowed_role_actions_impl(
         &self,
         metadata: &RequestMetadata,
-        role_id: RoleId,
-        action: CatalogRoleAction,
-    ) -> AuthorizerResult<bool> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: role_id.to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
+        for_user: Option<&UserOrRole>,
+        roles_with_actions: &[(&Role, Self::RoleAction)],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        // Every authenticated user can read role metadata.
+        // This does not include assignments to the role.
+        // Used for cross-project role get so that we can show role names and not just IDs.
+
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
+
+        // Separate CanRead actions from others to avoid unnecessary batch checks
+        let mut results = Vec::with_capacity(roles_with_actions.len());
+        let mut batch_items = Vec::new();
+        let mut batch_indices = Vec::new();
+        for (idx, (role, action)) in roles_with_actions.iter().enumerate() {
+            if *action == RoleRelation::CanReadMetadata {
+                results.push((idx, true));
+            } else {
+                batch_indices.push(idx);
+                batch_items.push(CheckRequestTupleKey {
+                    user: user.clone(),
+                    relation: action.to_string(),
+                    object: role.id.to_openfga(),
+                });
+            }
+        }
+
+        // Only perform batch check if there are non-CanRead actions
+        if !batch_items.is_empty() {
+            let guard_tuples = if for_user.is_some() {
+                // Collect unique role objects for permission checks
+                let unique_roles: HashSet<_> = roles_with_actions
+                    .iter()
+                    .filter(|(_, action)| *action != RoleRelation::CanReadMetadata)
+                    .map(|(role, _)| role.id.to_openfga())
+                    .collect();
+
+                unique_roles
+                    .into_iter()
+                    .map(|role_obj| CheckRequestTupleKey {
+                        user: metadata.actor().to_openfga(),
+                        relation: RoleRelation::CanReadAssignments.to_string(),
+                        object: role_obj,
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            let batch_results = self
+                .check_actions_with_permission_guard(metadata.actor(), batch_items, guard_tuples)
+                .await?;
+
+            for (batch_idx, result) in batch_results.iter().enumerate() {
+                results.push((batch_indices[batch_idx], result.allowed));
+            }
+        }
+
+        // Sort by original index and extract boolean values
+        results.sort_by_key(|(idx, _)| *idx);
+        Ok(results
+            .into_iter()
+            .map(|(_, allowed)| AuthorizationDecision::from(allowed))
+            .collect())
     }
 
-    async fn is_allowed_user_action_impl(
+    async fn are_allowed_tag_actions_impl(
         &self,
         metadata: &RequestMetadata,
-        user_id: &UserId,
-        action: CatalogUserAction,
-    ) -> AuthorizerResult<bool> {
-        let actor = metadata.actor();
+        for_user: Option<&UserOrRole>,
+        tags_with_actions: &[(&TagDefinition, Self::TagAction)],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
 
-        let is_same_user = match actor {
+        let items: Vec<_> = tags_with_actions
+            .iter()
+            .map(|(tag, action)| CheckRequestTupleKey {
+                user: user.clone(),
+                relation: action.to_string(),
+                object: tag.tag_definition_id.to_openfga(),
+            })
+            .collect();
+
+        let guard_tuples = if for_user.is_some() {
+            // Collect unique tag objects for permission checks
+            let unique_tags: HashSet<_> = tags_with_actions
+                .iter()
+                .map(|(tag, _)| tag.tag_definition_id.to_openfga())
+                .collect();
+
+            unique_tags
+                .into_iter()
+                .map(|tag_obj| CheckRequestTupleKey {
+                    user: metadata.actor().to_openfga(),
+                    relation: TagRelation::CanReadAssignments.to_string(),
+                    object: tag_obj,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
+    }
+
+    async fn are_allowed_user_actions_impl(
+        &self,
+        metadata: &RequestMetadata,
+        for_user: Option<&UserOrRole>,
+        users_with_actions: &[(&UserId, Self::UserAction)],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let actor_principal = match metadata.actor() {
             Actor::Role {
                 principal,
                 assumed_role: _,
             }
-            | Actor::Principal(principal) => principal == user_id,
-            Actor::Anonymous => false,
+            | Actor::Principal(principal) => Some(principal),
+            Actor::Anonymous => None,
         };
 
-        if is_same_user {
-            return match action {
-                CatalogUserAction::CanRead
-                | CatalogUserAction::CanUpdate
-                | CatalogUserAction::CanDelete => Ok(true),
+        let mut results = Vec::with_capacity(users_with_actions.len());
+        let mut batch_indices = Vec::new();
+
+        for (idx, (user_id, action)) in users_with_actions.iter().enumerate() {
+            // 1. The inspected subject can perform all actions on themselves. The
+            //    subject is `for_user` when inspecting another principal's access,
+            //    or the actor otherwise.
+            // 2. Every authenticated user can read user metadata given the user id
+            let is_same_user = match for_user {
+                None => actor_principal == Some(*user_id),
+                Some(UserOrRole::User(subject)) => subject == *user_id,
+                Some(UserOrRole::Role(_)) => false,
             };
-        }
-
-        let server_id = self.openfga_server().clone();
-        match action {
-            // Currently, given a user-id, all information about a user can be retrieved.
-            // For multi-tenant setups, we need to restrict this to a tenant.
-            CatalogUserAction::CanRead => Ok(true),
-            CatalogUserAction::CanUpdate => {
-                self.check(CheckRequestTupleKey {
-                    user: actor.to_openfga(),
-                    relation: CatalogServerAction::CanUpdateUsers.to_string(),
-                    object: server_id.clone(),
-                })
-                .await
-            }
-            CatalogUserAction::CanDelete => {
-                self.check(CheckRequestTupleKey {
-                    user: actor.to_openfga(),
-                    relation: CatalogServerAction::CanDeleteUsers.to_string(),
-                    object: server_id,
-                })
-                .await
+            if is_same_user || *action == CatalogUserAction::Read {
+                results.push((idx, true));
+            } else {
+                batch_indices.push((idx, *action));
             }
         }
-        .map_err(Into::into)
+
+        if !batch_indices.is_empty() {
+            let server_id = self.openfga_server().clone();
+            let actor_openfga = metadata.actor().to_openfga();
+            let user = for_user.map_or_else(
+                || actor_openfga.clone(),
+                |u| u.api_user_or_role().to_openfga(),
+            );
+
+            let batch_results = self
+                .batch_check(vec![
+                    CheckRequestTupleKey {
+                        user: actor_openfga.clone(),
+                        relation: ServerRelation::CanListUsers.to_string(),
+                        object: server_id.clone(),
+                    },
+                    CheckRequestTupleKey {
+                        user: user.clone(),
+                        relation: ServerRelation::CanUpdateUsers.to_string(),
+                        object: server_id.clone(),
+                    },
+                    CheckRequestTupleKey {
+                        user: user.clone(),
+                        relation: ServerRelation::CanDeleteUsers.to_string(),
+                        object: server_id.clone(),
+                    },
+                    // The inspected subject's own `CanListUsers` — distinct from
+                    // the actor's (`batch_results[0]`). `ReadRoleAssignments`
+                    // reflects whether *the subject* may know about users, not the
+                    // caller. When `for_user` is None, `user` is the actor, so this
+                    // coincides with `batch_results[0]`.
+                    CheckRequestTupleKey {
+                        user,
+                        relation: ServerRelation::CanListUsers.to_string(),
+                        object: server_id.clone(),
+                    },
+                ])
+                .await?;
+
+            // `batch_results[0]` is the *actor's* permission to know about users —
+            // it gates whether the caller may inspect another principal's access.
+            let actor_can_inspect = batch_results[0];
+            let can_update = batch_results[1];
+            let can_delete = batch_results[2];
+            let subject_can_list_users = batch_results[3];
+
+            if for_user.is_some() && !actor_can_inspect {
+                return Err(CannotInspectPermissions::new(&server_id).into());
+            }
+
+            for (idx, action) in batch_indices {
+                let allowed = match action {
+                    CatalogUserAction::Read => true,
+                    CatalogUserAction::Update => can_update,
+                    CatalogUserAction::Delete => can_delete,
+                    // List the roles assigned to this user: gated on whether the
+                    // inspected subject may know about users (`CanListUsers`). A
+                    // subject reading their own assignments is already
+                    // short-circuited above via `is_same_user`.
+                    CatalogUserAction::ReadRoleAssignments => subject_can_list_users,
+                };
+                results.push((idx, allowed));
+            }
+        }
+
+        results.sort_by_key(|(idx, _)| *idx);
+        Ok(results
+            .into_iter()
+            .map(|(_, allowed)| AuthorizationDecision::from(allowed))
+            .collect())
     }
 
-    async fn is_allowed_server_action_impl(
+    async fn are_allowed_server_actions_impl(
         &self,
         metadata: &RequestMetadata,
-        action: Self::ServerAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: self.openfga_server().clone(),
-        })
-        .await
-        .map_err(Into::into)
-    }
+        for_user: Option<&UserOrRole>,
+        actions: &[Self::ServerAction],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
+        let object = self.openfga_server().clone();
 
-    async fn is_allowed_project_action_impl(
-        &self,
-        metadata: &RequestMetadata,
-        project_id: &ProjectId,
-        action: Self::ProjectAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: project_id.to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
+        let items: Vec<_> = actions
+            .iter()
+            .map(|a| CheckRequestTupleKey {
+                user: user.clone(),
+                relation: a.to_string(),
+                object: object.clone(),
+            })
+            .collect();
+
+        let guard_tuples = if for_user.is_some() {
+            vec![CheckRequestTupleKey {
+                user: metadata.actor().to_openfga(),
+                relation: ServerRelation::CanReadAssignments.to_string(),
+                object: object.clone(),
+            }]
+        } else {
+            vec![]
+        };
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
     }
 
     async fn are_allowed_project_actions_impl(
         &self,
         metadata: &RequestMetadata,
-        projects_with_actions: &[(&ProjectId, Self::ProjectAction)],
-    ) -> std::result::Result<Vec<bool>, AuthorizationBackendUnavailable> {
+        for_user: Option<&UserOrRole>,
+        projects_with_actions: &[(&ArcProjectId, Self::ProjectAction)],
+    ) -> std::result::Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
+
         let items: Vec<_> = projects_with_actions
             .iter()
             .map(|(project, a)| CheckRequestTupleKey {
-                user: metadata.actor().to_openfga(),
+                user: user.clone(),
                 relation: a.to_string(),
                 object: project.to_openfga(),
             })
             .collect();
-        self.batch_check(items).await.map_err(Into::into)
-    }
 
-    async fn is_allowed_warehouse_action_impl(
-        &self,
-        metadata: &RequestMetadata,
-        warehouse: &ResolvedWarehouse,
-        action: Self::WarehouseAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: warehouse.warehouse_id.to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
+        let guard_tuples = if for_user.is_some() {
+            // Collect unique project objects for permission checks
+            let unique_projects: HashSet<_> = projects_with_actions
+                .iter()
+                .map(|(project, _)| project.to_openfga())
+                .collect();
+
+            unique_projects
+                .into_iter()
+                .map(|project_obj| CheckRequestTupleKey {
+                    user: metadata.actor().to_openfga(),
+                    relation: ProjectRelation::CanReadAssignments.to_string(),
+                    object: project_obj,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
     }
 
     async fn are_allowed_warehouse_actions_impl(
         &self,
         metadata: &RequestMetadata,
+        for_user: Option<&UserOrRole>,
         warehouses_with_actions: &[(&ResolvedWarehouse, Self::WarehouseAction)],
-    ) -> std::result::Result<Vec<bool>, AuthorizationBackendUnavailable> {
+    ) -> std::result::Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
+
         let items: Vec<_> = warehouses_with_actions
             .iter()
             .map(|(wh, a)| CheckRequestTupleKey {
-                user: metadata.actor().to_openfga(),
+                user: user.clone(),
                 relation: a.to_string(),
                 object: wh.warehouse_id.to_openfga(),
             })
             .collect();
-        self.batch_check(items).await.map_err(Into::into)
-    }
 
-    async fn is_allowed_namespace_action_impl(
-        &self,
-        metadata: &RequestMetadata,
-        _warehouse: &ResolvedWarehouse,
-        namespace: &NamespaceHierarchy,
-        action: Self::NamespaceAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: namespace.namespace_id().to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
+        let guard_tuples = if for_user.is_some() {
+            // Collect unique warehouse objects for permission checks
+            let unique_warehouses: HashSet<_> = warehouses_with_actions
+                .iter()
+                .map(|(wh, _)| wh.warehouse_id.to_openfga())
+                .collect();
+
+            unique_warehouses
+                .into_iter()
+                .map(|warehouse_obj| CheckRequestTupleKey {
+                    user: metadata.actor().to_openfga(),
+                    relation: WarehouseRelation::CanReadAssignments.to_string(),
+                    object: warehouse_obj,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
     }
 
     async fn are_allowed_namespace_actions_impl(
         &self,
         metadata: &RequestMetadata,
+        for_user: Option<&UserOrRole>,
         _warehouse: &ResolvedWarehouse,
-        actions: &[(&NamespaceHierarchy, Self::NamespaceAction)],
-    ) -> Result<Vec<bool>, AuthorizationBackendUnavailable> {
+        _parent_namespaces: &HashMap<NamespaceId, NamespaceWithParent>,
+        actions: &[(&impl AuthZNamespaceInfo, Self::NamespaceAction)],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let user = for_user.map_or_else(
+            || metadata.actor().to_openfga(),
+            |u| u.api_user_or_role().to_openfga(),
+        );
+
         let items: Vec<_> = actions
             .iter()
             .map(|(namespace, a)| CheckRequestTupleKey {
-                user: metadata.actor().to_openfga(),
+                user: user.clone(),
                 relation: a.to_string(),
                 object: namespace.namespace_id().to_openfga(),
             })
             .collect();
-        self.batch_check(items).await.map_err(Into::into)
+
+        let guard_tuples = if for_user.is_some() {
+            // Collect unique namespace objects for permission checks
+            let unique_namespaces: HashSet<_> = actions
+                .iter()
+                .map(|(namespace, _)| namespace.namespace_id().to_openfga())
+                .collect();
+
+            unique_namespaces
+                .into_iter()
+                .map(|namespace_obj| CheckRequestTupleKey {
+                    user: metadata.actor().to_openfga(),
+                    relation: NamespaceRelation::CanReadAssignments.to_string(),
+                    object: namespace_obj,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
     }
 
-    async fn is_allowed_table_action_impl(
+    async fn are_allowed_table_actions_impl<A: Into<Self::TableAction> + Send + Clone + Sync>(
         &self,
         metadata: &RequestMetadata,
-        table: &impl AuthZTableInfo,
-        action: Self::TableAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        let warehouse_id = table.warehouse_id();
-        let table_id = table.table_id();
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: (warehouse_id, table_id).to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
-    }
-
-    async fn are_allowed_table_actions_impl(
-        &self,
-        metadata: &RequestMetadata,
-        tables_with_actions: &[(&impl AuthZTableInfo, Self::TableAction)],
-    ) -> Result<Vec<bool>, AuthorizationBackendUnavailable> {
-        let items: Vec<_> = tables_with_actions
+        _warehouse: &ResolvedWarehouse,
+        _parent_namespaces: &HashMap<NamespaceId, NamespaceWithParent>,
+        actions: &[(
+            &NamespaceWithParent,
+            ActionOnTable<'_, '_, impl AuthZTableInfo, A>,
+        )],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        // Build check requests with per-action user handling
+        let items: Vec<_> = actions
             .iter()
-            .map(|(table, a)| CheckRequestTupleKey {
-                user: metadata.actor().to_openfga(),
-                relation: a.to_string(),
-                object: (table.warehouse_id(), table.table_id()).to_openfga(),
+            .map(|(_, action)| {
+                let user = action
+                    .user
+                    .map_or_else(|| metadata.actor().to_openfga(), OpenFgaEntity::to_openfga);
+                CheckRequestTupleKey {
+                    user,
+                    relation: action.action.clone().into().to_string(),
+                    object: (action.info.warehouse_id(), action.info.table_id()).to_openfga(),
+                }
             })
             .collect();
-        self.batch_check(items).await.map_err(Into::into)
-    }
 
-    async fn is_allowed_view_action_impl(
-        &self,
-        metadata: &RequestMetadata,
-        view: &impl AuthZViewInfo,
-        action: Self::ViewAction,
-    ) -> Result<bool, AuthorizationBackendUnavailable> {
-        self.check(CheckRequestTupleKey {
-            user: metadata.actor().to_openfga(),
-            relation: action.to_string(),
-            object: (view.warehouse_id(), view.view_id()).to_openfga(),
-        })
-        .await
-        .map_err(Into::into)
-    }
-
-    async fn are_allowed_view_actions_impl(
-        &self,
-        metadata: &RequestMetadata,
-        views_with_actions: &[(&impl AuthZViewInfo, Self::ViewAction)],
-    ) -> Result<Vec<bool>, AuthorizationBackendUnavailable> {
-        let items: Vec<_> = views_with_actions
+        // Collect guard tuples for actions with explicit for_user, but skip for delegated execution
+        // Delegated execution (e.g., DEFINER views) uses the specified user's permissions directly
+        // without requiring permission inspection rights.
+        let mut guard_tuples = Vec::new();
+        let unique_tables_needing_guards: HashSet<_> = actions
             .iter()
-            .map(|(view, a)| CheckRequestTupleKey {
+            .filter(|(_, action)| action.user.is_some() && !action.is_delegated_execution)
+            .map(|(_, action)| (action.info.warehouse_id(), action.info.table_id()).to_openfga())
+            .collect();
+
+        guard_tuples.extend(unique_tables_needing_guards.into_iter().map(|table_obj| {
+            CheckRequestTupleKey {
                 user: metadata.actor().to_openfga(),
-                relation: a.to_string(),
-                object: (view.warehouse_id(), view.view_id()).to_openfga(),
+                relation: TableRelation::CanReadAssignments.to_string(),
+                object: table_obj,
+            }
+        }));
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
+    }
+
+    async fn are_allowed_view_actions_impl<A: Into<Self::ViewAction> + Send + Clone + Sync>(
+        &self,
+        metadata: &RequestMetadata,
+        _warehouse: &ResolvedWarehouse,
+        _parent_namespaces: &HashMap<NamespaceId, NamespaceWithParent>,
+        actions: &[(
+            &NamespaceWithParent,
+            ActionOnView<'_, '_, impl AuthZViewInfo, A>,
+        )],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        // Build check requests with per-action user handling
+        let items: Vec<_> = actions
+            .iter()
+            .map(|(_, action)| {
+                let user = action
+                    .user
+                    .map_or_else(|| metadata.actor().to_openfga(), OpenFgaEntity::to_openfga);
+                CheckRequestTupleKey {
+                    user,
+                    relation: action.action.clone().into().to_string(),
+                    object: (action.info.warehouse_id(), action.info.view_id()).to_openfga(),
+                }
             })
             .collect();
-        self.batch_check(items).await.map_err(Into::into)
+
+        // Collect guard tuples for actions with explicit for_user, but skip for delegated execution
+        // Delegated execution (e.g., DEFINER views) uses the specified user's permissions directly
+        // without requiring permission inspection rights.
+        let mut guard_tuples = Vec::new();
+        let unique_views_needing_guards: HashSet<_> = actions
+            .iter()
+            .filter(|(_, action)| action.user.is_some() && !action.is_delegated_execution)
+            .map(|(_, action)| (action.info.warehouse_id(), action.info.view_id()).to_openfga())
+            .collect();
+
+        guard_tuples.extend(unique_views_needing_guards.into_iter().map(|view_obj| {
+            CheckRequestTupleKey {
+                user: metadata.actor().to_openfga(),
+                relation: ViewRelation::CanReadAssignments.to_string(),
+                object: view_obj,
+            }
+        }));
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
+    }
+
+    async fn are_allowed_generic_table_actions_impl<
+        A: Into<Self::GenericTableAction> + Send + Clone + Sync,
+    >(
+        &self,
+        metadata: &RequestMetadata,
+        _warehouse: &ResolvedWarehouse,
+        _parent_namespaces: &HashMap<NamespaceId, NamespaceWithParent>,
+        actions: &[(
+            &NamespaceWithParent,
+            ActionOnGenericTable<'_, '_, impl AuthZGenericTableInfo, A>,
+        )],
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        // Build check requests with per-action user handling
+        let items: Vec<_> = actions
+            .iter()
+            .map(|(_, action)| {
+                let user = action
+                    .user
+                    .map_or_else(|| metadata.actor().to_openfga(), OpenFgaEntity::to_openfga);
+                CheckRequestTupleKey {
+                    user,
+                    relation: action.action.clone().into().to_string(),
+                    object: (action.info.warehouse_id(), action.info.generic_table_id())
+                        .to_openfga(),
+                }
+            })
+            .collect();
+
+        // Collect guard tuples for actions with explicit for_user, but skip for delegated execution.
+        let mut guard_tuples = Vec::new();
+        let unique_gts_needing_guards: HashSet<_> = actions
+            .iter()
+            .filter(|(_, action)| action.user.is_some() && !action.is_delegated_execution)
+            .map(|(_, action)| {
+                (action.info.warehouse_id(), action.info.generic_table_id()).to_openfga()
+            })
+            .collect();
+
+        guard_tuples.extend(unique_gts_needing_guards.into_iter().map(|gt_obj| {
+            CheckRequestTupleKey {
+                user: metadata.actor().to_openfga(),
+                relation: GenericTableRelation::CanReadAssignments.to_string(),
+                object: gt_obj,
+            }
+        }));
+
+        self.check_actions_with_permission_guard(metadata.actor(), items, guard_tuples)
+            .await
+    }
+
+    async fn create_generic_table(
+        &self,
+        metadata: &RequestMetadata,
+        warehouse_id: WarehouseId,
+        generic_table_id: GenericTableId,
+        parent: NamespaceId,
+    ) -> AuthorizerResult<()> {
+        let actor = metadata.actor();
+
+        // Higher consistency as for stage create overwrites old relations are deleted
+        // immediately before
+        self.require_no_relations(&(warehouse_id, generic_table_id))
+            .await?;
+
+        let mut tuples = crate::tuples::hierarchy_tuples_for_generic_table(
+            warehouse_id,
+            generic_table_id,
+            parent,
+        );
+        tuples.extend(crate::tuples::ownership_tuples_for_generic_table(
+            actor,
+            warehouse_id,
+            generic_table_id,
+        ));
+        self.write_higher_consistency(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
+    }
+
+    async fn delete_generic_table(
+        &self,
+        warehouse_id: WarehouseId,
+        generic_table_id: GenericTableId,
+    ) -> AuthorizerResult<()> {
+        self.delete_all_relations(&(warehouse_id, generic_table_id))
+            .await
     }
 
     async fn delete_user(
@@ -446,32 +793,17 @@ impl Authorizer for OpenFGAAuthorizer {
         &self,
         metadata: &RequestMetadata,
         role_id: RoleId,
-        parent_project_id: ProjectId,
+        parent_project_id: ArcProjectId,
     ) -> AuthorizerResult<()> {
         let actor = metadata.actor();
 
         self.require_no_relations(&role_id).await?;
-        let parent_id = parent_project_id.to_openfga();
-        let this_id = role_id.to_openfga();
-        self.write(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: RoleRelation::Ownership.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: parent_id.clone(),
-                    relation: RoleRelation::Project.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let mut tuples = crate::tuples::hierarchy_tuples_for_role(&parent_project_id, role_id);
+        tuples.extend(crate::tuples::ownership_tuples_for_role(actor, role_id));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_role(
@@ -482,6 +814,35 @@ impl Authorizer for OpenFGAAuthorizer {
         self.delete_all_relations(&role_id).await
     }
 
+    async fn create_tag(
+        &self,
+        metadata: &RequestMetadata,
+        tag_definition_id: TagDefinitionId,
+        parent_project_id: ArcProjectId,
+    ) -> AuthorizerResult<()> {
+        let actor = metadata.actor();
+
+        self.require_no_relations(&tag_definition_id).await?;
+        let mut tuples =
+            crate::tuples::hierarchy_tuples_for_tag(&parent_project_id, tag_definition_id);
+        tuples.extend(crate::tuples::ownership_tuples_for_tag(
+            actor,
+            tag_definition_id,
+        ));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
+    }
+
+    async fn delete_tag(
+        &self,
+        _metadata: &RequestMetadata,
+        tag_definition_id: TagDefinitionId,
+    ) -> AuthorizerResult<()> {
+        self.delete_all_relations(&tag_definition_id).await
+    }
+
     async fn create_project(
         &self,
         metadata: &RequestMetadata,
@@ -490,41 +851,23 @@ impl Authorizer for OpenFGAAuthorizer {
         let actor = metadata.actor();
 
         self.require_no_relations(project_id).await?;
-        let server = self.openfga_server().clone();
-        let this_id = project_id.to_openfga();
-        self.write(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: ProjectRelation::ProjectAdmin.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: server.clone(),
-                    relation: ProjectRelation::Server.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: this_id,
-                    relation: ServerRelation::Project.to_string(),
-                    object: server,
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let server = self.openfga_server();
+        let mut tuples = crate::tuples::hierarchy_tuples_for_project(&server, project_id);
+        tuples.extend(crate::tuples::ownership_tuples_for_project(
+            actor, project_id,
+        ));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_project(
         &self,
         _metadata: &RequestMetadata,
-        project_id: ProjectId,
+        project_id: &ProjectId,
     ) -> AuthorizerResult<()> {
-        self.delete_all_relations(&project_id).await
+        self.delete_all_relations(project_id).await
     }
 
     async fn create_warehouse(
@@ -536,33 +879,16 @@ impl Authorizer for OpenFGAAuthorizer {
         let actor = metadata.actor();
 
         self.require_no_relations(&warehouse_id).await?;
-        let project_id = parent_project_id.to_openfga();
-        let this_id = warehouse_id.to_openfga();
-        self.write(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: WarehouseRelation::Ownership.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: project_id.clone(),
-                    relation: WarehouseRelation::Project.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: this_id.clone(),
-                    relation: ProjectRelation::Warehouse.to_string(),
-                    object: project_id.clone(),
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let mut tuples =
+            crate::tuples::hierarchy_tuples_for_warehouse(parent_project_id, warehouse_id);
+        tuples.extend(crate::tuples::ownership_tuples_for_warehouse(
+            actor,
+            warehouse_id,
+        ));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_warehouse(
@@ -583,43 +909,15 @@ impl Authorizer for OpenFGAAuthorizer {
 
         self.require_no_relations(&namespace_id).await?;
 
-        let (parent_id, parent_child_relation) = match parent {
-            NamespaceParent::Warehouse(warehouse_id) => (
-                warehouse_id.to_openfga(),
-                WarehouseRelation::Namespace.to_string(),
-            ),
-            NamespaceParent::Namespace(parent_namespace_id) => (
-                parent_namespace_id.to_openfga(),
-                NamespaceRelation::Child.to_string(),
-            ),
-        };
-        let this_id = namespace_id.to_openfga();
-
-        self.write(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: NamespaceRelation::Ownership.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: parent_id.clone(),
-                    relation: NamespaceRelation::Parent.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: this_id.clone(),
-                    relation: parent_child_relation,
-                    object: parent_id.clone(),
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let mut tuples = crate::tuples::hierarchy_tuples_for_namespace(&parent, namespace_id);
+        tuples.extend(crate::tuples::ownership_tuples_for_namespace(
+            actor,
+            namespace_id,
+        ));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_namespace(
@@ -630,6 +928,64 @@ impl Authorizer for OpenFGAAuthorizer {
         self.delete_all_relations(&namespace_id).await
     }
 
+    async fn detach_namespace_parent(
+        &self,
+        _metadata: &RequestMetadata,
+        namespace_id: NamespaceId,
+        parent: NamespaceParent,
+    ) -> AuthorizerResult<()> {
+        // Derived from the same helper that writes them, so the delete cannot drift from
+        // the write. A condition cannot participate in a delete, hence the reshape.
+        let deletes = crate::tuples::hierarchy_tuples_for_namespace(&parent, namespace_id)
+            .into_iter()
+            .map(|t| TupleKeyWithoutCondition {
+                user: t.user,
+                relation: t.relation,
+                object: t.object,
+            })
+            .collect::<Vec<_>>();
+        // Idempotent, and deliberately *not* a strict write whose `CannotDeleteTupleNotFound`
+        // we swallow. A hierarchy edge is two tuples (forward `parent` plus the inverse), and
+        // a strict write is atomic: if only one of them is already gone the whole delete
+        // fails, so treating that error as "already applied" would leave the surviving tuple
+        // in place — a stale parent edge, which is the exact silent-inheritance failure this
+        // ordering exists to prevent. `on_missing: Ignore` applies per tuple, so a
+        // half-removed edge converges instead.
+        self.client
+            .write_with_options(None, Some(deletes), WriteOptions::new_idempotent())
+            .await
+            .inspect_err(|e| {
+                tracing::error!("Failed to detach namespace {namespace_id} from parent: {e}");
+            })
+            .map_err(crate::error::OpenFGAError::from)
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
+    }
+
+    async fn attach_namespace_parent(
+        &self,
+        _metadata: &RequestMetadata,
+        namespace_id: NamespaceId,
+        parent: NamespaceParent,
+    ) -> AuthorizerResult<()> {
+        // Its own OpenFGA transaction, separate from the detach, so the two halves of a move
+        // converge independently on replay.
+        //
+        // Idempotent for the same reason as the detach: the edge is two tuples and a strict
+        // write is atomic, so if only the forward tuple already exists the whole write fails
+        // and the inverse would never be written. `on_duplicate: Ignore` applies per tuple.
+        let writes = crate::tuples::hierarchy_tuples_for_namespace(&parent, namespace_id);
+        self.client
+            .write_with_options(Some(writes), None, WriteOptions::new_idempotent())
+            .await
+            .inspect_err(|e| {
+                tracing::error!("Failed to attach namespace {namespace_id} to parent: {e}");
+            })
+            .map_err(crate::error::OpenFGAError::from)
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
+    }
+
     async fn create_table(
         &self,
         metadata: &RequestMetadata,
@@ -638,38 +994,21 @@ impl Authorizer for OpenFGAAuthorizer {
         parent: NamespaceId,
     ) -> AuthorizerResult<()> {
         let actor = metadata.actor();
-        let parent_id = parent.to_openfga();
-        let this_id = (warehouse_id, table_id).to_openfga();
 
         // Higher consistency as for stage create overwrites old relations are deleted
         // immediately before
         self.require_no_relations(&(warehouse_id, table_id)).await?;
 
-        self.write_higher_consistency(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: TableRelation::Ownership.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: parent_id.clone(),
-                    relation: TableRelation::Parent.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: this_id.clone(),
-                    relation: NamespaceRelation::Child.to_string(),
-                    object: parent_id.clone(),
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let mut tuples = crate::tuples::hierarchy_tuples_for_table(warehouse_id, table_id, parent);
+        tuples.extend(crate::tuples::ownership_tuples_for_table(
+            actor,
+            warehouse_id,
+            table_id,
+        ));
+        self.write_higher_consistency(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_table(
@@ -688,36 +1027,19 @@ impl Authorizer for OpenFGAAuthorizer {
         parent: NamespaceId,
     ) -> AuthorizerResult<()> {
         let actor = metadata.actor();
-        let parent_id = parent.to_openfga();
-        let this_id = (warehouse_id, view_id).to_openfga();
 
         self.require_no_relations(&(warehouse_id, view_id)).await?;
 
-        self.write(
-            Some(vec![
-                TupleKey {
-                    user: actor.to_openfga(),
-                    relation: ViewRelation::Ownership.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: parent_id.clone(),
-                    relation: ViewRelation::Parent.to_string(),
-                    object: this_id.clone(),
-                    condition: None,
-                },
-                TupleKey {
-                    user: this_id.clone(),
-                    relation: NamespaceRelation::Child.to_string(),
-                    object: parent_id.clone(),
-                    condition: None,
-                },
-            ]),
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        let mut tuples = crate::tuples::hierarchy_tuples_for_view(warehouse_id, view_id, parent);
+        tuples.extend(crate::tuples::ownership_tuples_for_view(
+            actor,
+            warehouse_id,
+            view_id,
+        ));
+        self.write(Some(tuples), None)
+            .await
+            .map_err(authz_to_error_no_audit)
+            .map_err(Into::into)
     }
 
     async fn delete_view(
@@ -726,6 +1048,209 @@ impl Authorizer for OpenFGAAuthorizer {
         view_id: ViewId,
     ) -> AuthorizerResult<()> {
         self.delete_all_relations(&(warehouse_id, view_id)).await
+    }
+
+    fn role_assignments(&self) -> Option<&dyn ManagesRoleAssignments> {
+        Some(self)
+    }
+
+    fn grants(&self) -> Option<&dyn ManagesGrants> {
+        Some(self)
+    }
+
+    fn grantable_privileges(&self, resource_type: ResourceType) -> &'static [PrivilegeDescriptor] {
+        crate::grant::vocabulary(resource_type)
+    }
+
+    /// Parses the name back to a relation instead of scanning the vocabulary — same
+    /// answer, without walking a list per listed row.
+    fn is_grantable_privilege(&self, resource_type: ResourceType, privilege: &str) -> bool {
+        crate::grant::is_known_privilege(resource_type, privilege)
+    }
+
+    async fn are_allowed_grants_impl(
+        &self,
+        metadata: &RequestMetadata,
+        for_user: Option<&UserOrRole>,
+        target: &GrantTarget<'_>,
+        checks: &[GrantAuthorityCheck<'_>],
+    ) -> std::result::Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        // Only the ids are used: the resolved ancestry the target carries is for
+        // authorizers that resolve inheritance themselves, and this one reads it from its
+        // own tuples instead.
+        self.grant_authority(metadata, for_user, &target.resource(), checks)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ManagesRoleAssignments for OpenFGAAuthorizer {
+    async fn add_role_assignments(
+        &self,
+        _metadata: &RequestMetadata,
+        _project_id: ArcProjectId,
+        assignments: &[(UserOrRoleId, RoleId)],
+    ) -> std::result::Result<(), AddRoleAssignmentsError> {
+        // Just persist the `#assignee` tuples. Cycle prevention is a catalog concern
+        // (`add_role_members`); OpenFGA tolerates cycles, so this never returns
+        // `AddRoleAssignmentsError::Cycle`.
+        let writes = assignments
+            .iter()
+            .map(|(subject, role_id)| TupleKey {
+                user: subject.to_openfga(),
+                relation: RoleRelation::Assignee.to_string(),
+                object: role_id.to_openfga(),
+                condition: None,
+            })
+            .collect::<Vec<_>>();
+
+        // OpenFGA rejects writes larger than `MAX_TUPLES_PER_WRITE`, so chunk. Writes
+        // are idempotent (a partial failure completes on retry); empty input no-ops.
+        for chunk in writes.chunks(MAX_TUPLES_PER_WRITE as usize) {
+            self.client
+                .write_with_options(Some(chunk.to_vec()), None, WriteOptions::new_idempotent())
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("Failed to write role assignments to OpenFGA: {e}");
+                })
+                .map_err(|e| {
+                    AddRoleAssignmentsError::BackendUnavailable(
+                        OpenFGABackendUnavailable::from(Box::new(e)).into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn remove_role_assignments(
+        &self,
+        _metadata: &RequestMetadata,
+        _project_id: ArcProjectId,
+        assignments: &[(UserOrRoleId, RoleId)],
+    ) -> std::result::Result<(), AuthorizationBackendUnavailable> {
+        let deletes = assignments
+            .iter()
+            .map(|(subject, role_id)| TupleKeyWithoutCondition {
+                user: subject.to_openfga(),
+                relation: RoleRelation::Assignee.to_string(),
+                object: role_id.to_openfga(),
+            })
+            .collect::<Vec<_>>();
+
+        // Chunk to the per-write limit (see `add_role_assignments`); idempotent.
+        for chunk in deletes.chunks(MAX_TUPLES_PER_WRITE as usize) {
+            self.client
+                .write_with_options(None, Some(chunk.to_vec()), WriteOptions::new_idempotent())
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("Failed to remove role assignments from OpenFGA: {e}");
+                })
+                .map_err(|e| {
+                    AuthorizationBackendUnavailable::from(OpenFGABackendUnavailable::from(
+                        Box::new(e),
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn list_role_assignments(
+        &self,
+        _metadata: &RequestMetadata,
+        _project_id: ArcProjectId,
+        filter: RoleAssignmentFilter,
+        pagination: PaginationQuery,
+    ) -> std::result::Result<ListRoleAssignmentsResultPage, ListRoleAssignmentsError> {
+        // `ByRole(role)`   -> read all assignees of `role:<role>`   (subject is the key user).
+        // `ByAssignee(sub)`-> read all roles the subject is assignee of (object is the key role).
+        let tuple_key = match &filter {
+            RoleAssignmentFilter::ByRole(role_id) => ReadRequestTupleKey {
+                user: String::new(),
+                relation: RoleRelation::Assignee.to_string(),
+                object: role_id.to_openfga(),
+            },
+            RoleAssignmentFilter::ByAssignee(subject) => ReadRequestTupleKey {
+                user: subject.to_openfga(),
+                relation: RoleRelation::Assignee.to_string(),
+                object: format!("{}:", FgaType::Role),
+            },
+        };
+
+        // OpenFGA's Read RPC caps page_size at 100; clamp rather than surface an
+        // over-large request as a backend error (the caller paginates via the
+        // token). `MAX_TUPLES_PER_WRITE` is a different limit that happens to be the
+        // same 100 — reused here only to avoid a second constant.
+        let page_size = pagination
+            .page_size
+            .and_then(|s| i32::try_from(s).ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(MAX_TUPLES_PER_WRITE)
+            .min(MAX_TUPLES_PER_WRITE);
+
+        // Listings use higher consistency, not the default cache-friendly read:
+        // a management caller that just wrote an assignment expects to see it
+        // (read-after-write), and the service-layer transitive walkers issue many
+        // sequential reads — a stale cache could yield a torn closure that never
+        // existed atomically. This is a cold path, so the extra latency is fine;
+        // the hot `Check`/`ListObjects` authz path is unaffected.
+        let response = self
+            .read_higher_consistency(
+                page_size,
+                tuple_key,
+                pagination.page_token.as_option().map(ToString::to_string),
+            )
+            .await
+            .map_err(AuthorizationBackendUnavailable::from)?;
+
+        let assignments = response
+            .tuples
+            .into_iter()
+            .map(
+                |t| -> std::result::Result<RoleAssignmentRow, MalformedRoleAssignment> {
+                    // A Read response tuple always carries a key; a missing one is a
+                    // malformed response — surface it rather than silently dropping it
+                    // (which would yield an incomplete page).
+                    let key = t.key.ok_or_else(|| {
+                        MalformedRoleAssignment::new(
+                            "authorization backend returned a tuple without a key",
+                            InternalErrorMessage(
+                                "OpenFGA Read response contained a tuple with no key".to_string(),
+                            ),
+                        )
+                    })?;
+                    let (subject, role_id) = match &filter {
+                        RoleAssignmentFilter::ByRole(role_id) => {
+                            (parse_role_subject(&key.user)?, *role_id)
+                        }
+                        RoleAssignmentFilter::ByAssignee(subject) => {
+                            (subject.clone(), parse_role_object(&key.object)?)
+                        }
+                    };
+                    // OpenFGA tuples carry a protobuf well-known timestamp recording when
+                    // the tuple was written. Valid timestamps have `nanos` in [0, 1e9), so a
+                    // negative value is malformed; clamp it to 0 rather than panic.
+                    let created_at = t.timestamp.and_then(|ts| {
+                        chrono::DateTime::from_timestamp(
+                            ts.seconds,
+                            u32::try_from(ts.nanos).unwrap_or(0),
+                        )
+                    });
+                    Ok(RoleAssignmentRow {
+                        subject,
+                        role_id,
+                        created_at,
+                    })
+                },
+            )
+            .collect::<std::result::Result<Vec<_>, MalformedRoleAssignment>>()?;
+
+        // OpenFGA returns an empty continuation token when there are no further pages.
+        let next_page_token = Some(response.continuation_token).filter(|t| !t.is_empty());
+
+        Ok(ListRoleAssignmentsResultPage {
+            assignments,
+            next_page_token,
+        })
     }
 }
 
@@ -755,7 +1280,7 @@ impl OpenFGAAuthorizer {
         let projects = self
             .list_objects(
                 FgaType::Project.to_string(),
-                CatalogProjectAction::CanIncludeInList.to_string(),
+                CatalogProjectAction::IncludeInList.to_openfga().to_string(),
                 actor.to_openfga(),
             )
             .await?
@@ -803,13 +1328,18 @@ impl OpenFGAAuthorizer {
         Ok(())
     }
 
-    /// A convenience wrapper around read that handles error conversion
+    /// A convenience wrapper around read that handles error conversion.
+    ///
+    /// `tuple_key` accepts `None` for an unfiltered store-wide read; see
+    /// [`openfga_client::client::OpenFgaClient::read`].
     pub(crate) async fn read(
         &self,
         page_size: i32,
-        tuple_key: impl Into<ReadRequestTupleKey>,
+        tuple_key: impl Into<Option<ReadRequestTupleKey>>,
         continuation_token: impl Into<Option<String>>,
-    ) -> OpenFGAResult<ReadResponse> {
+    ) -> Result<ReadResponse, OpenFGABackendUnavailable> {
+        // A read can only fail with a transport/client error (no request-data
+        // variants apply), so the narrow backend error is the precise return type.
         self.client
             .read(page_size, tuple_key, continuation_token)
             .await
@@ -817,16 +1347,19 @@ impl OpenFGAAuthorizer {
                 tracing::error!("Failed to read from OpenFGA: {e}");
             })
             .map(tonic::Response::into_inner)
-            .map_err(Into::into)
+            .map_err(|e| OpenFGABackendUnavailable::from(Box::new(e)))
     }
 
-    /// A convenience wrapper around read that handles error conversion
-    async fn read_higher_consistency(
+    /// A convenience wrapper around read that handles error conversion.
+    ///
+    /// `tuple_key` accepts `None` for an unfiltered store-wide read; see
+    /// [`openfga_client::client::OpenFgaClient::read`].
+    pub(crate) async fn read_higher_consistency(
         &self,
         page_size: i32,
-        tuple_key: impl Into<ReadRequestTupleKey>,
+        tuple_key: impl Into<Option<ReadRequestTupleKey>>,
         continuation_token: impl Into<Option<String>>,
-    ) -> OpenFGAResult<ReadResponse> {
+    ) -> Result<ReadResponse, OpenFGABackendUnavailable> {
         self.client_higher_consistency
             .read(page_size, tuple_key, continuation_token)
             .await
@@ -834,18 +1367,29 @@ impl OpenFGAAuthorizer {
                 tracing::error!("Failed to read from OpenFGA: {e}");
             })
             .map(tonic::Response::into_inner)
-            .map_err(Into::into)
+            .map_err(|e| OpenFGABackendUnavailable::from(Box::new(e)))
     }
 
     /// Read all tuples for a given request
     pub(crate) async fn read_all(
         &self,
         tuple_key: Option<impl Into<ReadRequestTupleKey>>,
-    ) -> OpenFGAResult<Vec<Tuple>> {
-        self.client
-            .read_all_pages(tuple_key, 100, 500)
+    ) -> Result<Vec<Tuple>, OpenFGABackendUnavailable> {
+        self.read_all_result(tuple_key)
             .await
-            .map_err(Into::into)
+            .map_err(|e| OpenFGABackendUnavailable::from(Box::new(e)))
+    }
+
+    /// As [`Self::read_all`], but with the client error verbatim.
+    ///
+    /// The page cap is reported as an error rather than by truncating, and it means
+    /// "too many tuples", not "backend down". Use this where the two must be told
+    /// apart; [`Self::read_all`] folds both into unavailability.
+    pub(crate) async fn read_all_result(
+        &self,
+        tuple_key: Option<impl Into<ReadRequestTupleKey>>,
+    ) -> Result<Vec<Tuple>, openfga_client::error::Error> {
+        self.client.read_all_pages(tuple_key, 100, 500).await
     }
 
     /// A convenience wrapper around check
@@ -862,6 +1406,45 @@ impl OpenFGAAuthorizer {
             .map_err(Into::into)
     }
 
+    /// Helper method to check actions with permission guards when inspecting another user's permissions.
+    /// This pattern is used across multiple resource types (server, project, warehouse, etc.).
+    ///
+    /// The `items` parameter should contain the pre-built check requests for the actions.
+    /// The `guard_tuples` parameter should contain permission checks to verify the actor
+    /// has the right to inspect another user's permissions. If empty, no permission checks are performed.
+    pub(crate) async fn check_actions_with_permission_guard(
+        &self,
+        _actor: &Actor,
+        mut items: Vec<CheckRequestTupleKey>,
+        guard_tuples: Vec<CheckRequestTupleKey>,
+    ) -> Result<Vec<AuthorizationDecision>, IsAllowedActionError> {
+        let num_guards = guard_tuples.len();
+
+        // Collect objects for error reporting if guards fail
+        let guard_objects: Vec<_> = guard_tuples.iter().map(|t| t.object.clone()).collect();
+
+        // Append the permission guard checks
+        items.extend(guard_tuples);
+
+        let mut results = self.batch_check(items).await?;
+
+        // If we had guard checks, pop them and verify all passed
+        if num_guards > 0 {
+            let guard_results: Vec<_> = results.drain(results.len() - num_guards..).collect();
+            if let Some((idx, _)) = guard_results
+                .iter()
+                .enumerate()
+                .find(|&(_, allowed)| !allowed)
+            {
+                return Err(CannotInspectPermissions::new(&guard_objects[idx]).into());
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(AuthorizationDecision::from)
+            .collect())
+    }
     /// A convenience wrapper around `batch_check`.
     async fn batch_check(
         &self,
@@ -920,7 +1503,7 @@ impl OpenFGAAuthorizer {
         metadata: &RequestMetadata,
         action: impl OpenFgaRelation,
         object: &str,
-    ) -> AuthorizerResult<()> {
+    ) -> Result<(), OpenFGAError> {
         let allowed = self
             .check(CheckRequestTupleKey {
                 user: metadata.actor().to_openfga(),
@@ -930,12 +1513,10 @@ impl OpenFGAAuthorizer {
             .await?;
 
         if !allowed {
-            return Err(ErrorModel::forbidden(
-                format!("Action {action} not allowed for object {object}"),
-                "ActionForbidden",
-                None,
-            )
-            .into());
+            return Err(OpenFGAError::Unauthorized {
+                relation: action.to_string(),
+                object: object.to_string(),
+            });
         }
         Ok(())
     }
@@ -955,7 +1536,8 @@ impl OpenFGAAuthorizer {
             .map_err(|e| {
                 tracing::error!("Failed to check if relations to {fga_object} exists: {e}");
                 OpenFGAError::from(e)
-            })?;
+            })
+            .map_err(authz_to_error_no_audit)?;
 
         if relations_exist {
             return Err(ErrorModel::conflict(
@@ -985,19 +1567,29 @@ impl OpenFGAAuthorizer {
                             },
                             None,
                         )
-                        .await?;
+                        .await
+                        .map_err(authz_to_error_no_audit)?;
 
                     if !tuples.tuples.is_empty() {
-                        return Err(IcebergErrorResponse::from(
-                            ErrorModel::conflict(
-                                format!(
-                                    "Object to create {fga_object_str} is used as user for type {o}",
-                                ),
-                                "ObjectUsedInRelation",
-                                None,
-                            )
-                                .append_detail(format!("Found: {tuples:?}")),
-                        ));
+                        // The tuples name other entities — a warehouse's hierarchy
+                        // tuple carries its owning project — and for a 4xx the
+                        // error `stack` is serialized to the caller verbatim. Now
+                        // that a caller can pick the id being created, and so aim
+                        // this check at an id they do not own, the tuples go to the
+                        // log rather than into the response.
+                        tracing::warn!(
+                            object = %fga_object_str,
+                            related_type = %o,
+                            ?tuples,
+                            "Refusing to create an object that is still used as a user in existing relations"
+                        );
+                        return Err(IcebergErrorResponse::from(ErrorModel::conflict(
+                            format!(
+                                "Object to create {fga_object_str} is used as user for type {o}",
+                            ),
+                            "ObjectUsedInRelation",
+                            None,
+                        )));
                     }
                 }
 
@@ -1016,7 +1608,7 @@ impl OpenFGAAuthorizer {
             self.delete_own_relations(object),
             self.delete_user_relations(object)
         );
-        own_relations?;
+        own_relations.map_err(authz_to_error_no_audit)?;
         user_relations.inspect_err(|e| {
             tracing::error!("Failed to delete user relations for {object_openfga}: {e:?}");
         })
@@ -1034,8 +1626,8 @@ impl OpenFGAAuthorizer {
             .iter()
             .map(|o| (o, &suffixes))
             .map(|(o, s)| async move {
-                let mut continuation_token = None;
                 for suffix in s {
+                    let mut continuation_token = None;
                     let user = format!("{fga_user_str}{suffix}");
                     while continuation_token != Some(String::new()) {
                         let response = self
@@ -1048,7 +1640,8 @@ impl OpenFGAAuthorizer {
                                 },
                                 continuation_token.clone(),
                             )
-                            .await?;
+                            .await
+                            .map_err(authz_to_error_no_audit)?;
                         continuation_token = Some(response.continuation_token);
                         let keys = response
                             .tuples
@@ -1067,7 +1660,8 @@ impl OpenFGAAuthorizer {
                                     .collect(),
                             ),
                         )
-                        .await?;
+                        .await
+                        .map_err(authz_to_error_no_audit)?;
                     }
                 }
 
@@ -1105,6 +1699,30 @@ impl OpenFGAAuthorizer {
     }
 }
 
+/// Parse an OpenFGA assignee subject (`user:<id>` or `role:<id>#assignee`) into the
+/// id-only [`UserOrRoleId`]. A tuple we wrote but can't read back is an internal
+/// invariant violation, so a parse failure is a [`MalformedRoleAssignment`] (500),
+/// not the backend-fault (503).
+fn parse_role_subject(subject: &str) -> Result<UserOrRoleId, MalformedRoleAssignment> {
+    use lakekeeper::api::management::v1::check::UserOrRole as ApiUserOrRole;
+
+    let parsed = ApiUserOrRole::parse_from_openfga(subject).map_err(|e| {
+        MalformedRoleAssignment::new("authorization backend returned an unparseable subject", e)
+    })?;
+    Ok(match parsed {
+        ApiUserOrRole::User(user_id) => UserOrRoleId::User(user_id),
+        ApiUserOrRole::Role(assignee) => UserOrRoleId::Role(assignee.role_id()),
+    })
+}
+
+/// Parse an OpenFGA role object string (`role:<id>`) into a [`RoleId`]. See
+/// [`parse_role_subject`] for the error rationale.
+fn parse_role_object(object: &str) -> Result<RoleId, MalformedRoleAssignment> {
+    RoleId::parse_from_openfga(object).map_err(|e| {
+        MalformedRoleAssignment::new("authorization backend returned an unparseable role", e)
+    })
+}
+
 fn suffixes_for_user(user: &FgaType) -> Vec<String> {
     user.usersets()
         .iter()
@@ -1118,7 +1736,10 @@ pub(crate) mod tests {
     // Name is important for test profile
     pub(crate) mod openfga_integration_tests {
         use http::StatusCode;
-        use lakekeeper::tokio;
+        use lakekeeper::{
+            service::{authz::AuthZProjectOps, events::AuthorizationFailureSource},
+            tokio,
+        };
         use openfga_client::client::ConsistencyPreference;
 
         use super::super::*;
@@ -1234,6 +1855,15 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert_eq!(err.error.code, StatusCode::CONFLICT.as_u16());
             assert_eq!(err.error.r#type, "ObjectUsedInRelation");
+            // The tuples that triggered the refusal must not travel to the caller:
+            // for a 4xx the error `stack` is serialized verbatim, and the tuples
+            // name a *different* object than the one being created (here the
+            // server, for a warehouse its owning project). They belong in the log.
+            let rendered = format!("{:?}", err.error);
+            assert!(
+                !rendered.contains("this_server"),
+                "refusal disclosed the related object: {rendered}"
+            );
         }
 
         #[tokio::test]
@@ -1385,7 +2015,7 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                ErrorModel::from(result).code,
+                result.into_error_model().code,
                 StatusCode::NOT_FOUND.as_u16()
             );
         }
@@ -1419,7 +2049,10 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(ErrorModel::from(result).code, StatusCode::CONFLICT.as_u16());
+            assert_eq!(
+                result.into_error_model().code,
+                StatusCode::CONFLICT.as_u16()
+            );
         }
 
         #[tokio::test]
@@ -1490,6 +2123,1218 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&user).await.unwrap_err();
             authorizer.delete_user_relations(&user).await.unwrap();
             authorizer.require_no_relations(&user).await.unwrap();
+        }
+
+        /// Read every tuple in the store as `(user, relation, object)` triples,
+        /// dropping the model-version bookkeeping tuples.
+        async fn all_tuples(
+            authorizer: &OpenFGAAuthorizer,
+        ) -> std::collections::HashSet<(String, String, String)> {
+            authorizer
+                .client
+                .read_all_pages(None::<ReadRequestTupleKey>, 100, 1000)
+                .await
+                .expect("read_all_pages")
+                .into_iter()
+                .filter_map(|t| t.key)
+                .filter(|k| k.relation != "exists" && k.relation != "openfga_id")
+                .map(|k| (k.user, k.relation, k.object))
+                .collect()
+        }
+
+        /// The hook re-points a namespace's hierarchy against a real store: the destination's
+        /// edges appear, the source's disappear, and everything else is untouched.
+        ///
+        /// The unit tests in `crate::tuples::tests` pin the tuple *shapes*; this pins that
+        /// writing and deleting them actually lands, which is the part a model-only test
+        /// (`store.fga.yaml`) and a fake authorizer both miss.
+        #[tokio::test]
+        async fn test_move_namespace_repoints_hierarchy_tuples() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let metadata = RequestMetadata::test_user(UserId::new_unchecked("oidc", "mover"));
+
+            let warehouse_id = WarehouseId::new_random();
+            let old_parent = NamespaceId::new_random();
+            let moved = NamespaceId::new_random();
+            // A sibling that must be left alone by the move.
+            let bystander = NamespaceId::new_random();
+
+            authorizer
+                .create_namespace(
+                    &metadata,
+                    old_parent,
+                    NamespaceParent::Warehouse(warehouse_id),
+                )
+                .await
+                .unwrap();
+            authorizer
+                .create_namespace(&metadata, moved, NamespaceParent::Namespace(old_parent))
+                .await
+                .unwrap();
+            authorizer
+                .create_namespace(&metadata, bystander, NamespaceParent::Namespace(old_parent))
+                .await
+                .unwrap();
+
+            let old_forward = (
+                format!("namespace:{old_parent}"),
+                "parent".to_string(),
+                format!("namespace:{moved}"),
+            );
+            let old_inverse = (
+                format!("namespace:{moved}"),
+                "child".to_string(),
+                format!("namespace:{old_parent}"),
+            );
+            let new_forward = (
+                format!("warehouse:{warehouse_id}"),
+                "parent".to_string(),
+                format!("namespace:{moved}"),
+            );
+            let new_inverse = (
+                format!("namespace:{moved}"),
+                "namespace".to_string(),
+                format!("warehouse:{warehouse_id}"),
+            );
+            let bystander_edge = (
+                format!("namespace:{old_parent}"),
+                "parent".to_string(),
+                format!("namespace:{bystander}"),
+            );
+
+            let before = all_tuples(&authorizer).await;
+            assert!(
+                before.contains(&old_forward),
+                "precondition: {old_forward:?}"
+            );
+            assert!(
+                before.contains(&old_inverse),
+                "precondition: {old_inverse:?}"
+            );
+            assert!(!before.contains(&new_forward));
+
+            // Re-parent from the namespace to the warehouse root — the case where the
+            // inverse relation changes kind (`child` → `namespace`). Detach first, then
+            // attach, the order the API layer uses around its commit.
+            authorizer
+                .detach_namespace_parent(&metadata, moved, NamespaceParent::Namespace(old_parent))
+                .await
+                .unwrap();
+            authorizer
+                .attach_namespace_parent(&metadata, moved, NamespaceParent::Warehouse(warehouse_id))
+                .await
+                .unwrap();
+
+            let after = all_tuples(&authorizer).await;
+            assert!(after.contains(&new_forward), "missing {new_forward:?}");
+            assert!(after.contains(&new_inverse), "missing {new_inverse:?}");
+            assert!(
+                !after.contains(&old_forward),
+                "stale edge survived: {old_forward:?}"
+            );
+            assert!(
+                !after.contains(&old_inverse),
+                "stale edge survived: {old_inverse:?}"
+            );
+            assert!(
+                after.contains(&bystander_edge),
+                "the move must not disturb sibling namespaces"
+            );
+
+            // Ownership is unrelated to hierarchy and must survive the move.
+            assert!(after.contains(&(
+                "user:oidc~mover".to_string(),
+                "ownership".to_string(),
+                format!("namespace:{moved}"),
+            )));
+        }
+
+        /// Replaying the hook must converge rather than fail.
+        ///
+        /// This is why the implementation is two writes instead of one: OpenFGA rejects a
+        /// write whose tuple already exists and a delete whose tuple is already gone, so a
+        /// single combined transaction could never be retried after partial application.
+        #[tokio::test]
+        async fn test_move_namespace_is_idempotent() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let metadata = RequestMetadata::test_user(UserId::new_unchecked("oidc", "mover"));
+
+            let warehouse_id = WarehouseId::new_random();
+            let old_parent = NamespaceId::new_random();
+            let moved = NamespaceId::new_random();
+
+            authorizer
+                .create_namespace(
+                    &metadata,
+                    old_parent,
+                    NamespaceParent::Warehouse(warehouse_id),
+                )
+                .await
+                .unwrap();
+            authorizer
+                .create_namespace(&metadata, moved, NamespaceParent::Namespace(old_parent))
+                .await
+                .unwrap();
+
+            // Replay the detach/attach pair three times. Both halves must tolerate their
+            // own "already applied" error, or the second round fails.
+            let mut after_first = None;
+            for attempt in 1..=3 {
+                authorizer
+                    .detach_namespace_parent(
+                        &metadata,
+                        moved,
+                        NamespaceParent::Namespace(old_parent),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("detach on attempt {attempt} failed: {e:?}"));
+                authorizer
+                    .attach_namespace_parent(
+                        &metadata,
+                        moved,
+                        NamespaceParent::Warehouse(warehouse_id),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("attach on attempt {attempt} failed: {e:?}"));
+
+                let tuples = all_tuples(&authorizer).await;
+                match &after_first {
+                    None => after_first = Some(tuples),
+                    Some(first) => assert_eq!(
+                        &tuples, first,
+                        "replay {attempt} must not change the tuple set"
+                    ),
+                }
+            }
+        }
+
+        /// A hierarchy edge is *two* tuples, and a strict OpenFGA write is atomic. So a
+        /// half-present edge — one direction there, the other not — must still converge.
+        ///
+        /// This is the state a strict write plus "treat already-applied as success" gets
+        /// wrong: the write fails because of the one tuple that conflicts, the error is
+        /// swallowed, and the sibling tuple is silently never applied. For a detach that
+        /// leaves a live parent edge behind.
+        #[tokio::test]
+        async fn test_detach_namespace_parent_converges_from_half_removed_edge() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let metadata = RequestMetadata::test_user(UserId::new_unchecked("oidc", "mover"));
+
+            let warehouse_id = WarehouseId::new_random();
+            let moved = NamespaceId::new_random();
+            authorizer
+                .create_namespace(&metadata, moved, NamespaceParent::Warehouse(warehouse_id))
+                .await
+                .unwrap();
+
+            // Remove only the inverse tuple, leaving the forward `parent` edge in place.
+            let inverse = (
+                format!("namespace:{moved}"),
+                "namespace".to_string(),
+                format!("warehouse:{warehouse_id}"),
+            );
+            authorizer
+                .client
+                .write_with_options(
+                    None,
+                    Some(vec![TupleKeyWithoutCondition {
+                        user: inverse.0.clone(),
+                        relation: inverse.1.clone(),
+                        object: inverse.2.clone(),
+                    }]),
+                    WriteOptions::new_idempotent(),
+                )
+                .await
+                .unwrap();
+
+            let forward = (
+                format!("warehouse:{warehouse_id}"),
+                "parent".to_string(),
+                format!("namespace:{moved}"),
+            );
+            let half = all_tuples(&authorizer).await;
+            assert!(
+                half.contains(&forward),
+                "precondition: forward edge remains"
+            );
+            assert!(
+                !half.contains(&inverse),
+                "precondition: inverse edge is gone"
+            );
+
+            authorizer
+                .detach_namespace_parent(&metadata, moved, NamespaceParent::Warehouse(warehouse_id))
+                .await
+                .expect("detach must tolerate a half-removed edge");
+
+            let after = all_tuples(&authorizer).await;
+            assert!(
+                !after.contains(&forward),
+                "the surviving forward edge must be removed, not skipped: {forward:?}"
+            );
+            assert!(!after.contains(&inverse));
+        }
+
+        /// The attach mirror image: one direction already present must not stop the other
+        /// from being written, or the namespace ends up with a half-built parent edge.
+        #[tokio::test]
+        async fn test_attach_namespace_parent_converges_from_half_present_edge() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let metadata = RequestMetadata::test_user(UserId::new_unchecked("oidc", "mover"));
+
+            let warehouse_id = WarehouseId::new_random();
+            let moved = NamespaceId::new_random();
+
+            // Only the forward tuple, as if a previous attempt applied half an edge.
+            let forward = (
+                format!("warehouse:{warehouse_id}"),
+                "parent".to_string(),
+                format!("namespace:{moved}"),
+            );
+            authorizer
+                .client
+                .write_with_options(
+                    Some(vec![TupleKey {
+                        user: forward.0.clone(),
+                        relation: forward.1.clone(),
+                        object: forward.2.clone(),
+                        condition: None,
+                    }]),
+                    None,
+                    WriteOptions::new_idempotent(),
+                )
+                .await
+                .unwrap();
+
+            authorizer
+                .attach_namespace_parent(&metadata, moved, NamespaceParent::Warehouse(warehouse_id))
+                .await
+                .expect("attach must tolerate a half-present edge");
+
+            let inverse = (
+                format!("namespace:{moved}"),
+                "namespace".to_string(),
+                format!("warehouse:{warehouse_id}"),
+            );
+            let after = all_tuples(&authorizer).await;
+            assert!(after.contains(&forward));
+            assert!(
+                after.contains(&inverse),
+                "the missing inverse edge must be written, not skipped: {inverse:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_are_allowed_project_actions_without_for_user() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let user_id: UserId = UserId::new_unchecked("oidc", "test_user");
+            let project_id = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            // Before granting any permissions, user should not have access
+            let results = authorizer
+                .are_allowed_project_actions_impl(
+                    &metadata,
+                    None,
+                    &[
+                        (&project_id, ProjectRelation::CanCreateWarehouse),
+                        (&project_id, ProjectRelation::CanListWarehouses),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![false, false]);
+
+            // Grant the user ProjectAdmin permission
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: user_id.to_openfga(),
+                        relation: ProjectRelation::ProjectAdmin.to_string(),
+                        object: project_id.to_openfga(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Now user should have access to both actions
+            let results = authorizer
+                .are_allowed_project_actions_impl(
+                    &metadata,
+                    None,
+                    &[
+                        (&project_id, ProjectRelation::CanCreateWarehouse),
+                        (&project_id, ProjectRelation::CanListWarehouses),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![true, true]);
+        }
+
+        #[tokio::test]
+        async fn test_are_allowed_project_actions_with_for_user() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            // Admin user who can check permissions
+            let admin_user_id = UserId::new_unchecked("oidc", "admin_user");
+
+            // Target user whose permissions we're checking
+            let target_user_id = UserId::new_unchecked("oidc", "target_user");
+            let target_user = UserOrRole::User(target_user_id.clone());
+
+            let project_id = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let metadata = RequestMetadata::test_user(admin_user_id.clone());
+
+            // Grant target user some permissions on the project
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: target_user_id.to_openfga(),
+                        relation: ProjectRelation::DataAdmin.to_string(),
+                        object: project_id.to_openfga(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Admin tries to check target user's permissions without having CanReadAssignments
+            // Should fail with CannotInspectPermissions
+            let result = authorizer
+                .are_allowed_project_actions_impl(
+                    &metadata,
+                    Some(&target_user),
+                    &[
+                        (&project_id, ProjectRelation::CanCreateWarehouse),
+                        (&project_id, ProjectRelation::CanListWarehouses),
+                    ],
+                )
+                .await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                IsAllowedActionError::CannotInspectPermissions(_) => {
+                    // Expected error
+                }
+                IsAllowedActionError::AuthorizationBackendUnavailable(_)
+                | IsAllowedActionError::BadRequest(_)
+                | IsAllowedActionError::CountMismatch(_) => {
+                    panic!("Expected CannotInspectPermissions error, got: {err:?}")
+                }
+            }
+
+            // Grant admin user CanReadAssignments permission on the project
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: admin_user_id.to_openfga(),
+                        relation: ProjectRelation::ProjectAdmin.to_string(),
+                        object: project_id.to_openfga(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Now admin should be able to check target user's permissions
+            let results = authorizer
+                .are_allowed_project_actions_vec(
+                    &metadata,
+                    Some(&target_user),
+                    &[
+                        (&project_id, ProjectRelation::CanGetMetadata),
+                        (&project_id, ProjectRelation::CanGrantProjectAdmin),
+                    ],
+                )
+                .await
+                .unwrap()
+                .into_inner();
+
+            assert_eq!(results, vec![true, false]);
+        }
+
+        /// `ReadRoleAssignments` must reflect the *inspected subject's* permission
+        /// to know about users, not the caller's. Regression for the bug where the
+        /// `for_user` path returned the actor's `CanListUsers` result.
+        #[tokio::test]
+        async fn test_are_allowed_user_actions_read_role_assignments_uses_inspected_subject() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let server = authorizer.openfga_server();
+
+            // Actor (caller) — granted server Admin so it MAY inspect others
+            // (`CanListUsers` ⇒ passes the inspection guard).
+            let actor_id = UserId::new_unchecked("oidc", "actor_admin");
+            // Inspected subject — initially has NO server grant, so it cannot list users.
+            let subject_id = UserId::new_unchecked("oidc", "inspected_subject");
+            let subject = UserOrRole::User(subject_id.clone());
+            // The user whose assignments are being asked about.
+            let target_id = UserId::new_unchecked("oidc", "target_user");
+
+            let metadata = RequestMetadata::test_user(actor_id.clone());
+
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: actor_id.to_openfga(),
+                        relation: ServerRelation::Admin.to_string(),
+                        object: server.clone(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Subject lacks `CanListUsers`: the actor can inspect (no error), but
+            // the result reflects the SUBJECT — false. (The old code returned the
+            // actor's permission here, which would be `true`.)
+            let results = authorizer
+                .are_allowed_user_actions_impl(
+                    &metadata,
+                    Some(&subject),
+                    &[(&target_id, CatalogUserAction::ReadRoleAssignments)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![false]);
+
+            // Grant the subject server Admin (⇒ `CanListUsers`); now the same query
+            // reflects the subject's permission — true.
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: subject_id.to_openfga(),
+                        relation: ServerRelation::Admin.to_string(),
+                        object: server.clone(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let results = authorizer
+                .are_allowed_user_actions_impl(
+                    &metadata,
+                    Some(&subject),
+                    &[(&target_id, CatalogUserAction::ReadRoleAssignments)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![true]);
+
+            // Self fast-path: inspecting a subject's permission on *itself* is
+            // allowed without any grant and without the inspection guard firing.
+            // `loner` has no server grants, so a `true` here can only come from the
+            // `is_same_user` short-circuit, not from a `CanListUsers` check.
+            let loner_id = UserId::new_unchecked("oidc", "loner");
+            let loner = UserOrRole::User(loner_id.clone());
+            let results = authorizer
+                .are_allowed_user_actions_impl(
+                    &metadata,
+                    Some(&loner),
+                    &[(&loner_id, CatalogUserAction::ReadRoleAssignments)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![true]);
+        }
+
+        #[tokio::test]
+        async fn test_are_allowed_project_actions_for_user_checks_correct_user() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            // Admin user who can check permissions
+            let admin_user_id = UserId::new_unchecked("oidc", "admin_user");
+
+            // Target user whose permissions we're checking
+            let target_user_id = UserId::new_unchecked("oidc", "target_user");
+            let target_user = UserOrRole::User(target_user_id.clone());
+
+            let project_id = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let metadata = RequestMetadata::test_user(admin_user_id.clone());
+
+            // Grant admin user permissions on the project
+            authorizer
+                .write(
+                    Some(vec![
+                        TupleKey {
+                            user: admin_user_id.to_openfga(),
+                            relation: ProjectRelation::ProjectAdmin.to_string(),
+                            object: project_id.to_openfga(),
+                            condition: None,
+                        },
+                        TupleKey {
+                            user: target_user.api_user_or_role().to_openfga(),
+                            relation: ProjectRelation::DataAdmin.to_string(),
+                            object: project_id.to_openfga(),
+                            condition: None,
+                        },
+                    ]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Check target user's permissions
+            let results = authorizer
+                .are_allowed_project_actions_vec(
+                    &metadata,
+                    Some(&target_user),
+                    &[
+                        (&project_id, ProjectRelation::CanGetMetadata),
+                        (&project_id, ProjectRelation::CanGrantProjectAdmin),
+                    ],
+                )
+                .await
+                .unwrap()
+                .into_inner();
+
+            assert_eq!(results, vec![true, false]);
+        }
+
+        #[tokio::test]
+        async fn test_generic_table_permissions_lifecycle() {
+            use std::collections::HashMap;
+
+            use lakekeeper::service::{
+                GenericTableId, GenericTabularInfo, NamespaceId, NamespaceWithParent,
+                ResolvedWarehouse, WarehouseId,
+            };
+
+            let authorizer = new_authorizer_in_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", "gt_test_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+            let warehouse_id = WarehouseId::from(uuid::Uuid::now_v7());
+            let namespace_id = NamespaceId::from(uuid::Uuid::now_v7());
+            let generic_table_id = GenericTableId::from(uuid::Uuid::now_v7());
+            let warehouse = ResolvedWarehouse::new_with_id(warehouse_id);
+            let ns = NamespaceWithParent::test_default(namespace_id, warehouse_id);
+            let parent_namespaces: HashMap<NamespaceId, NamespaceWithParent> =
+                HashMap::from([(namespace_id, ns.clone())]);
+
+            let gt_info =
+                GenericTabularInfo::test_default(warehouse_id, namespace_id, generic_table_id);
+
+            let make = |action| {
+                (
+                    &ns,
+                    ActionOnGenericTable {
+                        info: &gt_info,
+                        action,
+                        user: None,
+                        is_delegated_execution: false,
+                    },
+                )
+            };
+
+            // Before creating any tuples, all actions should be denied
+            let results = authorizer
+                .are_allowed_generic_table_actions_impl(
+                    &metadata,
+                    &warehouse,
+                    &parent_namespaces,
+                    &[
+                        make(GenericTableRelation::CanGetMetadata),
+                        make(GenericTableRelation::CanReadData),
+                        make(GenericTableRelation::CanWriteData),
+                        make(GenericTableRelation::CanDrop),
+                        make(GenericTableRelation::CanUndrop),
+                        make(GenericTableRelation::CanIncludeInList),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![false, false, false, false, false, false]);
+
+            // Create the generic table in authorizer (sets ownership + parent)
+            authorizer
+                .create_generic_table(&metadata, warehouse_id, generic_table_id, namespace_id)
+                .await
+                .unwrap();
+
+            // Now the creator should have full permissions via ownership
+            let results = authorizer
+                .are_allowed_generic_table_actions_impl(
+                    &metadata,
+                    &warehouse,
+                    &parent_namespaces,
+                    &[
+                        make(GenericTableRelation::CanGetMetadata),
+                        make(GenericTableRelation::CanReadData),
+                        make(GenericTableRelation::CanWriteData),
+                        make(GenericTableRelation::CanDrop),
+                        make(GenericTableRelation::CanUndrop),
+                        make(GenericTableRelation::CanIncludeInList),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![true, true, true, true, true, true]);
+
+            // Delete the generic table from authorizer
+            authorizer
+                .delete_generic_table(warehouse_id, generic_table_id)
+                .await
+                .unwrap();
+
+            // After deletion, all actions should be denied again
+            let results = authorizer
+                .are_allowed_generic_table_actions_impl(
+                    &metadata,
+                    &warehouse,
+                    &parent_namespaces,
+                    &[
+                        make(GenericTableRelation::CanGetMetadata),
+                        make(GenericTableRelation::CanDrop),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(results, vec![false, false]);
+        }
+
+        #[tokio::test]
+        async fn role_member_can_assume_parent_transitively() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "transitive_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            // Role A (parent) and Role B (member of A).
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+
+            // B becomes an assignee (member) of A: role -> role nesting.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::Role(role_b.id), role_a.id)],
+                )
+                .await
+                .unwrap();
+
+            // U becomes an assignee of B: user -> role.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::User(user_id.clone()), role_b.id)],
+                )
+                .await
+                .unwrap();
+
+            // U can assume B directly.
+            let can_assume_b = authorizer
+                .check_assume_role_impl(&user_id, &role_b, &metadata)
+                .await
+                .unwrap();
+            assert!(can_assume_b);
+
+            // U can assume A transitively (U -> B -> A).
+            let can_assume_a = authorizer
+                .check_assume_role_impl(&user_id, &role_a, &metadata)
+                .await
+                .unwrap();
+            assert!(can_assume_a);
+        }
+
+        /// OpenFGA TOLERATES cyclic role-in-role memberships: the authorizer does
+        /// no write-time cycle detection (cycle prevention is a catalog-layer
+        /// concern — see `add_role_members` — not the authorizer's). Writing both
+        /// `B member of A` and the cycle-closing `A member of B` succeed, and
+        /// `can_assume` resolves the cyclic userset safely (returns promptly, no
+        /// infinite loop). This test locks that behavior against a live server.
+        #[tokio::test]
+        async fn openfga_tolerates_cyclic_role_membership() {
+            use std::time::Duration;
+
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "cyclic_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+
+            // Generous client-side guard: every OpenFGA call must return well under this.
+            let guard = Duration::from_secs(30);
+
+            // B member of A, then the cycle-closing A member of B — both accepted.
+            for (member, parent) in [(role_b.clone(), role_a.id), (role_a.clone(), role_b.id)] {
+                tokio::time::timeout(
+                    guard,
+                    authorizer
+                        .role_assignments()
+                        .expect("OpenFGA manages role assignments")
+                        .add_role_assignments(
+                            &metadata,
+                            project_id.clone(),
+                            &[(UserOrRoleId::Role(member.id), parent)],
+                        ),
+                )
+                .await
+                .expect("write must not hang")
+                .expect("OpenFGA must accept the (cyclic) membership write");
+            }
+
+            // Assign a user to A; the cyclic userset resolves safely, so the user
+            // can assume BOTH A and B, and every check returns promptly (no hang).
+            tokio::time::timeout(
+                guard,
+                authorizer
+                    .role_assignments()
+                    .expect("OpenFGA manages role assignments")
+                    .add_role_assignments(
+                        &metadata,
+                        project_id.clone(),
+                        &[(UserOrRoleId::User(user_id.clone()), role_a.id)],
+                    ),
+            )
+            .await
+            .expect("write must not hang")
+            .expect("user assignment must succeed");
+
+            for role in [&role_a, &role_b] {
+                let can_assume = tokio::time::timeout(
+                    guard,
+                    authorizer.check_assume_role_impl(&user_id, role, &metadata),
+                )
+                .await
+                .expect("can_assume check must not hang (cycle resolves safely)")
+                .expect("check must not error");
+                assert!(
+                    can_assume,
+                    "user assigned to A assumes both A and B through the cycle"
+                );
+            }
+        }
+
+        /// A legitimate DEEP (depth >= 2) non-cyclic role->role chain must be
+        /// ACCEPTED: the write-time cycle check in `add_role_assignments` must
+        /// not false-positive on an acyclic chain `C => A => B`.
+        ///
+        /// Setup:
+        ///   - A is a member of B   (A => B)
+        ///   - C is a member of A   (C => A)  -- depth-2 edge, NOT a cycle
+        ///
+        /// Then a user U assigned to C must transitively assume C, A and B, while
+        /// a holder of B (`role:B#assignee`) must NOT be able to assume C, proving
+        /// the chain stays directional (no reverse/cyclic edge was created).
+        #[tokio::test]
+        async fn openfga_accepts_deep_noncyclic_role_chain() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "deep_chain_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+            let role_c = Arc::new(Role::new_random());
+
+            // Step 1: A is a member of B (A => B). Normal first-level edge.
+            let write_a_in_b = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::Role(role_a.id), role_b.id)],
+                )
+                .await;
+            assert!(
+                write_a_in_b.is_ok(),
+                "first edge A-in-B must be accepted, got {write_a_in_b:?}"
+            );
+
+            // Step 2: C is a member of A (C => A). This extends the chain to
+            // C => A => B (depth 2). It is acyclic and must NOT be rejected.
+            let result = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::Role(role_c.id), role_a.id)],
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "deep non-cyclic chain must be accepted, got {result:?}"
+            );
+
+            // Step 3: assign user U to C (user => role).
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::User(user_id.clone()), role_c.id)],
+                )
+                .await
+                .unwrap();
+
+            // U can assume C directly.
+            let can_assume_c = authorizer
+                .check_assume_role_impl(&user_id, &role_c, &metadata)
+                .await
+                .unwrap();
+            assert!(can_assume_c, "U must assume C directly");
+
+            // U can assume A transitively (U => C => A).
+            let can_assume_a = authorizer
+                .check_assume_role_impl(&user_id, &role_a, &metadata)
+                .await
+                .unwrap();
+            assert!(can_assume_a, "U must assume A transitively (U=>C=>A)");
+
+            // U can assume B transitively across two levels (U => C => A => B).
+            let can_assume_b = authorizer
+                .check_assume_role_impl(&user_id, &role_b, &metadata)
+                .await
+                .unwrap();
+            assert!(can_assume_b, "U must assume B transitively (U=>C=>A=>B)");
+
+            // The chain is directional: a holder of B (role:B#assignee) must NOT
+            // be able to assume C. If a reverse/cyclic edge existed this would be
+            // true.
+            let role_b_assume_c = authorizer
+                .check(CheckRequestTupleKey {
+                    user: format!("{}#assignee", role_b.id.to_openfga()),
+                    relation: relations::RoleRelation::CanAssume.to_string(),
+                    object: role_c.id.to_openfga(),
+                })
+                .await
+                .unwrap();
+            assert!(
+                !role_b_assume_c,
+                "B's holder must NOT assume C: chain is directional, no reverse edge"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_role_assignments_returns_role_members() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "list_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+
+            // B is a member of A; U is a member of A directly.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[
+                        (UserOrRoleId::Role(role_b.id), role_a.id),
+                        (UserOrRoleId::User(user_id.clone()), role_a.id),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let page = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role_a.id),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+
+            // Every returned row targets role A and carries the tuple write timestamp.
+            for row in &page.assignments {
+                assert_eq!(row.role_id, role_a.id);
+                assert!(row.created_at.is_some());
+            }
+
+            let subjects: HashSet<UserOrRoleId> =
+                page.assignments.into_iter().map(|r| r.subject).collect();
+            let expected: HashSet<UserOrRoleId> = HashSet::from_iter(vec![
+                UserOrRoleId::Role(role_b.id),
+                UserOrRoleId::User(user_id.clone()),
+            ]);
+            assert_eq!(subjects, expected);
+        }
+
+        #[tokio::test]
+        async fn list_role_assignments_populates_created_at() {
+            let authorizer = new_authorizer_in_empty_store().await;
+
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "created_at_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+
+            let role = Arc::new(Role::new_random());
+
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::User(user_id.clone()), role.id)],
+                )
+                .await
+                .unwrap();
+
+            let first_page = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role.id),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+
+            // Exactly one assignment, and it carries a populated created_at.
+            assert_eq!(first_page.assignments.len(), 1);
+            for row in &first_page.assignments {
+                assert!(row.created_at.is_some());
+            }
+            let first_created_at = first_page.assignments[0].created_at;
+            assert!(first_created_at.is_some());
+
+            // Re-adding the same (subject, role) is idempotent (ignore-on-duplicate) and
+            // must NOT rewrite the tuple, so the timestamp must be unchanged.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[(UserOrRoleId::User(user_id.clone()), role.id)],
+                )
+                .await
+                .unwrap();
+
+            let second_page = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role.id),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(second_page.assignments.len(), 1);
+            let second_created_at = second_page.assignments[0].created_at;
+            assert!(second_created_at.is_some());
+            assert_eq!(first_created_at, second_created_at);
+        }
+
+        /// `ByAssignee` lists every role a subject is assigned to (the inverse
+        /// axis of `ByRole`), parsing the role from the tuple's `object`.
+        #[tokio::test]
+        async fn list_role_assignments_by_assignee_returns_roles() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "by_assignee_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[
+                        (UserOrRoleId::User(user_id.clone()), role_a.id),
+                        (UserOrRoleId::User(user_id.clone()), role_b.id),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let page = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByAssignee(UserOrRoleId::User(user_id.clone())),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+
+            let roles: HashSet<RoleId> = page.assignments.iter().map(|r| r.role_id).collect();
+            assert_eq!(roles, HashSet::from([role_a.id, role_b.id]));
+            // Every row's subject is exactly the queried user.
+            for row in &page.assignments {
+                assert_eq!(row.subject, UserOrRoleId::User(user_id.clone()));
+            }
+        }
+
+        /// Round-trip: a role-member assignment can be added, listed, removed, and
+        /// removing it again is idempotent (ignore-on-missing).
+        #[tokio::test]
+        async fn remove_role_assignments_round_trip() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let user_id = UserId::new_unchecked("oidc", "remove_rt_user");
+            let metadata = RequestMetadata::test_user(user_id.clone());
+            let role_a = Arc::new(Role::new_random());
+            let role_b = Arc::new(Role::new_random());
+            let edge = [(UserOrRoleId::Role(role_b.id), role_a.id)];
+
+            // B is a member of A.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(&metadata, project_id.clone(), &edge)
+                .await
+                .unwrap();
+
+            let before = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role_a.id),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+            let subjects: HashSet<UserOrRoleId> = before
+                .assignments
+                .iter()
+                .map(|r| r.subject.clone())
+                .collect();
+            assert_eq!(subjects, HashSet::from([UserOrRoleId::Role(role_b.id)]));
+
+            // Remove it.
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .remove_role_assignments(&metadata, project_id.clone(), &edge)
+                .await
+                .unwrap();
+
+            let after = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role_a.id),
+                    PaginationQuery::new_with_page_size(100),
+                )
+                .await
+                .unwrap();
+            assert!(after.assignments.is_empty());
+
+            // Removing an already-absent edge is a no-op (idempotent).
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .remove_role_assignments(&metadata, project_id.clone(), &edge)
+                .await
+                .unwrap();
+        }
+
+        /// Pagination: a `page_size` of 1 over two assignments yields one row plus
+        /// a continuation token; following the token returns the rest, and the
+        /// union across pages is exactly the full set (no gaps, no duplicates).
+        #[tokio::test]
+        async fn list_role_assignments_paginates() {
+            let authorizer = new_authorizer_in_empty_store().await;
+            let project_id: ArcProjectId = Arc::new(ProjectId::from(uuid::Uuid::now_v7()));
+            let metadata = RequestMetadata::test_user(UserId::new_unchecked("oidc", "pager"));
+            let role = Arc::new(Role::new_random());
+            let u1 = UserId::new_unchecked("oidc", "page_user_1");
+            let u2 = UserId::new_unchecked("oidc", "page_user_2");
+
+            authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .add_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    &[
+                        (UserOrRoleId::User(u1.clone()), role.id),
+                        (UserOrRoleId::User(u2.clone()), role.id),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let first = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role.id),
+                    PaginationQuery::new_with_page_size(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.assignments.len(), 1);
+            let token = first
+                .next_page_token
+                .clone()
+                .expect("page 1 of 2 must yield a continuation token");
+
+            let second = authorizer
+                .role_assignments()
+                .expect("OpenFGA manages role assignments")
+                .list_role_assignments(
+                    &metadata,
+                    project_id.clone(),
+                    RoleAssignmentFilter::ByRole(role.id),
+                    PaginationQuery {
+                        page_token: lakekeeper::api::iceberg::v1::PageToken::Present(token),
+                        page_size: Some(1),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.assignments.len(), 1);
+
+            let subjects: HashSet<UserOrRoleId> = first
+                .assignments
+                .iter()
+                .chain(second.assignments.iter())
+                .map(|r| r.subject.clone())
+                .collect();
+            assert_eq!(
+                subjects,
+                HashSet::from([UserOrRoleId::User(u1), UserOrRoleId::User(u2)])
+            );
         }
     }
 }

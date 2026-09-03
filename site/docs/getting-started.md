@@ -1,14 +1,19 @@
+---
+description: "Deploy Lakekeeper with the self-contained examples, Docker Compose, Kubernetes, a prebuilt binary or from source, and connect your first query engine."
+---
+
 # Getting Started
 
 There are multiple ways to deploy Lakekeeper. Our [self-contained examples](#option-1-examples) are the easiest way to get started and deploy everything you need (including S3, Query Engines, Jupyter, ...). By default, compute outside of the docker network cannot access the example Warehouses due to docker networking.
 
 If you have your own Storage (e.g. S3) available, you can deploy Lakekeeper using [docker compose](#option-2-docker-compose), deploy on [Kubernetes](#option-3-kubernetes), deploy the pre-build [Binary](#option-4-binary) directly or [compile Lakekeeper yourself](#option-5-build-from-sources).
 
-Lakekeeper is currently only compatible with Postgres >= 15.
+Lakekeeper is currently compatible with Postgres >= 15.
 
 ## Deployment
 
 ### Option 1: 🐳 Examples
+
 !!! note
 
     Our docker compose examples are not designed to be used with compute outside of the docker network (e.g. external Spark).
@@ -20,7 +25,7 @@ All docker compose examples come with batteries included (Identity Provider, Sto
 
     ```bash
     git clone https://github.com/lakekeeper/lakekeeper
-    cd examples/access-control-advanced
+    cd lakekeeper/examples/access-control-advanced
     docker compose up -d
     ```
 
@@ -29,7 +34,7 @@ All docker compose examples come with batteries included (Identity Provider, Sto
 
     ```bash
     git clone https://github.com/lakekeeper/lakekeeper
-    cd examples/access-control-simple
+    cd lakekeeper/examples/access-control-simple
     docker compose up -d
     ```
 
@@ -37,15 +42,15 @@ All docker compose examples come with batteries included (Identity Provider, Sto
 
     ```bash
     git clone https://github.com/lakekeeper/lakekeeper
-    cd examples/minimal
+    cd lakekeeper/examples/minimal
     docker compose up -d
     ```
 
 Then open your browser and head to `localhost:8888` to load the example Jupyter notebooks or head to `localhost:8181` for the Lakekeeper UI.
 
-
 ### Option 2: 🐳 Docker Compose
-For a Docker-Compose deployment that is used with external object storage, and external Identity Providers, you can use the [`docker-compose` Setup](https://github.com/lakekeeper/lakekeeper/tree/main/docker-compose). Please also check the [Examples](#option-1-examples) and our [User Guides](./docs/nightly/docs/configuration.md) for additional information on customization.
+
+For a Docker-Compose deployment that is used with external object storage, and external Identity Providers, you can use the [`docker-compose` Setup](https://github.com/lakekeeper/lakekeeper/tree/main/docker-compose). Please also check the [Examples](#option-1-examples) and our [User Guides](./docs/nightly/configuration.md) for additional information on customization.
 
 While you can start the "🐳 Unsecured" variant without any external dependencies, you will need at least an external object store (S3, ADLS, GCS) to create a Warehouse.
 
@@ -53,17 +58,17 @@ While you can start the "🐳 Unsecured" variant without any external dependenci
 
     ```bash
     git clone https://github.com/lakekeeper/lakekeeper
-    cd docker-compose
+    cd lakekeeper/docker-compose
     docker compose up -d
     ```
 
 === "🐳 Authentication & Authorization"
 
-    Please follow the [Authentication Guide](./docs/nightly/docs/authentication.md) to prepare your Identity Provider. Additional environment variables might be required.
+    Please follow the [Authentication Guide](./docs/nightly/authentication.md) to prepare your Identity Provider. Additional environment variables might be required.
 
     ```bash
     git clone https://github.com/lakekeeper/lakekeeper
-    cd docker-compose
+    cd lakekeeper/docker-compose
     export LAKEKEEPER__OPENID_PROVIDER_URI=... (required)
     export LAKEKEEPER__OPENID_AUDIENCE=... (recommended)
     export LAKEKEEPER__UI__OPENID_CLIENT_ID=... (required if UI is used)
@@ -72,13 +77,14 @@ While you can start the "🐳 Unsecured" variant without any external dependenci
     ```
 
 ### Option 3: ☸️ Kubernetes
+
 We recommend deploying the catalog on Kubernetes using our [Helm Chart](https://github.com/lakekeeper/lakekeeper-charts/tree/main/charts/lakekeeper). Please check the Helm Chart's documentation for possible values. To enable Authentication and Authorization, an external identity provider is required.
 
 A community driven [Kubernetes Operator](https://github.com/lakekeeper/lakekeeper-operator) is currently in development.
 
-
 ### Option 4: ⚙️ Binary
-For single node deployments, you can also download the Binary for your architecture from [Github Releases](https://github.com/lakekeeper/lakekeeper/releases). A basic configuration via environment variables would look like this:
+
+For single node deployments, you can also download the Binary for your architecture from [GitHub Releases](https://github.com/lakekeeper/lakekeeper/releases). A basic configuration via environment variables would look like this:
 
 ```bash
 export LAKEKEEPER__PG_DATABASE_URL_READ="postgres://postgres_user:postgres_urlencoded_password@hostname:5432/catalog_database"
@@ -90,29 +96,35 @@ export LAKEKEEPER__PG_ENCRYPTION_KEY="MySecretEncryptionKeyThatIBetterNotLoose"
 ```
 
 To expose Lakekeeper behind a reverse proxy, most deployments also set:
+
 ```bash
-export LAKEKEEPER__BASE_URI=<https://<Url-where-Lakekeeper-is-externally-reachable>
+export LAKEKEEPER__BASE_URI="http://<Url-where-Lakekeeper-is-externally-reachable>"
 ```
-The default `LAKEKEEPER__BASE_URI` is `https://localhost:8181`.
+
+The default `LAKEKEEPER__BASE_URI` is `http://localhost:8181`.
 
 ### Option 5: 👨‍💻 Build from Sources
-To customize Lakekeeper, for example to connect to your own Authorization system, you might want to build the binary yourself. Please check the [Developer Guide](./docs/nightly/docs/developer-guide.md) for more information. 
+
+To customize Lakekeeper, for example to connect to your own Authorization system, you might want to build the binary yourself. Please check the [Developer Guide](./docs/nightly/developer-guide.md) for more information.
 
 ## First Steps
 
 Now that the catalog is up-and-running, the following endpoints are available:
 
-1. `<LAKEKEEPER__BASE_URI>/ui/` - the UI - by default: [http://localhost:8181/ui/](https://localhost:8181/ui/)
+1. `<LAKEKEEPER__BASE_URI>/ui/` - the UI - by default: [http://localhost:8181/ui/](http://localhost:8181/ui/)
 1. `<LAKEKEEPER__BASE_URI>/catalog` is the Iceberg REST API
 1. `<LAKEKEEPER__BASE_URI>/management` contains the management API
+1. `<LAKEKEEPER__BASE_URI>/lakekeeper` is the Data API (e.g. generic, non-Iceberg tables)
 1. `<LAKEKEEPER__BASE_URI>/swagger-ui` hosts Swagger to inspect the API specifications
 
 ### Bootstrapping
+
 Our self-contained docker compose examples are already bootstrapped and require no further actions.
 
 After the initial deployment, Lakekeeper needs to be bootstrapped. This can be done via the UI or the bootstrap endpoint. Among others, bootstrapping sets the initial administrator of Lakekeeper and creates the first project. Please find more information on bootstrapping in the [Bootstrap Docs](docs/nightly/bootstrap.md).
 
 ### Creating a Warehouse
+
 Now that the server is running, we need to create a new warehouse. We recommend to do this via the UI.
 
 <br>
@@ -121,7 +133,6 @@ Now that the server is running, we need to create a new warehouse. We recommend 
   <figcaption>Create a Warehouse via UI</figcaption>
 </figure>
 <br>
-
 
 Alternatively, we can use the REST-API directly. For an S3 backed warehouse, create a file called `create-warehouse-request.json`:
 
@@ -156,7 +167,11 @@ If you want to use a different storage backend, see the [Storage Guide](docs/nig
 
 ### Connect Compute
 
-That's it - we can now use the catalog:
+That's it - we can now use the catalog. The example below targets the **unsecured** deployment: it sends the literal token `dummy` because no Authentication is configured, so any bearer token is accepted. If you enabled Authentication, replace `"dummy"` with a real OAuth2 token (or configure your engine's OAuth2 flow) — see the [Authentication Guide](./docs/nightly/authentication.md).
+
+!!! tip
+
+    `ICEBERG_VERSION` below pins a known-good Iceberg release. Check [Iceberg releases](https://iceberg.apache.org/releases/) for the latest version.
 
 ```python
 import pandas as pd
@@ -164,7 +179,7 @@ import pyspark
 
 SPARK_VERSION = pyspark.__version__
 SPARK_MINOR_VERSION = '.'.join(SPARK_VERSION.split('.')[:2])
-ICEBERG_VERSION = "1.6.1"
+ICEBERG_VERSION = "1.10.1"
 
 # if you use adls as storage backend, you need iceberg-azure instead of iceberg-aws-bundle
 configuration = {
@@ -174,7 +189,7 @@ configuration = {
     "spark.sql.catalog.demo": "org.apache.iceberg.spark.SparkCatalog",
     "spark.sql.catalog.demo.catalog-impl": "org.apache.iceberg.rest.RESTCatalog",
     "spark.sql.catalog.demo.uri": "http://localhost:8181/catalog/",
-    "spark.sql.catalog.demo.token": "dummy",
+    "spark.sql.catalog.demo.token": "dummy",  # unsecured deployment only; use a real token if Authentication is enabled
     "spark.sql.catalog.demo.warehouse": "my-warehouse",
 }
 spark_conf = pyspark.SparkConf()

@@ -12,19 +12,21 @@ use crate::{
     api::Result,
     server::{io::remove_all, maybe_get_secret},
     service::{
-        tasks::TaskQueueName, CatalogStore, CatalogWarehouseOps, SecretStore, WarehouseIdNotFound,
-        WarehouseStatus,
+        CatalogStore, CatalogWarehouseOps, SecretStore, WarehouseIdNotFound, WarehouseStatus,
+        tasks::{TaskEntity, TaskQueueName},
     },
 };
 
 const QN_STR: &str = "tabular_purge";
-pub(crate) static QUEUE_NAME: LazyLock<TaskQueueName> = LazyLock::new(|| QN_STR.into());
+pub static QUEUE_NAME: LazyLock<TaskQueueName> = LazyLock::new(|| QN_STR.into());
 #[cfg(feature = "open-api")]
 pub(crate) static API_CONFIG: LazyLock<super::QueueApiConfig> =
     LazyLock::new(|| super::QueueApiConfig {
         queue_name: &QUEUE_NAME,
         utoipa_type_name: PurgeQueueConfig::name(),
         utoipa_schema: PurgeQueueConfig::schema(),
+        scope: super::QueueScope::Warehouse,
+        user_scheduling: super::UserScheduling::Disabled,
     });
 
 pub type TabularPurgeTask =
@@ -83,14 +85,29 @@ pub(crate) async fn tabular_purge_worker<C: CatalogStore, S: SecretStore>(
             return;
         };
 
-        let span = tracing::debug_span!(
-            QN_STR,
-            location = %task.data.tabular_location,
-            warehouse_id = %task.task_metadata.warehouse_id,
-            entity_type = %task.task_metadata.entity_id.entity_type().to_string(),
-            attempt = %task.attempt(),
-            task_id = %task.task_id(),
-        );
+        let span = if let Some((warehouse_id, entity_id, entity_name)) =
+            task.task_metadata.warehouse_task_sub_entity()
+        {
+            let entity_id_uuid = entity_id.as_uuid();
+            let entity_type = entity_id.entity_type().to_string();
+            let entity_name = entity_name.join(".");
+            tracing::debug_span!(
+                QN_STR,
+                warehouse_id = %warehouse_id,
+                entity_type = %entity_type,
+                entity_id = %entity_id_uuid,
+                entity_name = %entity_name,
+                attempt = %task.attempt(),
+                task_id = %task.task_id(),
+            )
+        } else {
+            tracing::debug_span!(
+                QN_STR,
+                entity_type = "Not Specified",
+                attempt = %task.attempt(),
+                task_id = %task.task_id(),
+            )
+        };
 
         instrumented_purge::<_, C>(catalog_state.clone(), &secret_state, &task)
             .instrument(span.or_current())
@@ -117,16 +134,13 @@ async fn instrumented_purge<S: SecretStore, C: CatalogStore>(
                 "Error in `{QN_STR}` worker. Failed to purge location {}. {err}",
                 task.data.tabular_location,
             );
-            task.record_failure::<C>(
-                catalog_state,
-                &format!(
-                    "Failed to purge tabular at location `{}`.\n{err}",
-                    task.data.tabular_location
-                ),
-            )
-            .await;
+            let detail = format!(
+                "Failed to purge tabular at location `{}`.\nError: {}",
+                task.data.tabular_location, err.error
+            );
+            task.record_failure::<C>(catalog_state, &detail).await;
         }
-    };
+    }
 }
 
 async fn purge<C, S>(
@@ -139,7 +153,23 @@ where
     S: SecretStore,
 {
     let tabular_location_str = &task.data.tabular_location;
-    let warehouse_id = task.task_metadata.warehouse_id;
+
+    let warehouse_id = match &task.task_metadata.entity {
+        TaskEntity::Warehouse { .. } | TaskEntity::Project => {
+            return Err(ErrorModel::internal(
+                format!("Unexpected task scope for `{QN_STR}` task. Task must have a table or view scope."),
+                "UnexpectedTaskScopeForPurge",
+                None,
+            )
+            .into());
+        }
+        TaskEntity::EntityInWarehouse {
+            warehouse_id,
+            entity_id: _,
+            entity_name: _,
+        } => *warehouse_id,
+    };
+
     let warehouse = C::get_warehouse_by_id(
         warehouse_id,
         WarehouseStatus::active_and_inactive(),
@@ -169,10 +199,11 @@ where
                 "Failed to get storage secret for warehouse {warehouse_id} for Tabular Purge task."
             ))
         })?;
+    let secret_ref = secret.as_deref();
 
     let file_io = warehouse
         .storage_profile
-        .file_io(secret.as_ref())
+        .file_io(secret_ref)
         .await
         .map_err(|e| {
             IcebergErrorResponse::from(e).append_detail(format!(

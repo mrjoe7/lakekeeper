@@ -1,32 +1,65 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use aws_config::{
-    retry::RetryConfig, sts::AssumeRoleProvider, timeout::TimeoutConfig, AppName, BehaviorVersion,
-    SdkConfig,
+    AppName, BehaviorVersion, SdkConfig, retry::RetryConfig, sts::AssumeRoleProvider,
+    timeout::TimeoutConfig,
 };
 use aws_sdk_s3::config::{
-    IdentityCache, SharedAsyncSleep, SharedCredentialsProvider, SharedHttpClient,
-    SharedIdentityCache,
+    IdentityCache, RequestChecksumCalculation, SharedAsyncSleep, SharedCredentialsProvider,
+    SharedHttpClient, http::HttpRequest,
 };
 use aws_smithy_async::{
     rt::sleep::{self, TokioSleep},
     time::SharedTimeSource,
 };
+use aws_smithy_runtime_api::{
+    box_error::BoxError,
+    client::{
+        interceptors::{Intercept, context::BeforeTransmitInterceptorContextMut},
+        orchestrator::Metadata,
+        runtime_components::RuntimeComponents,
+    },
+};
+use aws_smithy_types::{base64, config_bag::ConfigBag};
 use veil::Redact;
 
 mod s3_error;
 mod s3_location;
 mod s3_storage;
-pub use s3_location::{validate_bucket_name, InvalidBucketName, S3Location};
+pub use s3_location::{InvalidBucketName, S3Location, validate_bucket_name};
 pub use s3_storage::S3Storage;
 
-static IDENTITY_CACHE: LazyLock<SharedIdentityCache> =
-    LazyLock::new(|| IdentityCache::lazy().build());
+// Seed the smithy trust store with webpki roots on top of the OS-native roots.
+// `rustls-native-certs` returns an empty list on minimal images that lack a CA
+// bundle (e.g. UBI-micro), so without this fallback every public TLS handshake
+// fails with `InvalidCertificate(UnknownIssuer)`. Native roots stay enabled to
+// honor `SSL_CERT_FILE` / `SSL_CERT_DIR` and host-installed CAs.
+fn smithy_trust_store() -> aws_smithy_http_client::tls::TrustStore {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().fold(
+        aws_smithy_http_client::tls::TrustStore::default(),
+        |ts, der| {
+            let b64 = base64::encode(der.as_ref());
+            let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+            ts.with_pem_certificate(pem)
+        },
+    )
+}
+
 static SMITHY_HTTP_CLIENT: LazyLock<SharedHttpClient> = LazyLock::new(|| {
+    let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
+        .with_trust_store(smithy_trust_store())
+        .build()
+        .expect("valid TLS context");
     aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
+        .tls_context(tls_context)
+        .pool_idle_timeout(Duration::from_mins(1))
         .build_https()
 });
 
@@ -40,9 +73,24 @@ static SLEEP_IMPL: LazyLock<SharedAsyncSleep> =
 
 const S3_CUSTOM_SCHEMES: [&str; 2] = ["s3a", "s3n"];
 
-/// Macro to apply common AWS configuration to any builder that supports these methods
+/// Shared identity cache for system identity (IMDS/ECS task role).
+/// Safe as a global static because there is only one system identity,
+/// so only one cache partition is ever created.
+static SYSTEM_IDENTITY_CACHE: LazyLock<aws_sdk_s3::config::SharedIdentityCache> =
+    LazyLock::new(|| IdentityCache::lazy().build());
+
+/// Macro to apply common AWS configuration to any builder that supports these methods.
+/// Uses `no_cache` by default to avoid the unbounded partition growth described in
+/// `<https://github.com/smithy-lang/smithy-rs/issues/4340>`.
+/// Pass `system_identity` to use a shared cache for IMDS/ECS credential resolution.
 macro_rules! apply_aws_config {
     ($builder:expr, $region:expr) => {
+        apply_aws_config!($builder, $region, IdentityCache::no_cache())
+    };
+    ($builder:expr, $region:expr, system_identity) => {
+        apply_aws_config!($builder, $region, SYSTEM_IDENTITY_CACHE.clone())
+    };
+    ($builder:expr, $region:expr, $identity_cache:expr) => {
         $builder
             .region($region)
             .retry_config(RETRY_CONFIG.clone())
@@ -51,7 +99,7 @@ macro_rules! apply_aws_config {
             .sleep_impl(SLEEP_IMPL.clone())
             .behavior_version(BehaviorVersion::latest())
             .http_client((*SMITHY_HTTP_CLIENT).clone())
-            .identity_cache(IDENTITY_CACHE.clone())
+            .identity_cache($identity_cache)
             .app_name(AppName::new("lakekeeper").unwrap())
     };
 }
@@ -86,6 +134,10 @@ pub struct S3AccessKeyAuth {
     pub aws_access_key_id: String,
     #[redact(partial)]
     pub aws_secret_access_key: String,
+    /// Session token for temporary credentials (vended via STS).
+    #[builder(default)]
+    #[redact(partial)]
+    pub aws_session_token: Option<String>,
     #[builder(default)]
     #[redact(partial)]
     pub external_id: Option<String>,
@@ -97,13 +149,33 @@ pub struct S3Settings {
     #[builder(default)]
     pub assume_role_arn: Option<String>,
     #[builder(default)]
+    /// STS Session Tags to pass when assuming a role.
+    /// Each tag is a key-value pair.
+    /// Only has effect if `assume_role_arn` is set.
+    pub sts_session_tags: BTreeMap<String, String>,
+    #[builder(default)]
     pub endpoint: Option<url::Url>,
+    /// Optional separate endpoint for STS requests.
+    /// If not set, the S3 `endpoint` is used for STS as well.
+    #[builder(default)]
+    pub sts_endpoint: Option<url::Url>,
     pub region: String,
     // -------- S3 specific settings --------
     #[builder(default)]
     pub path_style_access: Option<bool>,
     #[builder(default)]
     pub aws_kms_key_arn: Option<String>,
+    #[builder(default)]
+    pub legacy_md5_behavior: Option<bool>,
+    /// Strict s3 compatible behaviour (currently required for Alibaba Cloud OSS):
+    /// - Sets request-checksum calculation to `WhenRequired` instead of the SDK default (`WhenSupported`).
+    ///   The default makes the SDK add a CRC32 checksum to `PutObject`/`UploadPart`
+    ///   and transmit it via `aws-chunked` + `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, which OSS rejects
+    ///   with `NotImplemented: Aws MultiChunkedEncoding ... is not supported`.
+    /// - Applies the [`LegacyMD5Interceptor`] so checksum-required operations such as `DeleteObjects`
+    ///   carry a `Content-MD5` header, which OSS requires (it returns `MissingArgument` otherwise).
+    #[builder(default)]
+    pub s3_compat_checksums: bool,
 }
 
 impl S3Settings {
@@ -116,6 +188,15 @@ impl S3Settings {
             s3_builder.set_force_path_style(Some(true));
         }
 
+        if self.legacy_md5_behavior.unwrap_or(false) || self.s3_compat_checksums {
+            s3_builder = s3_builder.interceptor(LegacyMD5Interceptor);
+        }
+
+        if self.s3_compat_checksums {
+            s3_builder =
+                s3_builder.request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
+        }
+
         let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
         S3Storage::new(client, self.aws_kms_key_arn.clone())
     }
@@ -123,11 +204,15 @@ impl S3Settings {
     pub async fn get_sdk_config(&self, s3_credential: Option<&S3Auth>) -> SdkConfig {
         let S3Settings {
             assume_role_arn,
+            sts_session_tags,
             endpoint,
+            sts_endpoint,
             region,
             // S3 specific settings
             path_style_access: _,
             aws_kms_key_arn: _,
+            legacy_md5_behavior: _,
+            s3_compat_checksums: _,
         } = self;
 
         let region = aws_config::Region::new(region.clone());
@@ -136,12 +221,13 @@ impl S3Settings {
             Some(S3Auth::AccessKey(S3AccessKeyAuth {
                 aws_access_key_id,
                 aws_secret_access_key,
+                aws_session_token,
                 external_id: _, // External ID handled below in assume role path
             })) => {
                 let aws_credentials = aws_credential_types::Credentials::new(
                     aws_access_key_id,
                     aws_secret_access_key,
-                    None,
+                    aws_session_token.clone(),
                     None,
                     "lakekeeper-secret-storage",
                 );
@@ -157,7 +243,8 @@ impl S3Settings {
             Some(S3Auth::AwsSystemIdentity(S3AwsSystemIdentityAuth {
                 external_id: _, // External ID handled below in this function in the assume role path
             })) => {
-                let mut builder = apply_aws_config!(aws_config::from_env(), region);
+                let mut builder =
+                    apply_aws_config!(aws_config::from_env(), region, system_identity);
                 if let Some(endpoint) = endpoint {
                     builder = builder.endpoint_url(endpoint.to_string());
                 }
@@ -173,12 +260,28 @@ impl S3Settings {
         };
 
         if let Some(assume_role_arn) = assume_role_arn {
+            // If a separate STS endpoint is configured, build a dedicated SdkConfig
+            // so that STS calls go to the correct endpoint.
+            let sts_sdk_config;
+            let configure_from = if let Some(sts_ep) = sts_endpoint {
+                sts_sdk_config = sdk_config
+                    .to_builder()
+                    .endpoint_url(sts_ep.to_string())
+                    .build();
+                &sts_sdk_config
+            } else {
+                &sdk_config
+            };
             let mut assume_role_provider = AssumeRoleProvider::builder(assume_role_arn)
-                .configure(&sdk_config)
+                .configure(configure_from)
                 .session_name("lakekeeper-assume-role");
 
             if let Some(external_id) = s3_credential.and_then(S3Auth::external_id) {
                 assume_role_provider = assume_role_provider.external_id(external_id);
+            }
+            if !sts_session_tags.is_empty() {
+                let tags = sts_session_tags.iter();
+                assume_role_provider = assume_role_provider.tags(tags);
             }
             let assume_role_provider = assume_role_provider.build().await;
 
@@ -190,6 +293,81 @@ impl S3Settings {
             sdk_config
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct LegacyMD5Interceptor;
+
+impl LegacyMD5Interceptor {
+    /// This function mutates the request to insert a Content-MD5 header if one is not present.
+    fn calculate_md5_checksum(http_request: &mut HttpRequest) {
+        // Return early if a Content-MD5 header is already present
+        if http_request.headers().contains_key("Content-MD5") {
+            return;
+        }
+
+        // Check if the body is present if it isn't (streaming request) we skip adding the header
+        if let Some(bytes) = http_request.body().bytes() {
+            let md5 = md5::compute(bytes);
+            let checksum_value = base64::encode(md5.as_slice());
+            http_request
+                .headers_mut()
+                .append("Content-MD5", checksum_value);
+        }
+    }
+}
+
+impl Intercept for LegacyMD5Interceptor {
+    fn name(&self) -> &'static str {
+        "LegacyMD5Interceptor"
+    }
+
+    fn modify_before_signing(
+        &self,
+        ctx: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        if let Some(metadata) = cfg.load::<Metadata>()
+            && metadata.service().eq("S3")
+            && is_checksum_required(metadata.name())
+        {
+            Self::calculate_md5_checksum(ctx.request_mut());
+        }
+
+        Ok(())
+    }
+}
+
+/// Check if a checksum is required for the given S3 operation.
+/// The list of operations requiring a checksum is based on the AWS S3 model definition,
+/// see `https://github.com/smithy-lang/smithy-rs/blob/main/aws/sdk/aws-models/s3.json`
+pub(crate) fn is_checksum_required(operation: &str) -> bool {
+    matches!(
+        operation,
+        "CreateBucketMetadataTableConfiguration"
+            | "DeleteObjects"
+            | "PutBucketAcl"
+            | "PutBucketCors"
+            | "PutBucketEncryption"
+            | "PutBucketLifecycleConfiguration"
+            | "PutBucketLogging"
+            | "PutBucketOwnershipControls"
+            | "PutBucketPolicy"
+            | "PutBucketReplication"
+            | "PutBucketRequestPayment"
+            | "PutBucketTagging"
+            | "PutBucketVersioning"
+            | "PutBucketWebsite"
+            | "PutObjectAcl"
+            | "PutObjectLegalHold"
+            | "PutObjectLockConfiguration"
+            | "PutObjectRetention"
+            | "PutObjectTagging"
+            | "PutPublicAccessBlock"
+            | "UpdateBucketMetadataInventoryTableConfiguration"
+            | "UpdateBucketMetadataJournalTableConfiguration"
+    )
 }
 
 /// Validate the S3 region.

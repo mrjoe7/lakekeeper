@@ -11,10 +11,10 @@ use google_cloud_auth::{
     token::DefaultTokenSourceProvider, token_source::TokenSource as GCloudAuthTokenSource,
 };
 use google_cloud_token::{TokenSource as GCloudTokenSource, TokenSourceProvider as _};
-use iceberg_ext::configs::table::{gcs, TableProperties};
+use iceberg_ext::configs::table::{TableProperties, creds, gcs};
 use lakekeeper_io::{
-    gcs::{validate_bucket_name, CredentialsFile, GCSSettings, GcsAuth, GcsStorage},
     InvalidLocationError, Location,
+    gcs::{CredentialsFile, GCSSettings, GcsAuth, GcsStorage, validate_bucket_name},
 };
 use serde::{Deserialize, Serialize};
 pub(super) use sts::STSResponse;
@@ -22,22 +22,23 @@ use url::Url;
 use veil::Redact;
 
 use crate::{
+    CONFIG, WarehouseId,
     api::{
+        CatalogConfig, RequestMetadata,
         iceberg::{supported_endpoints, v1::tables::DataAccessMode},
-        CatalogConfig,
     },
-    service::storage::{
-        cache::{
-            get_stc_from_cache, insert_stc_into_cache, STCCacheKey, STCCacheValue,
-            ShortTermCredential,
+    service::{
+        BasicTabularInfo,
+        storage::{
+            ShortTermCredentialsRequest, TableConfig,
+            cache::{CachedStc, GCS_STC_CACHE, STCCacheKey, get_or_load_stc},
+            error::{
+                CredentialsError, InvalidProfileError, TableConfigError, UpdateError,
+                ValidationError,
+            },
+            storage_layout::StorageLayout,
         },
-        error::{
-            CredentialsError, IcebergFileIoError, InvalidProfileError, TableConfigError,
-            UpdateError, ValidationError,
-        },
-        ShortTermCredentialsRequest, TableConfig,
     },
-    WarehouseId, CONFIG,
 };
 
 mod sts;
@@ -59,6 +60,18 @@ pub struct GcsProfile {
     pub bucket: String,
     /// Subpath in the bucket to use.
     pub key_prefix: Option<String>,
+    /// Enable STS (Security Token Service) downscoped token generation for GCS.
+    /// When disabled, clients cannot use vended credentials for this storage profile.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub sts_enabled: bool,
+    /// Storage layout for namespace and tabular paths.
+    #[serde(default)]
+    pub storage_layout: Option<StorageLayout>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Hash, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,13 +227,17 @@ impl GcsProfile {
     /// Validate the GCS profile with credentials.
     /// # Errors
     /// - Fails if the bucket or key prefix changed
-    pub fn update_with(self, other: Self) -> Result<Self, UpdateError> {
+    pub fn update_with(self, mut other: Self) -> Result<Self, UpdateError> {
         if self.bucket != other.bucket {
             return Err(UpdateError::ImmutableField("bucket".to_string()));
         }
 
         if self.key_prefix != other.key_prefix {
             return Err(UpdateError::ImmutableField("key_prefix".to_string()));
+        }
+
+        if other.storage_layout.is_none() {
+            other.storage_layout = self.storage_layout;
         }
 
         Ok(other)
@@ -252,6 +269,7 @@ impl GcsProfile {
             defaults: HashMap::with_capacity(0),
             overrides: HashMap::with_capacity(0),
             endpoints: supported_endpoints().to_vec(),
+            idempotency_key_lifetime: None,
         }
     }
 
@@ -333,22 +351,31 @@ impl GcsProfile {
         data_access: DataAccessMode,
         credential: &GcsCredential,
         stc_request: &ShortTermCredentialsRequest,
+        tabular_info: &impl BasicTabularInfo,
+        request_metadata: &RequestMetadata,
     ) -> Result<TableConfig, TableConfigError> {
         let mut table_properties = TableProperties::default();
 
-        if !data_access.provide_credentials() {
+        if !data_access.provide_credentials() || !self.sts_enabled {
+            tracing::debug!(
+                "Not providing GCS credentials - provide_credentials: {}, sts_enabled: {}",
+                data_access.provide_credentials(),
+                self.sts_enabled
+            );
             return Ok(TableConfig {
                 creds: table_properties.clone(),
                 config: table_properties,
+                credentials_expiration_ms: None,
+                remote_signing: None,
             });
         }
 
         let cache_key = STCCacheKey::new(stc_request.clone(), self.into(), Some(credential.into()));
-        let cached_sts_token = self.load_sts_response_token_from_cache(&cache_key).await;
 
-        let response = if let Some(token) = cached_sts_token {
-            token
-        } else {
+        // Single-flight read-through: concurrent identical requests coalesce onto
+        // one STS downscope (the most expensive miss in the system) per cache key.
+        // The typed cache returns the `CachedSTSResponse` directly — no variant check.
+        let response = get_or_load_stc(&GCS_STC_CACHE, cache_key, || async {
             let (source, project_id) = self.get_token_source(credential).await?;
             let token = sts::downscope(source, &self.bucket, stc_request).await?;
 
@@ -368,29 +395,36 @@ impl GcsProfile {
                 project_id,
                 expires_at_system_time,
             };
-
-            if CONFIG.cache.stc.enabled {
-                let cache_value = STCCacheValue::new(
-                    ShortTermCredential::Gcs(token.clone()),
-                    Instant::now().checked_add(sts_validity_duration),
-                );
-                insert_stc_into_cache(cache_key, cache_value).await;
-            }
-
-            token
-        };
+            Ok::<_, TableConfigError>(CachedStc::new(
+                token,
+                Instant::now().checked_add(sts_validity_duration),
+            ))
+        })
+        .await?;
 
         table_properties.insert(&gcs::Token(response.token.access_token));
         if let Some(project_id) = response.project_id {
             table_properties.insert(&gcs::ProjectId(project_id));
         }
 
+        let mut credentials_expiration_ms: Option<i64> = None;
         if let Some(expiry) = response.expires_at_system_time {
             match expiry.duration_since(std::time::UNIX_EPOCH) {
                 Ok(expiry_since_epoch) => {
                     table_properties.insert(&gcs::TokenExpiresAt(
                         expiry_since_epoch.as_millis().to_string(),
                     ));
+                    match i64::try_from(expiry_since_epoch.as_millis()) {
+                        Ok(expiration) => {
+                            table_properties.insert(&creds::ExpirationTimeMs(expiration));
+                            credentials_expiration_ms = Some(expiration);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Calculated expiry time for STS token is outside of valid range: {e:?}. SystemTime: {expiry:?}.",
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -400,37 +434,20 @@ impl GcsProfile {
             }
         }
 
+        table_properties.insert(&gcs::RefreshCredentialsEndpoint(
+            request_metadata.refresh_client_credentials_endpoint_for_table(
+                tabular_info.warehouse_id(),
+                tabular_info.tabular_ident(),
+            ),
+        ));
+
         Ok(TableConfig {
             // Due to backwards compat reasons we still return creds within config too
             config: table_properties.clone(),
             creds: table_properties,
+            credentials_expiration_ms,
+            remote_signing: None,
         })
-    }
-
-    async fn load_sts_response_token_from_cache(
-        &self,
-        cache_key: &STCCacheKey,
-    ) -> Option<CachedSTSResponse> {
-        let stc_request = &cache_key.request;
-        if CONFIG.cache.stc.enabled {
-            if let Some(STCCacheValue {
-                credentials: ShortTermCredential::Gcs(sts_response),
-                ..
-            }) = get_stc_from_cache(cache_key).await
-            {
-                tracing::debug!("Using cached short term credentials for request: {stc_request}");
-                return Some(sts_response);
-            }
-            tracing::debug!(
-                "No cached STS token found for request: {stc_request}, fetching new credentials"
-            );
-        } else {
-            tracing::debug!(
-                "STC caching disabled, fetching new STS token for request: {stc_request}"
-            );
-        }
-
-        None
     }
 
     fn normalize_key_prefix(&mut self) -> Result<(), ValidationError> {
@@ -445,23 +462,23 @@ impl GcsProfile {
             }
         }
 
-        if let Some(key_prefix) = self.key_prefix.as_ref() {
-            if key_prefix.is_empty() {
-                self.key_prefix = None;
-            }
+        if let Some(key_prefix) = self.key_prefix.as_ref()
+            && key_prefix.is_empty()
+        {
+            self.key_prefix = None;
         }
 
         // GCS supports a max of 1024 chars and we need some buffer for tables.
-        if let Some(key_prefix) = self.key_prefix.as_ref() {
-            if key_prefix.len() > 896 {
-                return Err(InvalidProfileError {
-                    source: None,
-                    reason: "Storage Profile `key_prefix` must be less than 896 characters."
-                        .to_string(),
-                    entity: "key_prefix".to_string(),
-                }
-                .into());
+        if let Some(key_prefix) = self.key_prefix.as_ref()
+            && key_prefix.len() > 896
+        {
+            return Err(InvalidProfileError {
+                source: None,
+                reason: "Storage Profile `key_prefix` must be less than 896 characters."
+                    .to_string(),
+                entity: "key_prefix".to_string(),
             }
+            .into());
         }
         Ok(())
     }
@@ -493,12 +510,24 @@ impl GcsProfile {
     }
 }
 
-pub(super) fn get_file_io_from_table_config(
+/// Build a `GcsStorage` client from vended-credentials properties.
+///
+/// Reads the downscoped `OAuth2` access token from the iceberg-format
+/// `TableProperties` previously produced by `generate_table_config`.
+pub(super) async fn lakekeeper_io_from_vended_table_config(
     config: &TableProperties,
-) -> Result<iceberg::io::FileIO, IcebergFileIoError> {
-    Ok(iceberg::io::FileIOBuilder::new("gcs")
-        .with_props(config.inner())
-        .build()?)
+) -> Result<GcsStorage, CredentialsError> {
+    let access_token = config.get_prop_opt::<gcs::Token>().ok_or_else(|| {
+        CredentialsError::ShortTermCredential {
+            reason: "GCS vended credentials are missing the OAuth2 access token.".to_string(),
+            source: None,
+        }
+    })?;
+    let auth = GcsAuth::BearerToken(lakekeeper_io::gcs::GcsBearerTokenAuth { access_token });
+    GCSSettings {}
+        .get_storage_client(&auth)
+        .await
+        .map_err(Into::into)
 }
 
 impl TryFrom<GcsCredential> for GcsAuth {
@@ -529,8 +558,8 @@ pub(crate) mod test {
         use crate::{
             api::RequestMetadata,
             service::storage::{
-                gcs::{GcsCredential, GcsProfile, GcsServiceKey},
                 StorageCredential, StorageProfile,
+                gcs::{GcsCredential, GcsProfile, GcsServiceKey},
             },
         };
 
@@ -543,6 +572,8 @@ pub(crate) mod test {
             let profile = GcsProfile {
                 bucket,
                 key_prefix: Some(format!("test_prefix/{}", uuid::Uuid::now_v7())),
+                sts_enabled: true,
+                storage_layout: None,
             };
             (profile, cred)
         }
@@ -597,8 +628,8 @@ pub(crate) mod test {
         use crate::{
             api::RequestMetadata,
             service::storage::{
-                gcs::{GcsCredential, GcsProfile, GcsServiceKey},
                 StorageCredential, StorageProfile,
+                gcs::{GcsCredential, GcsProfile, GcsServiceKey},
             },
         };
 
@@ -612,6 +643,8 @@ pub(crate) mod test {
             let profile = GcsProfile {
                 bucket,
                 key_prefix: Some(format!("test_prefix/{}", uuid::Uuid::now_v7())),
+                sts_enabled: true,
+                storage_layout: None,
             };
             (profile, cred)
         }
@@ -648,6 +681,8 @@ mod is_overlapping_location_tests {
         GcsProfile {
             bucket: bucket.to_string(),
             key_prefix: key_prefix.map(ToString::to_string),
+            sts_enabled: true,
+            storage_layout: None,
         }
     }
 

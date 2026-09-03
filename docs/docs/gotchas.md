@@ -1,3 +1,7 @@
+---
+description: "Common Lakekeeper problems and their causes: unexpected 403 responses, Helm and UI issues, and other frequently hit edge cases."
+---
+
 # Gotchas
 
 ## I got permissions but am still getting 403s
@@ -10,7 +14,7 @@ Check out [our routing guide](./configuration.md#routing-and-base-url), both the
 
 ### Examples
 
-##### Local
+#### Local
 
 ```ssh
 k port-forward services/my-lakekeeper 7777:8181
@@ -24,7 +28,7 @@ catalog:
     ICEBERG_REST__BASE_URI: "http://localhost:7777"
 ```
 
-##### Public
+#### Public
 
 ```yaml
 catalog:
@@ -34,6 +38,9 @@ catalog:
     ICEBERG_REST__BASE_URI: "https://lakekeeper.example.com"
 ```
 
+## Identifiers are case-insensitive
+
+All entity names (Warehouses, Namespaces, Tables, Views, Roles) are case-insensitive. If you create a table named `MyTable`, querying for `mytable` or `MYTABLE` will find it. Attempting to create `mytable` in the same namespace where `MyTable` already exists will fail with a conflict error. See [Identifier Case Sensitivity](./concepts.md#identifier-case-sensitivity) for details.
 
 ## I'm using Postgres <15 and the Lakekeeper database migrations fail with syntax error
 
@@ -43,4 +50,4 @@ Caused by:
 1: syntax error at or near "NULLS"
 ```
 
-Lakekeeper is currently only compatible with Postgres >= 15 since we rely on `NULLS not distinct` which was added with PG 15.
+Lakekeeper is currently compatible with Postgres >= 15 since we rely on `NULLS not distinct` which was added with PG 15.

@@ -1,20 +1,37 @@
 #![allow(clippy::needless_for_each)]
+#![allow(deprecated)]
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use http::StatusCode;
+#[cfg(feature = "open-api")]
+use lakekeeper::api::management::v1::PROJECT_ID_HEADER_DESCRIPTION;
 use lakekeeper::{
-    api::{ApiContext, RequestMetadata},
-    axum::{
-        extract::{Path, Query, State as AxumState},
-        routing::{get, post},
-        Extension, Json, Router,
-    },
-    service::{
-        Actor, CatalogStore, NamespaceId, Result, RoleId, SecretStore, State, TableId, UserId,
-        ViewId,
-    },
     ProjectId, WarehouseId,
+    api::{
+        ApiContext, RequestMetadata,
+        management::v1::{
+            check::UserOrRole,
+            lakekeeper_actions::{GetAccessQuery, ParsedAccessQuery},
+            role_membership::reject_system_role_membership,
+        },
+    },
+    axum::{
+        Extension, Json, Router,
+        extract::{Path, State as AxumState},
+        routing::{get, post},
+    },
+    axum_extra::extract::Query,
+    service::{
+        Actor, CachePolicy, CatalogRoleOps, CatalogStore, GenericTableId,
+        GetRoleAcrossProjectsError, NamespaceId, Result, RoleId, SecretStore, State, TableId,
+        TagDefinitionId, ViewId,
+        authz::ActionDescriptor,
+        events::{
+            APIEventContext,
+            context::{APIEventActions, IntrospectPermissions, authz_to_error_no_audit},
+        },
+    },
 };
 use openfga_client::client::{
     CheckRequestTupleKey, ReadRequestTupleKey, TupleKey, TupleKeyWithoutCondition,
@@ -27,18 +44,20 @@ use utoipa::OpenApi;
 use super::{
     check::check,
     relations::{
-        APINamespaceAction as NamespaceAction, APINamespaceRelation as NamespaceRelation,
-        APIProjectAction as ProjectAction, APIProjectRelation as ProjectRelation,
-        APIRoleAction as RoleAction, APIRoleRelation as RoleRelation,
-        APIServerAction as ServerAction, APIServerRelation as ServerRelation,
-        APITableAction as TableAction, APITableRelation as TableRelation,
+        APIGenericTableRelation as GenericTableRelation, APINamespaceAction as NamespaceAction,
+        APINamespaceRelation as NamespaceRelation, APIProjectAction as ProjectAction,
+        APIProjectRelation as ProjectRelation, APIRoleAction as RoleAction,
+        APIRoleRelation as RoleRelation, APIServerAction as ServerAction,
+        APIServerRelation as ServerRelation, APITableAction as TableAction,
+        APITableRelation as TableRelation, APITagRelation as TagRelation,
         APIViewAction as ViewAction, APIViewRelation as ViewRelation,
         APIWarehouseAction as WarehouseAction, APIWarehouseRelation as WarehouseRelation,
-        Assignment, GrantableRelation, NamespaceAssignment,
-        NamespaceRelation as AllNamespaceRelations, ProjectAssignment,
-        ProjectRelation as AllProjectRelations, ReducedRelation, RoleAssignment,
-        RoleRelation as AllRoleRelations, ServerAssignment, ServerRelation as AllServerAction,
-        TableAssignment, TableRelation as AllTableRelations, UserOrRole, ViewAssignment,
+        Assignment, GenericTableAssignment, GenericTableRelation as AllGenericTableRelations,
+        GrantableRelation, NamespaceAssignment, NamespaceRelation as AllNamespaceRelations,
+        ProjectAssignment, ProjectRelation as AllProjectRelations, ReducedRelation,
+        RevocableRelation, RoleAssignment, RoleRelation as AllRoleRelations, ServerAssignment,
+        ServerRelation as AllServerAction, TableAssignment, TableRelation as AllTableRelations,
+        TagAssignment, TagRelation as AllTagRelations, ViewAssignment,
         ViewRelation as AllViewRelations, WarehouseAssignment,
         WarehouseRelation as AllWarehouseRelation,
     },
@@ -46,46 +65,38 @@ use super::{
 #[cfg(feature = "open-api")]
 use crate::check::__path_check;
 use crate::{
-    entities::OpenFgaEntity, models::RoleIdExt as _, OpenFGAAuthorizer, OpenFGAError, OpenFGAResult,
+    OpenFGAAuthorizer, OpenFGAError, OpenFGAResult,
+    entities::OpenFgaEntity,
+    relations::{
+        OpenFGAGenericTableAction, OpenFGANamespaceAction, OpenFGAProjectAction, OpenFGARoleAction,
+        OpenFGAServerAction, OpenFGATableAction, OpenFGAViewAction, OpenFGAWarehouseAction,
+    },
 };
 
 const _MAX_ASSIGNMENTS_PER_RELATION: i32 = 200;
 
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
-#[serde(rename_all = "camelCase")]
-struct GetAccessQuery {
-    /// The user or role to show access for.
-    /// If not specified, shows access for the current user.
-    #[serde(default)]
-    #[cfg_attr(feature = "open-api", param(required = false, value_type=String))]
-    principal_user: Option<UserId>,
-    #[serde(default)]
-    #[cfg_attr(feature = "open-api", param(required = false, value_type=Uuid))]
-    principal_role: Option<RoleId>,
+macro_rules! access_response {
+    ($name:ident, $action_type:ty) => {
+        #[derive(Debug, Clone, Serialize, PartialEq)]
+        #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+        #[serde(rename_all = "kebab-case")]
+        struct $name {
+            allowed_actions: Vec<$action_type>,
+        }
+    };
 }
 
-struct ParsedAccessQuery {
-    principal: Option<UserOrRole>,
-}
-
-impl TryFrom<GetAccessQuery> for ParsedAccessQuery {
-    type Error = OpenFGAError;
-
-    fn try_from(query: GetAccessQuery) -> Result<Self, Self::Error> {
-        let principal = match (query.principal_user, query.principal_role) {
-            (Some(user), None) => Some(UserOrRole::User(user)),
-            (None, Some(role)) => Some(UserOrRole::Role(role.into_assignees())),
-            (Some(_), Some(_)) => {
-                return Err(OpenFGAError::InvalidQuery(
-                    "Cannot specify both user and role in GetAccessQuery".to_string(),
-                ))
-            }
-            (None, None) => None,
-        };
-        Ok(Self { principal })
-    }
-}
+access_response!(GetOpenFGARoleActionsResponse, OpenFGARoleAction);
+access_response!(GetOpenFGAServerActionsResponse, OpenFGAServerAction);
+access_response!(GetOpenFGAProjectActionsResponse, OpenFGAProjectAction);
+access_response!(GetOpenFGAWarehouseActionsResponse, OpenFGAWarehouseAction);
+access_response!(GetOpenFGANamespaceActionsResponse, OpenFGANamespaceAction);
+access_response!(GetOpenFGATableActionsResponse, OpenFGATableAction);
+access_response!(GetOpenFGAViewActionsResponse, OpenFGAViewAction);
+access_response!(
+    GetOpenFGAGenericTableActionsResponse,
+    OpenFGAGenericTableAction
+);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
@@ -257,6 +268,59 @@ struct GetViewAssignmentsResponse {
     assignments: Vec<ViewAssignment>,
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GetGenericTableAssignmentsQuery {
+    /// Relations to be loaded. If not specified, all relations are returned.
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(nullable = false, required = false))]
+    relations: Option<Vec<GenericTableRelation>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+struct GetGenericTableAssignmentsResponse {
+    assignments: Vec<GenericTableAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
+#[serde(rename_all = "camelCase")]
+struct GetTagAssignmentsQuery {
+    /// Relations to be loaded. If not specified, all relations are returned.
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(nullable = false, required = false))]
+    relations: Option<Vec<TagRelation>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, typed_builder::TypedBuilder)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+struct GetTagAssignmentsResponse {
+    assignments: Vec<TagAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+struct UpdateTagAssignmentsRequest {
+    #[serde(default)]
+    writes: Vec<TagAssignment>,
+    #[serde(default)]
+    deletes: Vec<TagAssignment>,
+}
+impl APIEventActions for UpdateTagAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_tag_assignments")
+                .build(),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
@@ -265,6 +329,15 @@ struct UpdateServerAssignmentsRequest {
     writes: Vec<ServerAssignment>,
     #[serde(default)]
     deletes: Vec<ServerAssignment>,
+}
+impl APIEventActions for UpdateServerAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_server_assignments")
+                .build(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -276,6 +349,15 @@ struct UpdateProjectAssignmentsRequest {
     #[serde(default)]
     deletes: Vec<ProjectAssignment>,
 }
+impl APIEventActions for UpdateProjectAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_project_assignments")
+                .build(),
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
@@ -285,6 +367,15 @@ struct UpdateWarehouseAssignmentsRequest {
     writes: Vec<WarehouseAssignment>,
     #[serde(default)]
     deletes: Vec<WarehouseAssignment>,
+}
+impl APIEventActions for UpdateWarehouseAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_warehouse_assignments")
+                .build(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -296,6 +387,15 @@ struct UpdateNamespaceAssignmentsRequest {
     #[serde(default)]
     deletes: Vec<NamespaceAssignment>,
 }
+impl APIEventActions for UpdateNamespaceAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_namespace_assignments")
+                .build(),
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
@@ -305,6 +405,15 @@ struct UpdateTableAssignmentsRequest {
     writes: Vec<TableAssignment>,
     #[serde(default)]
     deletes: Vec<TableAssignment>,
+}
+impl APIEventActions for UpdateTableAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_table_assignments")
+                .build(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -316,6 +425,34 @@ struct UpdateViewAssignmentsRequest {
     #[serde(default)]
     deletes: Vec<ViewAssignment>,
 }
+impl APIEventActions for UpdateViewAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_view_assignments")
+                .build(),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+struct UpdateGenericTableAssignmentsRequest {
+    #[serde(default)]
+    writes: Vec<GenericTableAssignment>,
+    #[serde(default)]
+    deletes: Vec<GenericTableAssignment>,
+}
+impl APIEventActions for UpdateGenericTableAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_generic_table_assignments")
+                .build(),
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
@@ -325,6 +462,15 @@ struct UpdateRoleAssignmentsRequest {
     writes: Vec<RoleAssignment>,
     #[serde(default)]
     deletes: Vec<RoleAssignment>,
+}
+impl APIEventActions for UpdateRoleAssignmentsRequest {
+    fn event_actions(&self) -> Vec<ActionDescriptor> {
+        vec![
+            ActionDescriptor::builder()
+                .action_name("update_role_assignments")
+                .build(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -349,10 +495,13 @@ struct SetManagedAccessRequest {
     managed_access: bool,
 }
 
-/// Get my access to the default project
+/// Get my access to a role
+///
+/// **Deprecated:** Use `/management/v1/permissions/role/{role_id}/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/role/{role_id}/actions` for Catalog permissions instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/role/{role_id}/access",
     params(
         ("role_id" = Uuid, Path, description = "Role ID"),
@@ -361,6 +510,10 @@ struct SetManagedAccessRequest {
             (status = 200, body = GetRoleAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/permissions/role/{role_id}/authorizer-actions and /management/v1/role/{role_id}/actions instead"
+)]
 async fn get_role_access_by_id<C: CatalogStore, S: SecretStore>(
     Path(role_id): Path<RoleId>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -369,14 +522,23 @@ async fn get_role_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetRoleAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_role(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        role_id,
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &role_id.to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
 
+    let (_, relations) = event_ctx.emit_authz(relations)?;
     Ok((
         StatusCode::OK,
         Json(GetRoleAccessResponse {
@@ -385,16 +547,72 @@ async fn get_role_access_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
-/// Get my access to the server
+/// Get allowed Authorizer actions on a role
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified role.
+/// For Catalog permissions, use `/management/v1/role/{role_id}/actions` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/role/{role_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("role_id" = Uuid, Path, description = "Role ID"),
+    ),
+    responses(
+            (status = 200, body = GetOpenFGARoleActionsResponse),
+    )
+))]
+async fn get_authorizer_role_actions<C: CatalogStore, S: SecretStore>(
+    Path(role_id): Path<RoleId>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGARoleActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_role(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        role_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &role_id.to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGARoleActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get my access to the server
+///
+/// **Deprecated:** Use `/management/v1/permissions/server/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/server/actions` for Catalog permissions instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/server/access",
     params(GetAccessQuery),
     responses(
-            (status = 200, description = "Server Access", body = GetServerAccessResponse),
+        (status = 200, description = "Server Access", body = GetServerAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/server/actions and /management/v1/permissions/server/authorizer-actions instead"
+)]
 async fn get_server_access<C: CatalogStore, S: SecretStore>(
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
@@ -403,14 +621,23 @@ async fn get_server_access<C: CatalogStore, S: SecretStore>(
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
     let openfga_server = authorizer.openfga_server().clone();
+
+    let event_ctx = APIEventContext::for_server(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        IntrospectPermissions {},
+        lakekeeper::service::authz::Authorizer::server_id(&authorizer),
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &openfga_server,
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
 
+    let (_, relations) = event_ctx.emit_authz(relations)?;
     Ok((
         StatusCode::OK,
         Json(GetServerAccessResponse {
@@ -419,16 +646,69 @@ async fn get_server_access<C: CatalogStore, S: SecretStore>(
     ))
 }
 
-/// Get my access to the default project
+/// Get allowed Authorizer actions on the server
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the server.
+/// For Catalog permissions, use `/management/v1/server/actions` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/server/authorizer-actions",
+    params(GetAccessQuery),
+    responses(
+            (status = 200, description = "Server Access", body = GetOpenFGAServerActionsResponse),
+    )
+))]
+async fn get_authorizer_server_actions<C: CatalogStore, S: SecretStore>(
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGAServerActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+    let openfga_server = authorizer.openfga_server().clone();
+
+    let event_ctx = APIEventContext::for_server(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        IntrospectPermissions {},
+        lakekeeper::service::authz::Authorizer::server_id(&authorizer),
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &openfga_server,
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGAServerActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get my access to the default project
+///
+/// **Deprecated:** Use `/management/v1/permissions/project/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/project/actions` for Catalog permissions instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/access",
     params(GetAccessQuery),
     responses(
             (status = 200, description = "Server Relations", body = GetProjectAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/project/actions and /management/v1/permissions/project/authorizer-actions instead"
+)]
 async fn get_project_access<C: CatalogStore, S: SecretStore>(
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
@@ -438,15 +718,25 @@ async fn get_project_access<C: CatalogStore, S: SecretStore>(
     let query = ParsedAccessQuery::try_from(query)?;
     let project_id = metadata
         .preferred_project_id()
-        .ok_or(OpenFGAError::NoProjectId)?;
+        .ok_or(OpenFGAError::NoProjectId)
+        .map_err(authz_to_error_no_audit)?;
+
+    let event_ctx = APIEventContext::for_project_arc(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id.clone(),
+        Arc::new(IntrospectPermissions {}),
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &project_id.to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
 
+    let (_, relations) = event_ctx.emit_authz(relations)?;
     Ok((
         StatusCode::OK,
         Json(GetProjectAccessResponse {
@@ -455,19 +745,75 @@ async fn get_project_access<C: CatalogStore, S: SecretStore>(
     ))
 }
 
-/// Get my access to the default project
+/// Get allowed Authorizer actions on the default project
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the default project.
+/// For Catalog permissions, use `/management/v1/project/actions` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/project/authorizer-actions",
+    params(GetAccessQuery, ("x-project-id" = Option<String>, Header, description = "Optional project ID")),
+    responses(
+        (status = 200, description = "Project Authorizer Actions", body = GetOpenFGAProjectActionsResponse),
+    )
+))]
+async fn get_authorizer_project_actions<C: CatalogStore, S: SecretStore>(
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGAProjectActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+    let project_id = metadata
+        .preferred_project_id()
+        .ok_or(OpenFGAError::NoProjectId)
+        .map_err(authz_to_error_no_audit)?;
+
+    let event_ctx = APIEventContext::for_project_arc(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id.clone(),
+        Arc::new(IntrospectPermissions {}),
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &project_id.to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGAProjectActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get my access to a project
+///
+/// **Deprecated:** Use `/management/v1/permissions/project/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/project/actions` for Catalog permissions instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/{project_id}/access",
     params(
         GetAccessQuery,
-        ("project_id" = Uuid, Path, description = "Project ID"),
+        ("project_id" = Option<String>, Path, description = PROJECT_ID_HEADER_DESCRIPTION),
     ),
     responses(
             (status = 200, description = "Server Relations", body = GetProjectAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/project/actions and /management/v1/permissions/project/authorizer-actions instead"
+)]
 async fn get_project_access_by_id<C: CatalogStore, S: SecretStore>(
     Path(project_id): Path<ProjectId>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -476,14 +822,23 @@ async fn get_project_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetProjectAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_project(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id.clone(),
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &project_id.to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
 
+    let (_, relations) = event_ctx.emit_authz(relations)?;
     Ok((
         StatusCode::OK,
         Json(GetProjectAccessResponse {
@@ -493,9 +848,12 @@ async fn get_project_access_by_id<C: CatalogStore, S: SecretStore>(
 }
 
 /// Get my access to a warehouse
+///
+/// **Deprecated:** Use `/management/v1/permissions/warehouse/{warehouse_id}/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/warehouse/{warehouse_id}/actions` for Catalog permissions instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/access",
     params(
         GetAccessQuery,
@@ -505,6 +863,10 @@ async fn get_project_access_by_id<C: CatalogStore, S: SecretStore>(
             (status = 200, body = GetWarehouseAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/warehouse/{warehouse_id}/actions and /management/v1/permissions/warehouse/{warehouse_id}/authorizer-actions instead"
+)]
 async fn get_warehouse_access_by_id<C: CatalogStore, S: SecretStore>(
     Path(warehouse_id): Path<WarehouseId>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -513,14 +875,23 @@ async fn get_warehouse_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetWarehouseAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &warehouse_id.to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
 
+    let (_, relations) = event_ctx.emit_authz(relations)?;
     Ok((
         StatusCode::OK,
         Json(GetWarehouseAccessResponse {
@@ -529,10 +900,59 @@ async fn get_warehouse_access_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
+/// Get allowed Authorizer actions on a warehouse
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified warehouse.
+/// For Catalog permissions, use `/management/v1/warehouse/{warehouse_id}/actions` instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+    ),
+    responses(
+            (status = 200, description = "Warehouse Authorizer Actions", body = GetOpenFGAWarehouseActionsResponse),
+    )
+))]
+async fn get_authorizer_warehouse_actions<C: CatalogStore, S: SecretStore>(
+    Path(warehouse_id): Path<WarehouseId>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGAWarehouseActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &warehouse_id.to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGAWarehouseActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
 /// Get Authorization properties of a warehouse
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}",
     params(
         ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
@@ -547,15 +967,27 @@ async fn get_warehouse_by_id<C: CatalogStore, S: SecretStore>(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<(StatusCode, Json<GetWarehouseAuthPropertiesResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        AllWarehouseRelation::CanGetMetadata,
+    );
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllWarehouseRelation::CanGetMetadata,
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
             &warehouse_id.to_openfga(),
         )
-        .await?;
+        .await;
 
-    let managed_access = get_managed_access(&authorizer, &warehouse_id).await?;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let managed_access = get_managed_access(&authorizer, &warehouse_id)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -566,7 +998,7 @@ async fn get_warehouse_by_id<C: CatalogStore, S: SecretStore>(
 /// Set managed access property of a warehouse
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/managed-access",
     params(
         ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
@@ -582,15 +1014,27 @@ async fn set_warehouse_managed_access<C: CatalogStore, S: SecretStore>(
     Json(request): Json<SetManagedAccessRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        AllWarehouseRelation::CanSetManagedAccess,
+    );
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllWarehouseRelation::CanSetManagedAccess,
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
             &warehouse_id.to_openfga(),
         )
-        .await?;
+        .await;
 
-    set_managed_access(authorizer, &warehouse_id, request.managed_access).await?;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    set_managed_access(authorizer, &warehouse_id, request.managed_access)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::OK)
 }
@@ -598,7 +1042,7 @@ async fn set_warehouse_managed_access<C: CatalogStore, S: SecretStore>(
 /// Set managed access property of a namespace
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/namespace/{namespace_id}/managed-access",
     params(
         ("namespace_id" = Uuid, Path, description = "Namespace ID"),
@@ -615,15 +1059,27 @@ async fn set_namespace_managed_access<C: CatalogStore, S: SecretStore>(
     Json(request): Json<SetManagedAccessRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        AllNamespaceRelations::CanSetManagedAccess,
+    );
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllNamespaceRelations::CanSetManagedAccess,
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
             &namespace_id.to_openfga(),
         )
-        .await?;
+        .await;
 
-    set_managed_access(authorizer, &namespace_id, request.managed_access).await?;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    set_managed_access(authorizer, &namespace_id, request.managed_access)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::OK)
 }
@@ -631,7 +1087,7 @@ async fn set_namespace_managed_access<C: CatalogStore, S: SecretStore>(
 /// Get Authorization properties of a namespace
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/namespace/{namespace_id}",
     params(
         ("namespace_id" = Uuid, Path, description = "Namespace ID"),
@@ -646,22 +1102,35 @@ async fn get_namespace_by_id<C: CatalogStore, S: SecretStore>(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<(StatusCode, Json<GetNamespaceAuthPropertiesResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        AllNamespaceRelations::CanGetMetadata,
+    );
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllNamespaceRelations::CanGetMetadata,
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
             &namespace_id.to_openfga(),
         )
-        .await?;
+        .await;
 
-    let managed_access = get_managed_access(&authorizer, &namespace_id).await?;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let managed_access = get_managed_access(&authorizer, &namespace_id)
+        .await
+        .map_err(authz_to_error_no_audit)?;
     let managed_access_inherited = authorizer
         .check(CheckRequestTupleKey {
             user: "user:*".to_string(),
             relation: AllNamespaceRelations::ManagedAccessInheritance.to_string(),
             object: namespace_id.to_openfga(),
         })
-        .await?;
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -673,9 +1142,12 @@ async fn get_namespace_by_id<C: CatalogStore, S: SecretStore>(
 }
 
 /// Get my access to a namespace
+///
+/// **Deprecated:** Use `/management/v1/permissions/namespace/{namespace_id}/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/actions` for Catalog permissions instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/namespace/{namespace_id}/access",
     params(
         GetAccessQuery,
@@ -685,6 +1157,10 @@ async fn get_namespace_by_id<C: CatalogStore, S: SecretStore>(
             (status = 200, description = "Server Relations", body = GetNamespaceAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/actions and /management/v1/permissions/namespace/{namespace_id}/authorizer-actions instead"
+)]
 async fn get_namespace_access_by_id<C: CatalogStore, S: SecretStore>(
     Path(namespace_id): Path<NamespaceId>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -693,13 +1169,23 @@ async fn get_namespace_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetNamespaceAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &namespace_id.to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
 
     Ok((
         StatusCode::OK,
@@ -709,10 +1195,63 @@ async fn get_namespace_access_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
-/// Get my access to a table
+/// Get allowed Authorizer actions on a namespace
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified namespace.
+/// For Catalog permissions, use `/management/v1/warehouse/{warehouse_id}/namespace/{namespace_id}/actions` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/namespace/{namespace_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("namespace_id" = Uuid, Path, description = "Namespace ID")
+    ),
+    responses(
+            (status = 200, description = "Namespace Authorizer Actions", body = GetOpenFGANamespaceActionsResponse),
+    )
+))]
+async fn get_authorizer_namespace_actions<C: CatalogStore, S: SecretStore>(
+    Path(namespace_id): Path<NamespaceId>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGANamespaceActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &namespace_id.to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGANamespaceActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get my access to a table
+///
+/// **Deprecated:** Use `/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/warehouse/{warehouse_id}/table/{table_id}/actions` for Catalog permissions instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/access",
     params(
         GetAccessQuery,
@@ -723,6 +1262,10 @@ async fn get_namespace_access_by_id<C: CatalogStore, S: SecretStore>(
             (status = 200, description = "Server Relations", body = GetTableAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/warehouse/{warehouse_id}/table/{table_id}/actions and /management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/authorizer-actions instead"
+)]
 async fn get_table_access_by_id<C: CatalogStore, S: SecretStore>(
     Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -731,13 +1274,24 @@ async fn get_table_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetTableAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        table_id,
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &(warehouse_id, table_id).to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
 
     Ok((
         StatusCode::OK,
@@ -747,10 +1301,65 @@ async fn get_table_access_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
-/// Get my access to a view
+/// Get allowed Authorizer actions on a table
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified table.
+/// For Catalog permissions, use `/management/v1/warehouse/{warehouse_id}/table/{table_id}/actions` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("table_id" = Uuid, Path, description = "Table ID")
+    ),
+    responses(
+            (status = 200, description = "Table Authorizer Actions", body = GetOpenFGATableActionsResponse),
+    )
+))]
+async fn get_authorizer_table_actions<C: CatalogStore, S: SecretStore>(
+    Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGATableActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        table_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &(warehouse_id, table_id).to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGATableActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get my access to a view
+///
+/// **Deprecated:** Use `/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/authorizer-actions` for Authorizer permissions
+/// or `/management/v1/warehouse/{warehouse_id}/view/{view_id}/actions` for Catalog permissions instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/access",
     params(
         GetAccessQuery,
@@ -761,6 +1370,10 @@ async fn get_table_access_by_id<C: CatalogStore, S: SecretStore>(
             (status = 200, body = GetViewAccessResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/warehouse/{warehouse_id}/view/{view_id}/actions and /management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/authorizer-actions instead"
+)]
 async fn get_view_access_by_id<C: CatalogStore, S: SecretStore>(
     Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -769,13 +1382,24 @@ async fn get_view_access_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetViewAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        view_id,
+        IntrospectPermissions {},
+    );
+
     let relations = get_allowed_actions(
         authorizer,
-        metadata.actor(),
+        event_ctx.request_metadata().actor(),
         &(warehouse_id, view_id).to_openfga(),
         query.principal.as_ref(),
     )
-    .await?;
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
 
     Ok((
         StatusCode::OK,
@@ -785,10 +1409,114 @@ async fn get_view_access_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
+/// Get allowed Authorizer actions on a view
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified view.
+/// For Catalog permissions, use `/management/v1/warehouse/{warehouse_id}/view/{view_id}/actions` instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("view_id" = Uuid, Path, description = "View ID"),
+    ),
+    responses(
+            (status = 200, description = "View Authorizer Actions", body = GetOpenFGAViewActionsResponse),
+    )
+))]
+async fn get_authorizer_view_actions<C: CatalogStore, S: SecretStore>(
+    Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGAViewActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        view_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &(warehouse_id, view_id).to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGAViewActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
+/// Get allowed Authorizer actions on a generic table
+///
+/// Returns Authorizer permissions (OpenFGA relations) for the specified generic table.
+/// For Catalog permissions, use `/management/v1/warehouse/{warehouse_id}/generic-table/{generic_table_id}/actions` instead.
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/generic-table/{generic_table_id}/authorizer-actions",
+    params(
+        GetAccessQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("generic_table_id" = Uuid, Path, description = "Generic Table ID")
+    ),
+    responses(
+            (status = 200, description = "Generic Table Authorizer Actions", body = GetOpenFGAGenericTableActionsResponse),
+    )
+))]
+async fn get_authorizer_generic_table_actions<C: CatalogStore, S: SecretStore>(
+    Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetAccessQuery>,
+) -> Result<(StatusCode, Json<GetOpenFGAGenericTableActionsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let query = ParsedAccessQuery::try_from(query)?;
+
+    let event_ctx = APIEventContext::for_generic_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        generic_table_id,
+        IntrospectPermissions {},
+    );
+
+    let relations = get_allowed_actions(
+        authorizer,
+        event_ctx.request_metadata().actor(),
+        &(warehouse_id, generic_table_id).to_openfga(),
+        query.principal.as_ref(),
+    )
+    .await;
+
+    let (_, relations) = event_ctx.emit_authz(relations)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(GetOpenFGAGenericTableActionsResponse {
+            allowed_actions: relations,
+        }),
+    ))
+}
+
 /// Get user and role assignments of a role
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/role/{role_id}/assignments",
     params(
         GetRoleAssignmentsQuery,
@@ -805,14 +1533,27 @@ async fn get_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Query(query): Query<GetRoleAssignmentsQuery>,
 ) -> Result<(StatusCode, Json<GetRoleAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_role(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        role_id,
+        AllRoleRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllRoleRelations::CanReadAssignments,
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
             &role_id.to_openfga(),
         )
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &role_id.to_openfga()).await?;
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &role_id.to_openfga())
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -820,10 +1561,62 @@ async fn get_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
     ))
 }
 
+/// Get user and role assignments of a tag definition (who may apply it / owns it)
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/tag/{tag_definition_id}/assignments",
+    params(
+        GetTagAssignmentsQuery,
+        ("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"),
+    ),
+    responses(
+            (status = 200, body = GetTagAssignmentsResponse),
+    )
+))]
+async fn get_tag_assignments_by_id<C: CatalogStore, S: SecretStore>(
+    Path(tag_definition_id): Path<TagDefinitionId>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetTagAssignmentsQuery>,
+) -> Result<(StatusCode, Json<GetTagAssignmentsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+
+    let event_ctx = APIEventContext::for_tag(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        tag_definition_id,
+        AllTagRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
+            &tag_definition_id.to_openfga(),
+        )
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &tag_definition_id.to_openfga())
+        .await
+        .map_err(authz_to_error_no_audit)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            GetTagAssignmentsResponse::builder()
+                .assignments(assignments)
+                .build(),
+        ),
+    ))
+}
+
 /// Get user and role assignments of the server
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/server/assignments",
     params(GetServerAssignmentsQuery),
     responses(
@@ -837,10 +1630,27 @@ async fn get_server_assignments<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetServerAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let server_id = authorizer.openfga_server().clone();
-    authorizer
-        .require_action(&metadata, AllServerAction::CanReadAssignments, &server_id)
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &server_id).await?;
+
+    let event_ctx = APIEventContext::for_server(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        AllServerAction::CanReadAssignments,
+        lakekeeper::service::authz::Authorizer::server_id(&authorizer),
+    );
+
+    let authz_result = authorizer
+        .require_action(
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
+            &server_id,
+        )
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &server_id)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -851,7 +1661,7 @@ async fn get_server_assignments<C: CatalogStore, S: SecretStore>(
 /// Get user and role assignments of a project
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/assignments",
     params(GetProjectAssignmentsQuery),
     responses(
@@ -866,38 +1676,59 @@ async fn get_project_assignments<C: CatalogStore, S: SecretStore>(
     let authorizer = api_context.v1_state.authz;
     let project_id = metadata
         .preferred_project_id()
-        .ok_or(OpenFGAError::NoProjectId)?;
-    authorizer
+        .ok_or(OpenFGAError::NoProjectId)
+        .map_err(authz_to_error_no_audit)?;
+
+    let event_ctx = APIEventContext::for_project_arc(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id,
+        Arc::new(AllProjectRelations::CanReadAssignments),
+    );
+    let project_id_openfga = event_ctx.user_provided_entity().to_openfga();
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllProjectRelations::CanReadAssignments,
-            &project_id.to_openfga(),
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
+            &project_id_openfga,
         )
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &project_id.to_openfga()).await?;
+        .await;
+
+    let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &project_id_openfga)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
         Json(GetProjectAssignmentsResponse {
             assignments,
-            project_id,
+            project_id: event_ctx.user_provided_entity().clone(),
         }),
     ))
 }
 
 /// Get user and role assignments to a project
+///
+/// **Deprecated:** Use `/management/v1/permissions/project/assignments` instead.
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/{project_id}/assignments",
     params(
         GetProjectAssignmentsQuery,
-        ("project_id" = Uuid, Path, description = "Project ID"),
+        ("project_id" = Option<String>, Path, description = PROJECT_ID_HEADER_DESCRIPTION),
     ),
     responses(
             (status = 200, body = GetProjectAssignmentsResponse),
     )
 ))]
+#[deprecated(
+    since = "0.11.0",
+    note = "Use /management/v1/permissions/project/assignments instead"
+)]
 async fn get_project_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Path(project_id): Path<ProjectId>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
@@ -905,20 +1736,34 @@ async fn get_project_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Query(query): Query<GetProjectAssignmentsQuery>,
 ) -> Result<(StatusCode, Json<GetProjectAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    authorizer
+
+    let event_ctx = APIEventContext::for_project(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id,
+        AllProjectRelations::CanReadAssignments,
+    );
+    let project_id_openfga = event_ctx.user_provided_entity().to_openfga();
+
+    let authz_result = authorizer
         .require_action(
-            &metadata,
-            AllProjectRelations::CanReadAssignments,
-            &project_id.to_openfga(),
+            event_ctx.request_metadata(),
+            *event_ctx.action(),
+            &project_id_openfga,
         )
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &project_id.to_openfga()).await?;
+        .await;
+
+    let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &project_id_openfga)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
         Json(GetProjectAssignmentsResponse {
             assignments,
-            project_id,
+            project_id: event_ctx.user_provided_entity().clone(),
         }),
     ))
 }
@@ -926,7 +1771,7 @@ async fn get_project_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Get user and role assignments for a warehouse
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/assignments",
     params(
         GetWarehouseAssignmentsQuery,
@@ -944,10 +1789,23 @@ async fn get_warehouse_assignments_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetWarehouseAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let object = warehouse_id.to_openfga();
-    authorizer
-        .require_action(&metadata, AllWarehouseRelation::CanReadAssignments, &object)
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &object).await?;
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        AllWarehouseRelation::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(event_ctx.request_metadata(), *event_ctx.action(), &object)
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -958,7 +1816,7 @@ async fn get_warehouse_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Get user and role assignments for a namespace
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/namespace/{namespace_id}/assignments",
     params(
         GetNamespaceAssignmentsQuery,
@@ -976,14 +1834,23 @@ async fn get_namespace_assignments_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetNamespaceAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let object = namespace_id.to_openfga();
-    authorizer
-        .require_action(
-            &metadata,
-            AllNamespaceRelations::CanReadAssignments,
-            &object,
-        )
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &object).await?;
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        AllNamespaceRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(event_ctx.request_metadata(), *event_ctx.action(), &object)
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -994,7 +1861,7 @@ async fn get_namespace_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Get user and role assignments for a table
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/assignments",
     params(
         GetTableAssignmentsQuery,
@@ -1013,10 +1880,24 @@ async fn get_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetTableAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let object = (warehouse_id, table_id).to_openfga();
-    authorizer
-        .require_action(&metadata, AllTableRelations::CanReadAssignments, &object)
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &object).await?;
+
+    let event_ctx = APIEventContext::for_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        table_id,
+        AllTableRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(event_ctx.request_metadata(), *event_ctx.action(), &object)
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -1027,7 +1908,7 @@ async fn get_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Get user and role assignments for a view
 #[cfg_attr(feature = "open-api", utoipa::path(
     get,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
     params(
         GetViewAssignmentsQuery,
@@ -1046,10 +1927,24 @@ async fn get_view_assignments_by_id<C: CatalogStore, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetViewAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let object = (warehouse_id, view_id).to_openfga();
-    authorizer
-        .require_action(&metadata, AllViewRelations::CanReadAssignments, &object)
-        .await?;
-    let assignments = get_relations(authorizer, query.relations, &object).await?;
+
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        view_id,
+        AllViewRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(event_ctx.request_metadata(), *event_ctx.action(), &object)
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok((
         StatusCode::OK,
@@ -1060,7 +1955,7 @@ async fn get_view_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Update permissions for this server
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/server/assignments",
     request_body = UpdateServerAssignmentsRequest,
     responses(
@@ -1074,14 +1969,26 @@ async fn update_server_assignments<C: CatalogStore, S: SecretStore>(
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
     let server_id = authorizer.openfga_server().clone();
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
+
+    let event_ctx = APIEventContext::for_server(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        request.clone(),
+        lakekeeper::service::authz::Authorizer::server_id(&authorizer),
+    );
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
         &server_id,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &server_id)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1089,7 +1996,7 @@ async fn update_server_assignments<C: CatalogStore, S: SecretStore>(
 /// Update permissions for the default project
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/assignments",
     request_body = UpdateProjectAssignmentsRequest,
     responses(
@@ -1104,15 +2011,29 @@ async fn update_project_assignments<C: CatalogStore, S: SecretStore>(
     let authorizer = api_context.v1_state.authz;
     let project_id = metadata
         .preferred_project_id()
-        .ok_or(OpenFGAError::NoProjectId)?;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &project_id.to_openfga(),
+        .ok_or(OpenFGAError::NoProjectId)
+        .map_err(authz_to_error_no_audit)?;
+
+    let event_ctx = APIEventContext::for_project_arc(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id,
+        Arc::new(request.clone()),
+    );
+    let object = event_ctx.user_provided_entity().to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1120,11 +2041,11 @@ async fn update_project_assignments<C: CatalogStore, S: SecretStore>(
 /// Update permissions for a project
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/project/{project_id}/assignments",
     request_body = UpdateProjectAssignmentsRequest,
     params(
-        ("project_id" = Uuid, Path, description = "Project ID"),
+        ("project_id" = Option<String>, Path, description = PROJECT_ID_HEADER_DESCRIPTION),
     ),
     responses(
             (status = 204, description = "Permissions updated successfully"),
@@ -1137,14 +2058,27 @@ async fn update_project_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateProjectAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &project_id.to_openfga(),
+
+    let event_ctx = APIEventContext::for_project(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        project_id,
+        request.clone(),
+    );
+    let object = event_ctx.user_provided_entity().to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1152,7 +2086,7 @@ async fn update_project_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Update permissions for a warehouse
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/assignments",
     request_body = UpdateWarehouseAssignmentsRequest,
     params(
@@ -1169,14 +2103,27 @@ async fn update_warehouse_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateWarehouseAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &warehouse_id.to_openfga(),
+
+    let event_ctx = APIEventContext::for_warehouse(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        request.clone(),
+    );
+    let object = event_ctx.user_provided_entity().to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1184,7 +2131,7 @@ async fn update_warehouse_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Update permissions for a namespace
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/namespace/{namespace_id}/assignments",
     request_body = UpdateNamespaceAssignmentsRequest,
     params(
@@ -1201,14 +2148,27 @@ async fn update_namespace_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateNamespaceAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &namespace_id.to_openfga(),
+
+    let event_ctx = APIEventContext::for_namespace_only_id(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        namespace_id,
+        request.clone(),
+    );
+    let object = namespace_id.to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1216,7 +2176,7 @@ async fn update_namespace_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Update permissions for a table
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/assignments",
     request_body = UpdateTableAssignmentsRequest,
     params(
@@ -1234,14 +2194,28 @@ async fn update_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateTableAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &(warehouse_id, table_id).to_openfga(),
+
+    let event_ctx = APIEventContext::for_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        table_id,
+        request.clone(),
+    );
+    let object = (warehouse_id, table_id).to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1249,7 +2223,7 @@ async fn update_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
 /// Update permissions for a view
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
     request_body = UpdateViewAssignmentsRequest,
     params(
@@ -1267,14 +2241,122 @@ async fn update_view_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateViewAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &(warehouse_id, view_id).to_openfga(),
+
+    let event_ctx = APIEventContext::for_view(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        view_id,
+        request.clone(),
+    );
+    let object = (warehouse_id, view_id).to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
     )
-    .await?;
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get user and role assignments for a generic table
+#[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/generic-table/{generic_table_id}/assignments",
+    params(
+        GetGenericTableAssignmentsQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("generic_table_id" = Uuid, Path, description = "Generic Table ID"),
+    ),
+    responses(
+            (status = 200, body = GetGenericTableAssignmentsResponse),
+    )
+))]
+async fn get_generic_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
+    Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<GetGenericTableAssignmentsQuery>,
+) -> Result<(StatusCode, Json<GetGenericTableAssignmentsResponse>)> {
+    let authorizer = api_context.v1_state.authz;
+    let object = (warehouse_id, generic_table_id).to_openfga();
+
+    let event_ctx = APIEventContext::for_generic_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        generic_table_id,
+        AllGenericTableRelations::CanReadAssignments,
+    );
+
+    let authz_result = authorizer
+        .require_action(event_ctx.request_metadata(), *event_ctx.action(), &object)
+        .await;
+
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    let assignments = get_relations(authorizer, query.relations, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(GetGenericTableAssignmentsResponse { assignments }),
+    ))
+}
+
+/// Update permissions for a generic table
+#[cfg_attr(feature = "open-api", utoipa::path(
+    post,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/generic-table/{generic_table_id}/assignments",
+    request_body = UpdateGenericTableAssignmentsRequest,
+    params(
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("generic_table_id" = Uuid, Path, description = "Generic Table ID"),
+    ),
+    responses(
+            (status = 204, description = "Permissions updated successfully"),
+    )
+))]
+async fn update_generic_table_assignments_by_id<C: CatalogStore, S: SecretStore>(
+    Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateGenericTableAssignmentsRequest>,
+) -> Result<StatusCode> {
+    let authorizer = api_context.v1_state.authz;
+
+    let event_ctx = APIEventContext::for_generic_table(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        warehouse_id,
+        generic_table_id,
+        request.clone(),
+    );
+    let object = (warehouse_id, generic_table_id).to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
+    )
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1282,7 +2364,7 @@ async fn update_view_assignments_by_id<C: CatalogStore, S: SecretStore>(
 // Update permissions for a role
 #[cfg_attr(feature = "open-api", utoipa::path(
     post,
-    tag = "permissions",
+    tag = "permissions-openfga",
     path = "/management/v1/permissions/role/{role_id}/assignments",
     request_body = UpdateRoleAssignmentsRequest,
     params(
@@ -1299,45 +2381,152 @@ async fn update_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
     Json(request): Json<UpdateRoleAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
-    // Improve error message of role being assigned to itself
-    for assignment in &request.writes {
-        let assignee = match assignment {
-            RoleAssignment::Ownership(r) | RoleAssignment::Assignee(r) => r,
-        };
-        if assignee == &UserOrRole::Role(role_id.into_assignees()) {
-            return Err(OpenFGAError::SelfAssignment(role_id.to_string()).into());
-        }
+
+    let event_ctx = APIEventContext::for_role(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        role_id,
+        request.clone(),
+    );
+
+    // Refuse an unauthenticated caller before any catalog work. The authorization
+    // check below refuses it too, but only after the uncached lookup has spent a
+    // connection — so without this an anonymous request can drive catalog load, and
+    // a catalog fault would answer it with a backend error instead of a 401.
+    if event_ctx.request_metadata().actor() == &Actor::Anonymous {
+        return Err(event_ctx
+            .emit_early_authz_failure(OpenFGAError::AuthenticationRequired)
+            .into());
     }
-    checked_write(
-        authorizer,
-        metadata.actor(),
-        request.writes,
-        request.deletes,
-        &role_id.to_openfga(),
+
+    // A `system` role's membership is also writable here: `assignee` is the same
+    // tuple the role-membership API writes, and `ownership` confers `assignee`. The
+    // catalog's rule has to hold on this path too, or it only covers whichever
+    // writer happens to be gated. Read with the cache bypassed, from the same
+    // source as the catalog-side gate: a role's `system`-ness cannot change once
+    // set, so the only thing replica lag can hide is a role too new to have
+    // replicated — which resolves as not-found and is then refused by the
+    // authorization check below, having no tuples yet.
+    let role = match C::get_role_by_id_across_projects_cache_aware(
+        role_id,
+        CachePolicy::Skip,
+        api_context.v1_state.catalog.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(role) => Some(role),
+        // No catalog row anywhere: a dangling authorizer tuple, never a system
+        // role, so there is nothing for the rule to apply to.
+        Err(GetRoleAcrossProjectsError::RoleIdNotFound(_)) => None,
+        // Any other failure is an unanswered question, not a `no`. Treating it as
+        // "not a system role" would let a backend fault — one a caller can provoke
+        // by loading the pool — wave the write past the rule.
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(role) = role {
+        let adds_role_member = request.writes.iter().any(|assignment| {
+            let (RoleAssignment::Assignee(subject) | RoleAssignment::Ownership(subject)) =
+                assignment;
+            matches!(subject, UserOrRole::Role(_))
+        });
+        reject_system_role_membership(&role, event_ctx.request_metadata(), adds_role_member)
+            .map_err(|violation| event_ctx.emit_early_authz_failure(violation))?;
+    }
+
+    let object = role_id.to_openfga();
+
+    // Improve error message of role being assigned to itself
+    let authz_result = 'authz: {
+        for assignment in &request.writes {
+            let assignee = match assignment {
+                RoleAssignment::Ownership(r) | RoleAssignment::Assignee(r) => r,
+            };
+            if assignee == &UserOrRole::Role(role_id.into_api_assignee()) {
+                break 'authz Err(OpenFGAError::SelfAssignment(role_id.to_string()));
+            }
+        }
+        check_assignment_writes(
+            &authorizer,
+            event_ctx.request_metadata().actor(),
+            &request.writes,
+            &request.deletes,
+            &object,
+        )
+        .await
+    };
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Update user and role assignments of a tag definition (grant/revoke apply, transfer ownership)
+#[cfg_attr(feature = "open-api", utoipa::path(
+    post,
+    tag = "permissions-openfga",
+    path = "/management/v1/permissions/tag/{tag_definition_id}/assignments",
+    request_body = UpdateTagAssignmentsRequest,
+    params(
+        ("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"),
+    ),
+    responses(
+            (status = 204, description = "Permissions updated successfully"),
+    )
+))]
+async fn update_tag_assignments_by_id<C: CatalogStore, S: SecretStore>(
+    Path(tag_definition_id): Path<TagDefinitionId>,
+    AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateTagAssignmentsRequest>,
+) -> Result<StatusCode> {
+    let authorizer = api_context.v1_state.authz;
+
+    let event_ctx = APIEventContext::for_tag(
+        Arc::new(metadata),
+        api_context.v1_state.events,
+        tag_definition_id,
+        request.clone(),
+    );
+
+    // A tag definition is never a valid assignment subject, so there is no
+    // self-assignment case to guard (unlike roles).
+    let object = tag_definition_id.to_openfga();
+    let authz_result = check_assignment_writes(
+        &authorizer,
+        event_ctx.request_metadata().actor(),
+        &request.writes,
+        &request.deletes,
+        &object,
+    )
+    .await;
+    let _ = event_ctx.emit_authz(authz_result)?;
+
+    apply_assignment_writes(authorizer, request.writes, request.deletes, &object)
+        .await
+        .map_err(authz_to_error_no_audit)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg_attr(feature = "open-api", derive(OpenApi))]
 #[cfg_attr(feature = "open-api", openapi(
-    servers(
-        (
-            url = "{scheme}://{host}/{basePath}",
-            description = "Lakekeeper Management API",
-            variables(
-                ("scheme" = (default = "https", description = "The scheme of the URI, either http or https")),
-                ("host" = (default = "localhost", description = "The host address for the specified server")),
-                ("basePath" = (default = "", description = "Optional prefix to be appended to all routes"))
-            )
-        )
-    ),
     tags(
-        (name = "permissions", description = "Manage Permissions"),
+        (name = "permissions-openfga", description = "Authorization and permissions management using OpenFGA"),
     ),
     paths(
         check,
+        get_authorizer_generic_table_actions,
+        get_authorizer_namespace_actions,
+        get_authorizer_project_actions,
+        get_authorizer_role_actions,
+        get_authorizer_server_actions,
+        get_authorizer_table_actions,
+        get_authorizer_view_actions,
+        get_authorizer_warehouse_actions,
+        get_generic_table_assignments_by_id,
         get_namespace_access_by_id,
         get_namespace_assignments_by_id,
         get_namespace_by_id,
@@ -1351,6 +2540,7 @@ async fn update_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
         get_server_assignments,
         get_table_access_by_id,
         get_table_assignments_by_id,
+        get_tag_assignments_by_id,
         get_view_access_by_id,
         get_view_assignments_by_id,
         get_warehouse_access_by_id,
@@ -1358,21 +2548,25 @@ async fn update_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
         get_warehouse_by_id,
         set_namespace_managed_access,
         set_warehouse_managed_access,
+        update_generic_table_assignments_by_id,
         update_namespace_assignments_by_id,
         update_project_assignments_by_id,
         update_project_assignments,
         update_role_assignments_by_id,
         update_server_assignments,
         update_table_assignments_by_id,
+        update_tag_assignments_by_id,
         update_view_assignments_by_id,
         update_warehouse_assignments_by_id,
     ),
     // auto-discovery seems to be broken for these
-    components(schemas(NamespaceRelation,
+    components(schemas(GenericTableRelation,
+                       NamespaceRelation,
                        ProjectRelation,
                        RoleRelation,
                        ServerRelation,
                        TableRelation,
+                       TagRelation,
                        ViewRelation,
                        WarehouseRelation))
 ))]
@@ -1380,18 +2574,35 @@ async fn update_role_assignments_by_id<C: CatalogStore, S: SecretStore>(
 #[derive(Debug)]
 pub(crate) struct ApiDoc;
 
-pub(super) fn new_v1_router<C: CatalogStore, S: SecretStore>(
-) -> Router<ApiContext<State<OpenFGAAuthorizer, C, S>>> {
+#[allow(clippy::too_many_lines)]
+pub(super) fn new_v1_router<C: CatalogStore, S: SecretStore>()
+-> Router<ApiContext<State<OpenFGAAuthorizer, C, S>>> {
     Router::new()
         .route(
             "/permissions/role/{role_id}/access",
             get(get_role_access_by_id),
         )
+        .route(
+            "/permissions/role/{role_id}/authorizer-actions",
+            get(get_authorizer_role_actions),
+        )
         .route("/permissions/server/access", get(get_server_access))
+        .route(
+            "/permissions/server/authorizer-actions",
+            get(get_authorizer_server_actions),
+        )
         .route("/permissions/project/access", get(get_project_access))
+        .route(
+            "/permissions/project/authorizer-actions",
+            get(get_authorizer_project_actions),
+        )
         .route(
             "/permissions/warehouse/{warehouse_id}/access",
             get(get_warehouse_access_by_id),
+        )
+        .route(
+            "/permissions/warehouse/{warehouse_id}/authorizer-actions",
+            get(get_authorizer_warehouse_actions),
         )
         .route(
             "/permissions/warehouse/{warehouse_id}",
@@ -1402,12 +2613,20 @@ pub(super) fn new_v1_router<C: CatalogStore, S: SecretStore>(
             post(set_warehouse_managed_access),
         )
         .route(
+            "/permissions/project/assignments",
+            get(get_project_assignments).post(update_project_assignments),
+        )
+        .route(
             "/permissions/project/{project_id}/access",
             get(get_project_access_by_id),
         )
         .route(
             "/permissions/namespace/{namespace_id}/access",
             get(get_namespace_access_by_id),
+        )
+        .route(
+            "/permissions/namespace/{namespace_id}/authorizer-actions",
+            get(get_authorizer_namespace_actions),
         )
         .route(
             "/permissions/namespace/{namespace_id}",
@@ -1422,20 +2641,32 @@ pub(super) fn new_v1_router<C: CatalogStore, S: SecretStore>(
             get(get_table_access_by_id),
         )
         .route(
+            "/permissions/warehouse/{warehouse_id}/table/{table_id}/authorizer-actions",
+            get(get_authorizer_table_actions),
+        )
+        .route(
             "/permissions/warehouse/{warehouse_id}/view/{view_id}/access",
             get(get_view_access_by_id),
+        )
+        .route(
+            "/permissions/warehouse/{warehouse_id}/view/{view_id}/authorizer-actions",
+            get(get_authorizer_view_actions),
+        )
+        .route(
+            "/permissions/warehouse/{warehouse_id}/generic-table/{generic_table_id}/authorizer-actions",
+            get(get_authorizer_generic_table_actions),
         )
         .route(
             "/permissions/role/{role_id}/assignments",
             get(get_role_assignments_by_id).post(update_role_assignments_by_id),
         )
         .route(
-            "/permissions/server/assignments",
-            get(get_server_assignments).post(update_server_assignments),
+            "/permissions/tag/{tag_definition_id}/assignments",
+            get(get_tag_assignments_by_id).post(update_tag_assignments_by_id),
         )
         .route(
-            "/permissions/project/assignments",
-            get(get_project_assignments).post(update_project_assignments),
+            "/permissions/server/assignments",
+            get(get_server_assignments).post(update_server_assignments),
         )
         .route(
             "/permissions/project/{project_id}/assignments",
@@ -1457,6 +2688,10 @@ pub(super) fn new_v1_router<C: CatalogStore, S: SecretStore>(
             "/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
             get(get_view_assignments_by_id).post(update_view_assignments_by_id),
         )
+        .route(
+            "/permissions/warehouse/{warehouse_id}/generic-table/{generic_table_id}/assignments",
+            get(get_generic_table_assignments_by_id).post(update_generic_table_assignments_by_id),
+        )
         .route("/permissions/check", post(check))
 }
 
@@ -1464,7 +2699,7 @@ async fn get_relations<RA: Assignment>(
     authorizer: OpenFGAAuthorizer,
     query_relations: Option<Vec<RA::Relation>>,
     object: &str,
-) -> Result<Vec<RA>> {
+) -> OpenFGAResult<Vec<RA>> {
     let relations = query_relations.unwrap_or_else(|| RA::Relation::iter().collect());
 
     let relations = relations.iter().map(|relation| async {
@@ -1478,7 +2713,7 @@ async fn get_relations<RA: Assignment>(
             .await?
             .into_iter()
             .filter_map(|t| t.key)
-            .map(|t| RA::try_from_user(&t.user, relation))
+            .map(|t| RA::try_from_user(&t.user, relation).map_err(OpenFGAError::from))
             .collect::<OpenFGAResult<Vec<RA>>>()
     });
 
@@ -1512,7 +2747,6 @@ async fn get_allowed_actions<A: ReducedRelation + IntoEnumIterator>(
         let allowed = authorizer.clone().check(key).await?;
         if !allowed {
             return Err(OpenFGAError::Unauthorized {
-                user: openfga_actor.clone(),
                 relation: RoleAction::ReadAssignments.to_openfga().to_string(),
                 object: object.to_string(),
             });
@@ -1533,7 +2767,7 @@ async fn get_allowed_actions<A: ReducedRelation + IntoEnumIterator>(
 
         let allowed = authorizer.clone().check(key).await?;
 
-        OpenFGAResult::Ok(Some(*action).filter(|_| allowed))
+        OpenFGAResult::Ok(Some(action.clone()).filter(|_| allowed))
     });
     let actions = futures::future::try_join_all(actions)
         .await?
@@ -1544,25 +2778,52 @@ async fn get_allowed_actions<A: ReducedRelation + IntoEnumIterator>(
     Ok(actions)
 }
 
-async fn checked_write<RA: Assignment>(
-    authorizer: OpenFGAAuthorizer,
+/// Authorize an assignment update without applying it.
+///
+/// Split out from the write so that callers can emit the authorization audit
+/// event *before* the OpenFGA write is issued. Apply the writes with
+/// [`apply_assignment_writes`] once the event has been emitted.
+async fn check_assignment_writes<RA: Assignment>(
+    authorizer: &OpenFGAAuthorizer,
     actor: &Actor,
-    writes: Vec<RA>,
-    deletes: Vec<RA>,
+    writes: &[RA],
+    deletes: &[RA],
     object: &str,
 ) -> OpenFGAResult<()> {
     // Fail fast
     if actor == &Actor::Anonymous {
         return Err(OpenFGAError::AuthenticationRequired);
     }
-    let all_modifications = writes.iter().chain(deletes.iter()).collect::<Vec<_>>();
     // ---------------------------- AUTHZ CHECKS ----------------------------
     let openfga_actor = actor.to_openfga();
 
-    let grant_relations = all_modifications
+    // Handing an assignment out is delegation, which `pass_grants` can confer; taking one
+    // back is administration, which only `manage_grants` confers. The two directions
+    // therefore ask different relations for the privileges `pass_grants` can delegate.
+    let grant_relations = writes
         .iter()
         .map(|action| action.relation().grant_relation())
+        .chain(
+            deletes
+                .iter()
+                .map(|action| action.relation().revoke_relation()),
+        )
         .collect::<HashSet<_>>();
+
+    if matches!(
+        actor,
+        Actor::Role {
+            principal: _,
+            assumed_role: _
+        }
+    ) && (object.starts_with("namespace:")
+        || object.starts_with("lakekeeper_table")
+        || object.starts_with("lakekeeper_view")
+        || object.starts_with("lakekeeper_generic_table"))
+    {
+        // Currently not supported as we are missing public usersets for managed access
+        return Err(OpenFGAError::GrantRoleWithAssumedRole);
+    }
 
     futures::future::try_join_all(grant_relations.iter().map(|relation| async {
         let key = CheckRequestTupleKey {
@@ -1571,12 +2832,11 @@ async fn checked_write<RA: Assignment>(
             object: object.to_string(),
         };
 
-        let allowed = authorizer.clone().check(key).await?;
+        let allowed = authorizer.check(key).await?;
         if allowed {
             Ok(())
         } else {
             Err(OpenFGAError::Unauthorized {
-                user: openfga_actor.clone(),
                 relation: relation.to_string(),
                 object: object.to_string(),
             })
@@ -1584,7 +2844,21 @@ async fn checked_write<RA: Assignment>(
     }))
     .await?;
 
-    // ---------------------- APPLY WRITE OPERATIONS -----------------------
+    Ok(())
+}
+
+/// Apply an assignment update that [`check_assignment_writes`] has authorized.
+///
+/// Callers must have emitted the authorization event before calling this.
+/// Endpoint callers must additionally map failures with `authz_to_error_no_audit`
+/// — the authorization outcome has already been logged, so a failing write must
+/// not emit a second event.
+async fn apply_assignment_writes<RA: Assignment>(
+    authorizer: OpenFGAAuthorizer,
+    writes: Vec<RA>,
+    deletes: Vec<RA>,
+    object: &str,
+) -> OpenFGAResult<()> {
     let writes = writes
         .into_iter()
         .map(|ra| TupleKey {
@@ -1670,10 +2944,10 @@ async fn set_managed_access<T: OpenFgaEntity>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::str::FromStr;
 
-    use lakekeeper::service::{Namespace, NamespaceHierarchy, NamespaceIdent};
-    use sqlx::types::chrono;
+    use lakekeeper::service::{NamespaceHierarchy, UserId};
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1687,31 +2961,101 @@ mod tests {
     }
 
     fn random_namespace(namespace_id: NamespaceId) -> NamespaceHierarchy {
-        NamespaceHierarchy {
-            namespace: Arc::new(Namespace {
-                namespace_ident: NamespaceIdent::new(format!("ns-{namespace_id}")),
-                namespace_id,
-                protected: false,
-                warehouse_id: uuid::Uuid::nil().into(),
-                properties: None,
-                updated_at: None,
-                created_at: chrono::Utc::now(),
-                version: 0.into(),
-            }),
-            parents: vec![],
-        }
+        NamespaceHierarchy::new_with_id(Uuid::nil().into(), namespace_id)
+    }
+
+    #[test]
+    fn test_get_role_assignments_response_serde() {
+        let response = GetRoleAssignmentsResponse {
+            assignments: vec![
+                RoleAssignment::Ownership(UserOrRole::User(UserId::new_unchecked("oidc", "user1"))),
+                RoleAssignment::Assignee(UserOrRole::Role(
+                    RoleId::new(Uuid::from_str("b0ef03ea-f314-42df-ae26-dc5eeea8259f").unwrap())
+                        .into_api_assignee(),
+                )),
+            ],
+        };
+        let serialized = serde_json::to_value(&response).unwrap();
+        println!(
+            "Serialized: {}",
+            serde_json::to_string_pretty(&response).unwrap()
+        );
+        let expected = serde_json::json!({
+          "assignments": [
+            {
+              "type": "ownership",
+              "user": "oidc~user1"
+            },
+            {
+              "type": "assignee",
+              "role": "b0ef03ea-f314-42df-ae26-dc5eeea8259f"
+            }
+          ]
+        });
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn test_get_tag_assignments_response_serde() {
+        let response = GetTagAssignmentsResponse::builder()
+            .assignments(vec![
+                TagAssignment::Ownership(UserOrRole::User(UserId::new_unchecked("oidc", "user1"))),
+                TagAssignment::Apply(UserOrRole::Role(
+                    RoleId::new(Uuid::from_str("b0ef03ea-f314-42df-ae26-dc5eeea8259f").unwrap())
+                        .into_api_assignee(),
+                )),
+            ])
+            .build();
+        let serialized = serde_json::to_value(&response).unwrap();
+        let expected = serde_json::json!({
+          "assignments": [
+            {
+              "type": "ownership",
+              "user": "oidc~user1"
+            },
+            {
+              "type": "apply",
+              "role": "b0ef03ea-f314-42df-ae26-dc5eeea8259f"
+            }
+          ]
+        });
+        assert_eq!(serialized, expected);
     }
 
     mod openfga_integration_tests {
+        use std::collections::HashMap;
+
         use lakekeeper::{
-            service::{authn::UserId, authz::Authorizer, ResolvedWarehouse},
+            service::{
+                ArcProjectId, ResolvedWarehouse, Role,
+                authn::UserId,
+                authz::{Authorizer, NamespaceParent},
+                events::{AuthorizationSucceededEvent, EventListener},
+            },
             tokio,
         };
+        use lakekeeper_integration_tests::SetupTestCatalog;
         use openfga_client::client::TupleKey;
         use uuid::Uuid;
 
         use super::{super::*, *};
         use crate::migration::tests::authorizer_for_empty_store;
+
+        /// Run both halves of an assignment update back to back.
+        ///
+        /// Production endpoints keep them apart so the authorization event is
+        /// emitted in between (see [`check_assignment_writes`]); tests that only
+        /// assert on the resulting tuples don't care about that seam.
+        async fn checked_write<RA: Assignment>(
+            authorizer: OpenFGAAuthorizer,
+            actor: &Actor,
+            writes: Vec<RA>,
+            deletes: Vec<RA>,
+            object: &str,
+        ) -> OpenFGAResult<()> {
+            check_assignment_writes(&authorizer, actor, &writes, &deletes, object).await?;
+            apply_assignment_writes(authorizer, writes, deletes, object).await
+        }
 
         #[tokio::test]
         async fn test_cannot_assign_role_to_itself() {
@@ -1736,7 +3080,7 @@ mod tests {
             let result = checked_write(
                 authorizer.clone(),
                 &Actor::Principal(user_id.clone()),
-                vec![RoleAssignment::Assignee(role_id.into())],
+                vec![RoleAssignment::Assignee(role_id.into_api_assignee().into())],
                 vec![],
                 &role_id.to_openfga(),
             )
@@ -1821,11 +3165,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let res = authorizer
                 .are_allowed_namespace_actions_impl(
-                    &RequestMetadata::random_human(user_id_assignee.clone()),
+                    &RequestMetadata::test_user(user_id_assignee.clone()),
+                    None,
                     &ResolvedWarehouse::new_random(),
+                    &HashMap::new(),
                     &namespaces
                         .iter()
-                        .map(|id| (id, AllNamespaceRelations::CanDelete))
+                        .map(|ns| (&ns.namespace, AllNamespaceRelations::CanDelete))
                         .collect::<Vec<_>>(),
                 )
                 .await
@@ -1843,11 +3189,13 @@ mod tests {
             // Note: `are_allowed_namespace_actions` calls `batch_check` internally.
             let res = authorizer
                 .are_allowed_namespace_actions_impl(
-                    &RequestMetadata::random_human(user_id_assignee.clone()),
+                    &RequestMetadata::test_user(user_id_assignee.clone()),
+                    None,
                     &ResolvedWarehouse::new_random(),
+                    &HashMap::new(),
                     &namespaces
                         .iter()
-                        .map(|id| (id, AllNamespaceRelations::CanDelete))
+                        .map(|ns| (&ns.namespace, AllNamespaceRelations::CanDelete))
                         .collect::<Vec<_>>(),
                 )
                 .await
@@ -1925,9 +3273,10 @@ mod tests {
             let openfga_server = authorizer.openfga_server();
             let role_id = RoleId::new(Uuid::now_v7());
             let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let role = Arc::new(Role::new_random_with_id(role_id));
             let actor = Actor::Role {
                 principal: user_id.clone(),
-                assumed_role: role_id,
+                assumed_role: role,
             };
             let access: Vec<ServerAction> =
                 get_allowed_actions(authorizer.clone(), &actor, &openfga_server, None)
@@ -1938,7 +3287,7 @@ mod tests {
             authorizer
                 .write(
                     Some(vec![TupleKey {
-                        user: role_id.into_assignees().to_openfga(),
+                        user: role_id.into_api_assignee().to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
                         object: openfga_server.clone(),
                         condition: None,
@@ -1982,7 +3331,7 @@ mod tests {
                 authorizer.clone(),
                 &actor,
                 &openfga_server,
-                Some(&role_id.into()),
+                Some(&role_id.into_api_assignee().into()),
             )
             .await
             .unwrap();
@@ -1991,7 +3340,7 @@ mod tests {
             authorizer
                 .write(
                     Some(vec![TupleKey {
-                        user: role_id.into_assignees().to_openfga(),
+                        user: role_id.into_api_assignee().to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
                         object: openfga_server.clone(),
                         condition: None,
@@ -2005,7 +3354,7 @@ mod tests {
                 authorizer.clone(),
                 &actor,
                 &openfga_server,
-                Some(&role_id.into()),
+                Some(&role_id.into_api_assignee().into()),
             )
             .await
             .unwrap();
@@ -2079,7 +3428,7 @@ mod tests {
                 &Actor::Principal(user_id_owner.clone()),
                 vec![
                     RoleAssignment::Assignee(user_id_owner.into()),
-                    RoleAssignment::Assignee(role_id_2.into()),
+                    RoleAssignment::Assignee(role_id_2.into_api_assignee().into()),
                 ],
                 vec![],
                 &role_id_1.to_openfga(),
@@ -2092,6 +3441,55 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(relations.len(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_assign_to_tag() {
+            let (_, authorizer) = authorizer_for_empty_store().await;
+
+            let user_id_owner = UserId::new_unchecked("kubernetes", &Uuid::now_v7().to_string());
+            let tag_id = TagDefinitionId::new(Uuid::now_v7());
+            let user_id_applier = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let role_id = RoleId::new(Uuid::now_v7());
+
+            // Seed ownership so the owner satisfies `can_grant_apply`.
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: user_id_owner.to_openfga(),
+                        relation: TagRelation::Ownership.to_openfga().to_string(),
+                        object: tag_id.to_openfga(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let expected_owner = TagAssignment::Ownership(user_id_owner.clone().into());
+            let expected_user_apply = TagAssignment::Apply(user_id_applier.into());
+            let expected_role_apply = TagAssignment::Apply(role_id.into_api_assignee().into());
+
+            // Owner grants `apply` to a user and a role.
+            checked_write(
+                authorizer.clone(),
+                &Actor::Principal(user_id_owner.clone()),
+                vec![expected_user_apply.clone(), expected_role_apply.clone()],
+                vec![],
+                &tag_id.to_openfga(),
+            )
+            .await
+            .unwrap();
+
+            let relations: Vec<TagAssignment> =
+                get_relations(authorizer.clone(), None, &tag_id.to_openfga())
+                    .await
+                    .unwrap();
+            // ownership (seeded) + two applies, with exact principals and variants
+            assert_eq!(relations.len(), 3);
+            assert!(relations.contains(&expected_owner));
+            assert!(relations.contains(&expected_user_apply));
+            assert!(relations.contains(&expected_role_apply));
         }
 
         #[tokio::test]
@@ -2116,13 +3514,16 @@ mod tests {
                 .await
                 .unwrap();
 
+            let tag_creator =
+                ProjectAssignment::TagCreator(UserOrRole::User(user_id_assignee.clone()));
             checked_write(
                 authorizer.clone(),
                 &Actor::Principal(user_id_owner.clone()),
                 vec![
-                    ProjectAssignment::Describe(UserOrRole::Role(role_id.into_assignees())),
-                    ProjectAssignment::DataAdmin(UserOrRole::Role(role_id.into_assignees())),
+                    ProjectAssignment::Describe(UserOrRole::Role(role_id.into_api_assignee())),
+                    ProjectAssignment::DataAdmin(UserOrRole::Role(role_id.into_api_assignee())),
                     ProjectAssignment::DataAdmin(UserOrRole::User(user_id_assignee.clone())),
+                    tag_creator.clone(),
                 ],
                 vec![],
                 &project_id.to_openfga(),
@@ -2134,7 +3535,9 @@ mod tests {
                 get_relations(authorizer.clone(), None, &project_id.to_openfga())
                     .await
                     .unwrap();
-            assert_eq!(relations.len(), 4);
+            // project_admin (seeded) + describe + 2x data_admin + tag_creator
+            assert_eq!(relations.len(), 5);
+            assert!(relations.contains(&tag_creator));
         }
 
         #[tokio::test]
@@ -2201,6 +3604,680 @@ mod tests {
             set_managed_access(authorizer.clone(), &warehouse_id, true)
                 .await
                 .unwrap();
+        }
+
+        /// Test batch warehouse authorization with mixed permissions
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_batch_warehouse_authorization_mixed() {
+            use lakekeeper::service::authz::Authorizer;
+
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create 5 warehouses
+            let warehouse_ids: Vec<WarehouseId> =
+                (0..5).map(|_| WarehouseId::from(Uuid::now_v7())).collect();
+
+            // Grant Describe permission to warehouses 1 and 3
+            for &warehouse_id in &[warehouse_ids[1], warehouse_ids[3]] {
+                authorizer
+                    .write(
+                        Some(vec![TupleKey {
+                            user: user_id.to_openfga(),
+                            relation: WarehouseRelation::Describe.to_openfga().to_string(),
+                            object: warehouse_id.to_openfga(),
+                            condition: None,
+                        }]),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let metadata = RequestMetadata::test_user(user_id);
+            let warehouses: Vec<ResolvedWarehouse> = warehouse_ids
+                .iter()
+                .map(|&id| ResolvedWarehouse::new_with_id(id))
+                .collect();
+
+            let actions: Vec<_> = warehouses
+                .iter()
+                .map(|w| (w, AllWarehouseRelation::CanGetMetadata))
+                .collect();
+
+            let results = authorizer
+                .are_allowed_warehouse_actions_impl(&metadata, None, &actions)
+                .await
+                .unwrap();
+
+            // Should be: false, true, false, true, false
+            assert_eq!(results, vec![false, true, false, true, false]);
+        }
+
+        /// Test batch namespace authorization with large batch to test batch chunking
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_batch_namespace_authorization_large_batch() {
+            use lakekeeper::service::authz::Authorizer;
+
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create a large number of namespaces (more than typical batch size of 50)
+            let num_namespaces = 120;
+            let namespace_ids: Vec<NamespaceId> = (0..num_namespaces)
+                .map(|_| NamespaceId::new_random())
+                .collect();
+
+            // Grant Modify permission to every other namespace
+            for (i, &namespace_id) in namespace_ids.iter().enumerate() {
+                if i % 2 == 0 {
+                    authorizer
+                        .write(
+                            Some(vec![TupleKey {
+                                user: user_id.to_openfga(),
+                                relation: NamespaceRelation::Modify.to_openfga().to_string(),
+                                object: namespace_id.to_openfga(),
+                                condition: None,
+                            }]),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let metadata = RequestMetadata::test_user(user_id);
+            let warehouse = ResolvedWarehouse::new_random();
+
+            let namespaces: Vec<_> = namespace_ids
+                .iter()
+                .map(|&id| random_namespace(id))
+                .collect();
+
+            let actions: Vec<_> = namespaces
+                .iter()
+                .map(|ns| (&ns.namespace, AllNamespaceRelations::CanDelete))
+                .collect();
+
+            let results = authorizer
+                .are_allowed_namespace_actions_impl(
+                    &metadata,
+                    None,
+                    &warehouse,
+                    &HashMap::new(),
+                    &actions,
+                )
+                .await
+                .unwrap();
+
+            // Verify results match expected pattern (every other one allowed)
+            assert_eq!(results.len(), num_namespaces);
+            for (i, allowed) in results.iter().enumerate() {
+                assert_eq!(*allowed, i % 2 == 0, "Namespace {i} permission mismatch");
+            }
+        }
+
+        /// Test batch project authorization with mixed permissions
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_batch_project_authorization_mixed() {
+            use lakekeeper::service::authz::Authorizer;
+
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create 4 projects
+            let project_ids: Vec<ArcProjectId> = (0..4)
+                .map(|_| Arc::new(ProjectId::from(Uuid::now_v7())))
+                .collect();
+
+            // Grant Describe to projects 0 and 2
+            for idx in [0, 2] {
+                authorizer
+                    .write(
+                        Some(vec![TupleKey {
+                            user: user_id.to_openfga(),
+                            relation: ProjectRelation::Describe.to_openfga().to_string(),
+                            object: project_ids[idx].to_openfga(),
+                            condition: None,
+                        }]),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let metadata = RequestMetadata::test_user(user_id);
+
+            let actions = project_ids
+                .iter()
+                .map(|p| (p, AllProjectRelations::CanGetMetadata))
+                .collect::<Vec<_>>();
+
+            let results = authorizer
+                .are_allowed_project_actions_impl(&metadata, None, &actions)
+                .await
+                .unwrap();
+
+            // Should be: true, false, true, false
+            assert_eq!(results, vec![true, false, true, false]);
+        }
+
+        /// Test that batch operations handle all denied permissions correctly
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_batch_authorization_all_denied() {
+            use lakekeeper::service::authz::Authorizer;
+
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create namespaces but don't grant any permissions
+            let namespace_ids: Vec<NamespaceId> =
+                (0..10).map(|_| NamespaceId::new_random()).collect();
+
+            let metadata = RequestMetadata::test_user(user_id);
+            let warehouse = ResolvedWarehouse::new_random();
+
+            let namespaces: Vec<_> = namespace_ids
+                .iter()
+                .map(|&id| random_namespace(id))
+                .collect();
+
+            let actions: Vec<_> = namespaces
+                .iter()
+                .map(|ns| (&ns.namespace, AllNamespaceRelations::CanDelete))
+                .collect();
+
+            let results = authorizer
+                .are_allowed_namespace_actions_impl(
+                    &metadata,
+                    None,
+                    &warehouse,
+                    &HashMap::new(),
+                    &actions,
+                )
+                .await
+                .unwrap();
+
+            // All should be denied
+            assert_eq!(results, vec![false; 10]);
+        }
+
+        /// Test that batch operations handle all allowed permissions correctly
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_batch_authorization_all_allowed() {
+            use lakekeeper::service::authz::Authorizer;
+
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create namespaces and grant all permissions
+            let namespace_ids: Vec<NamespaceId> =
+                (0..8).map(|_| NamespaceId::new_random()).collect();
+
+            // Grant Describe permission to all namespaces
+            for &namespace_id in &namespace_ids {
+                authorizer
+                    .write(
+                        Some(vec![TupleKey {
+                            user: user_id.to_openfga(),
+                            relation: NamespaceRelation::Describe.to_openfga().to_string(),
+                            object: namespace_id.to_openfga(),
+                            condition: None,
+                        }]),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let metadata = RequestMetadata::test_user(user_id);
+            let warehouse = ResolvedWarehouse::new_random();
+
+            let namespaces: Vec<_> = namespace_ids
+                .iter()
+                .map(|&id| random_namespace(id))
+                .collect();
+
+            let actions: Vec<_> = namespaces
+                .iter()
+                .map(|ns| (&ns.namespace, AllNamespaceRelations::CanGetMetadata))
+                .collect();
+
+            let results = authorizer
+                .are_allowed_namespace_actions_impl(
+                    &metadata,
+                    None,
+                    &warehouse,
+                    &HashMap::new(),
+                    &actions,
+                )
+                .await
+                .unwrap();
+
+            // All should be allowed
+            assert_eq!(results, vec![true; 8]);
+        }
+
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_managed_access_warehouse_inheritance_user() {
+            let (_, authorizer) = authorizer_for_empty_store().await;
+
+            // Create two users: user A will be namespace owner, user B will receive grants
+            let user_a = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let user_b = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let user_c = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+
+            // Create warehouse and namespace
+            let warehouse_id = WarehouseId::from(Uuid::now_v7());
+            let namespace_id = NamespaceId::new_random();
+
+            // Setup hierarchy: warehouse -> namespace
+            authorizer
+                .create_namespace(
+                    &RequestMetadata::test_user(user_a.clone()),
+                    namespace_id,
+                    NamespaceParent::Warehouse(warehouse_id),
+                )
+                .await
+                .unwrap();
+
+            // User A grants select on namespace to user B - should succeed (no managed access yet)
+            let result = checked_write(
+                authorizer.clone(),
+                &Actor::Principal(user_a.clone()),
+                vec![NamespaceAssignment::Select(user_b.clone().into())],
+                vec![],
+                &namespace_id.to_openfga(),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "User A should be able to grant select before managed access is enabled"
+            );
+
+            // Set warehouse to managed access
+            set_managed_access(authorizer.clone(), &warehouse_id, true)
+                .await
+                .unwrap();
+
+            // Verify managed access is enabled
+            let managed = get_managed_access(&authorizer, &warehouse_id)
+                .await
+                .unwrap();
+            assert!(managed, "Warehouse should have managed access enabled");
+
+            // User A tries to grant select on namespace to user B again - should FAIL
+            let result = checked_write(
+                authorizer.clone(),
+                &Actor::Principal(user_a.clone()),
+                vec![NamespaceAssignment::Select(user_c.clone().into())],
+                vec![],
+                &namespace_id.to_openfga(),
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "User A should NOT be able to grant select when warehouse has managed access enabled"
+            );
+        }
+
+        #[tokio::test]
+        #[tracing_test::traced_test]
+        async fn test_managed_access_warehouse_inheritance_role() {
+            let (_, authorizer) = authorizer_for_empty_store().await;
+
+            // Create two users: user A will be namespace owner, user B will receive grants
+            let user_a = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let role_a_id = RoleId::new(Uuid::now_v7());
+            let role_a = Arc::new(Role::new_random_with_id(role_a_id));
+
+            let actor = Actor::Role {
+                principal: user_a.clone(),
+                assumed_role: role_a,
+            };
+
+            // Create warehouse and namespace
+            let warehouse_id = WarehouseId::from(Uuid::now_v7());
+            let namespace_id = NamespaceId::new_random();
+
+            // Setup hierarchy: warehouse -> namespace
+            authorizer
+                .create_namespace(
+                    &RequestMetadata::test_user_assumed_role(user_a.clone(), role_a_id),
+                    namespace_id,
+                    NamespaceParent::Warehouse(warehouse_id),
+                )
+                .await
+                .unwrap();
+
+            // // User A grants select on namespace- should succeed (no managed access yet)
+            // Currently unsupported as the userset check for ownership does not support the public tuple
+            // role:*
+            // This worked with OpenFGA < 1.8.13
+            // checked_write(
+            //     authorizer.clone(),
+            //     &actor,
+            //     vec![NamespaceAssignment::Select(
+            //         UserId::new_unchecked("oidc", &Uuid::now_v7().to_string()).into(),
+            //     )],
+            //     vec![],
+            //     &namespace_id.to_openfga(),
+            // )
+            // .await
+            // .unwrap();
+
+            // Set warehouse to managed access
+            set_managed_access(authorizer.clone(), &warehouse_id, true)
+                .await
+                .unwrap();
+
+            // Verify managed access is enabled
+            let managed = get_managed_access(&authorizer, &warehouse_id)
+                .await
+                .unwrap();
+            assert!(managed, "Warehouse should have managed access enabled");
+
+            // User A tries to grant select on namespace to user B again - should FAIL
+            let result = checked_write(
+                authorizer.clone(),
+                &Actor::Principal(user_a.clone()),
+                vec![NamespaceAssignment::Select(
+                    UserId::new_unchecked("oidc", &Uuid::now_v7().to_string()).into(),
+                )],
+                vec![],
+                &namespace_id.to_openfga(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "User A should NOT be able to grant select when warehouse has managed access enabled"
+            );
+            let result = checked_write(
+                authorizer.clone(),
+                &actor,
+                vec![NamespaceAssignment::Select(
+                    UserId::new_unchecked("oidc", &Uuid::now_v7().to_string()).into(),
+                )],
+                vec![],
+                &namespace_id.to_openfga(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "User A with assumed role should NOT be able to grant select when warehouse has managed access enabled"
+            );
+        }
+
+        /// Records every `authorization_succeeded` event it receives.
+        #[derive(Debug, Default)]
+        struct CapturingListener {
+            succeeded: std::sync::Mutex<Vec<AuthorizationSucceededEvent>>,
+        }
+
+        impl std::fmt::Display for CapturingListener {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "CapturingListener")
+            }
+        }
+
+        #[lakekeeper::async_trait::async_trait]
+        impl EventListener for CapturingListener {
+            async fn authorization_succeeded(
+                &self,
+                event: AuthorizationSucceededEvent,
+            ) -> anyhow::Result<()> {
+                self.succeeded.lock().unwrap().push(event);
+                Ok(())
+            }
+        }
+
+        impl CapturingListener {
+            fn count(&self) -> usize {
+                self.succeeded.lock().unwrap().len()
+            }
+
+            /// Events are dispatched from a spawned task, so give it a moment to
+            /// land before asserting. Waits for `expected` events, then waits a
+            /// little longer so surplus emits are caught rather than raced past.
+            async fn settled_count(&self, expected: usize) -> usize {
+                for _ in 0..100 {
+                    if self.count() >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                self.count()
+            }
+        }
+
+        /// The authorization check must not touch OpenFGA state.
+        ///
+        /// Endpoints emit the audit event between the check and the write, so a
+        /// check that also wrote would commit the side-effect before the attempt
+        /// was ever logged — the ordering bug this split exists to prevent.
+        #[tokio::test]
+        async fn test_check_assignment_writes_has_no_side_effects() {
+            let (_, authorizer) = authorizer_for_empty_store().await;
+
+            let admin_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let grantee_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let openfga_server = authorizer.openfga_server();
+
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: admin_id.to_openfga(),
+                        relation: ServerRelation::Admin.to_openfga().to_string(),
+                        object: openfga_server.clone(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let writes = vec![ServerAssignment::Admin(grantee_id.clone().into())];
+            check_assignment_writes(
+                &authorizer,
+                &Actor::Principal(admin_id.clone()),
+                &writes,
+                &[],
+                &openfga_server,
+            )
+            .await
+            .unwrap();
+
+            let relations: Vec<ServerAssignment> =
+                get_relations(authorizer.clone(), None, &openfga_server)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                relations,
+                vec![ServerAssignment::Admin(admin_id.into())],
+                "check_assignment_writes must not apply the assignment - only the \
+                 pre-existing admin tuple should be present"
+            );
+
+            // The write still lands when applied explicitly.
+            apply_assignment_writes(authorizer.clone(), writes, vec![], &openfga_server)
+                .await
+                .unwrap();
+            let relations: Vec<ServerAssignment> = get_relations(authorizer, None, &openfga_server)
+                .await
+                .unwrap();
+            assert_eq!(relations.len(), 2);
+        }
+
+        /// `pass_grants` delegates one direction only: a holder may hand out a privilege
+        /// they hold, but taking one back is administration and needs `manage_grants`.
+        ///
+        /// Covers the assignments endpoints specifically. The `/grants` diff asks the same
+        /// question through `grant_authority`, but this path authorizes writes and deletes
+        /// separately in `check_assignment_writes`, so it needs its own pin — it is also
+        /// the path that shipped, which makes the asymmetry a behaviour change here.
+        #[tokio::test]
+        async fn test_pass_grants_hands_out_but_cannot_take_back() {
+            let (_, authorizer) = authorizer_for_empty_store().await;
+            let delegator = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let grantee = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let warehouse_id = WarehouseId::from(Uuid::now_v7());
+            let object = warehouse_id.to_openfga();
+
+            // The delegator holds `select` and may pass it on, but no grant administration.
+            authorizer
+                .write(
+                    Some(vec![
+                        TupleKey {
+                            user: delegator.to_openfga(),
+                            relation: AllWarehouseRelation::Select.to_string(),
+                            object: object.clone(),
+                            condition: None,
+                        },
+                        TupleKey {
+                            user: delegator.to_openfga(),
+                            relation: AllWarehouseRelation::PassGrants.to_string(),
+                            object: object.clone(),
+                            condition: None,
+                        },
+                    ]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            checked_write(
+                authorizer.clone(),
+                &Actor::Principal(delegator.clone()),
+                vec![WarehouseAssignment::Select(grantee.clone().into())],
+                vec![],
+                &object,
+            )
+            .await
+            .expect("passing on a privilege the delegator holds is delegation");
+
+            let error = checked_write(
+                authorizer.clone(),
+                &Actor::Principal(delegator.clone()),
+                vec![],
+                vec![WarehouseAssignment::Select(grantee.clone().into())],
+                &object,
+            )
+            .await
+            .expect_err("taking it back is administration, not delegation");
+            assert!(
+                matches!(
+                    &error,
+                    OpenFGAError::Unauthorized { relation, .. }
+                        if relation == &AllWarehouseRelation::CanRevokeSelect.to_string()
+                ),
+                "the denial must name the revoke relation, not the grant one: {error:?}"
+            );
+
+            let relations: Vec<WarehouseAssignment> =
+                get_relations(authorizer.clone(), None, &object)
+                    .await
+                    .unwrap();
+            assert!(
+                relations.contains(&WarehouseAssignment::Select(grantee.clone().into())),
+                "the refused delete must leave the assignment in place: {relations:?}"
+            );
+
+            // The same delete succeeds for a principal holding grant administration.
+            let admin = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            authorizer
+                .write(
+                    Some(vec![TupleKey {
+                        user: admin.to_openfga(),
+                        relation: AllWarehouseRelation::ManageGrants.to_string(),
+                        object: object.clone(),
+                        condition: None,
+                    }]),
+                    None,
+                )
+                .await
+                .unwrap();
+            checked_write(
+                authorizer.clone(),
+                &Actor::Principal(admin),
+                vec![],
+                vec![WarehouseAssignment::Select(grantee.into())],
+                &object,
+            )
+            .await
+            .expect("manage_grants administers both directions");
+        }
+
+        /// Drives the real endpoint: a write that fails *after* authorization
+        /// succeeded must still leave the authorization attempt in the audit log,
+        /// and must not log it twice.
+        ///
+        /// The second call is byte-identical to the first, so the authorization
+        /// check passes again while OpenFGA rejects the duplicate tuple - a write
+        /// failure reachable only once authorization has already been decided.
+        #[sqlx::test]
+        async fn test_endpoint_audits_authz_before_failing_write(pool: sqlx::PgPool) {
+            let operator_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let authorizer = authorizer_for_empty_store().await.1;
+            let (ctx, warehouse) = SetupTestCatalog::builder()
+                .pool(pool)
+                .authorizer(authorizer)
+                .user_id(Some(operator_id.clone()))
+                .build()
+                .setup()
+                .await;
+
+            // Attach after setup so only the two calls below are captured.
+            let listener = Arc::new(CapturingListener::default());
+            ctx.v1_state
+                .events
+                .append(listener.clone() as Arc<dyn EventListener>)
+                .await;
+
+            let grantee_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
+            let request = UpdateWarehouseAssignmentsRequest {
+                writes: vec![WarehouseAssignment::Select(grantee_id.into())],
+                deletes: vec![],
+            };
+            let metadata = RequestMetadata::test_user(operator_id);
+
+            update_warehouse_assignments_by_id(
+                Path(warehouse.warehouse_id),
+                AxumState(ctx.clone()),
+                Extension(metadata.clone()),
+                Json(request.clone()),
+            )
+            .await
+            .expect("first assignment update succeeds");
+            assert_eq!(
+                listener.settled_count(1).await,
+                1,
+                "the successful call must be audited exactly once"
+            );
+
+            let write_error = update_warehouse_assignments_by_id(
+                Path(warehouse.warehouse_id),
+                AxumState(ctx),
+                Extension(metadata),
+                Json(request),
+            )
+            .await
+            .expect_err("re-writing an existing tuple must fail");
+
+            assert_eq!(
+                listener.settled_count(2).await,
+                2,
+                "the second authorization attempt must be audited exactly once even \
+                 though the write that followed it failed: {write_error:?}"
+            );
         }
     }
 }

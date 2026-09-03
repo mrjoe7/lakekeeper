@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use super::{ApiServer, ProtectionResponse};
 use crate::{
+    WarehouseId,
     api::{ApiContext, RequestMetadata, Result},
     service::{
-        authz::{AuthZTableOps, Authorizer, CatalogTableAction},
         CatalogStore, CatalogTabularOps, SecretStore, State, TableId, TabularId, TabularListFlags,
         Transaction,
+        authz::{AuthZTableOps, Authorizer, CatalogTableAction},
+        events::APIEventContext,
     },
-    WarehouseId,
 };
 
 impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore> TableManagementService<C, A, S>
@@ -28,24 +31,28 @@ where
     ) -> Result<ProtectionResponse> {
         // ------------------- AUTHZ -------------------
         let authorizer = state.v1_state.authz;
-        let table = C::get_table_info(
+        let state_catalog = state.v1_state.catalog.clone();
+
+        let event_ctx = APIEventContext::for_table(
+            Arc::new(request_metadata),
+            state.v1_state.events.clone(),
             warehouse_id,
             table_id,
-            TabularListFlags::all(),
-            state.v1_state.catalog.clone(),
-        )
-        .await;
-        authorizer
-            .require_table_action(
-                &request_metadata,
-                warehouse_id,
-                table_id,
-                table,
-                CatalogTableAction::CanDrop,
-            )
-            .await?;
+            CatalogTableAction::SetProtection,
+        );
 
-        let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
+        let authz_result = authorizer
+            .load_and_authorize_table_operation::<C>(
+                event_ctx.request_metadata(),
+                event_ctx.user_provided_entity(),
+                TabularListFlags::all(),
+                event_ctx.action().clone(),
+                state_catalog.clone(),
+            )
+            .await;
+        let (_event_ctx, _table) = event_ctx.emit_authz(authz_result)?;
+        // ------------------- BUSINESS LOGIC -------------------
+        let mut t = C::Transaction::begin_write(state_catalog).await?;
         let status = C::set_tabular_protected(
             warehouse_id,
             TabularId::Table(table_id),
@@ -66,30 +73,31 @@ where
         state: ApiContext<State<A, C, S>>,
         request_metadata: RequestMetadata,
     ) -> Result<ProtectionResponse> {
-        //  ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz.clone();
+        // ------------------- AUTHZ -------------------
+        let authorizer = state.v1_state.authz;
 
-        let info = C::get_table_info(
+        let event_ctx = APIEventContext::for_table(
+            Arc::new(request_metadata.clone()),
+            state.v1_state.events.clone(),
             warehouse_id,
             table_id,
-            TabularListFlags::all(),
-            state.v1_state.catalog,
-        )
-        .await;
+            CatalogTableAction::GetMetadata,
+        );
 
-        let info = authorizer
-            .require_table_action(
-                &request_metadata,
-                warehouse_id,
-                table_id,
-                info,
-                CatalogTableAction::CanGetMetadata,
+        let authz_result = authorizer
+            .load_and_authorize_table_operation::<C>(
+                event_ctx.request_metadata(),
+                event_ctx.user_provided_entity(),
+                TabularListFlags::all(),
+                event_ctx.action().clone(),
+                state.v1_state.catalog,
             )
-            .await?;
+            .await;
+        let (_event_ctx, (_, _, table)) = event_ctx.emit_authz(authz_result)?;
 
         Ok(ProtectionResponse {
-            protected: info.protected,
-            updated_at: info.updated_at,
+            protected: table.protected,
+            updated_at: table.updated_at,
         })
     }
 }

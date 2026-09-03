@@ -1,24 +1,29 @@
 use std::sync::Arc;
 
 use http::StatusCode;
-use iceberg_ext::catalog::rest::{ErrorModel, IcebergErrorResponse};
+use iceberg::spec::FormatVersion;
+use iceberg_ext::catalog::rest::ErrorModel;
 
-use super::{CatalogStore, Transaction};
+use super::{CatalogCreateWarehouseRequest, CatalogStore, Transaction};
 use crate::{
-    api::management::v1::{warehouse::TabularDeleteProfile, DeleteWarehouseQuery},
+    ProjectId, SecretId, WarehouseId,
+    api::management::v1::{DeleteWarehouseQuery, warehouse::TabularDeleteProfile},
     service::{
+        ArcProjectId, DatabaseIntegrityError,
+        authz::CatalogWarehouseAction,
         catalog_store::{
-            define_transparent_error, impl_error_stack_methods, impl_from_with_detail,
+            CatalogBackendError, define_transparent_error, impl_error_stack_methods,
+            impl_from_with_detail,
             warehouse_cache::{
-                warehouse_cache_get_by_id, warehouse_cache_get_by_name, warehouse_cache_insert,
+                warehouse_cache_get_by_id, warehouse_cache_get_by_name,
+                warehouse_cache_get_or_load, warehouse_cache_insert,
+                warehouse_name_to_id_get_or_load,
             },
-            CatalogBackendError,
         },
         define_simple_error, define_version_newtype,
+        events::{AuthorizationFailureReason, AuthorizationFailureSource},
         storage::StorageProfile,
-        DatabaseIntegrityError,
     },
-    ProjectId, SecretId, WarehouseId,
 };
 
 /// Status of a warehouse
@@ -38,10 +43,10 @@ use crate::{
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
-#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx-postgres", derive(sqlx::Type))]
 #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
 #[cfg_attr(
-    feature = "sqlx",
+    feature = "sqlx-postgres",
     sqlx(type_name = "warehouse_status", rename_all = "kebab-case")
 )]
 pub enum WarehouseStatus {
@@ -49,6 +54,59 @@ pub enum WarehouseStatus {
     Active,
     /// The warehouse is inactive and cannot be used.
     Inactive,
+}
+
+/// Which control plane, if any, exclusively manages a warehouse's spec.
+///
+/// `self-managed` (the default) leaves the spec mutable by the warehouse's own
+/// owners through the usual grants. When set to `instance-admin`, spec changes —
+/// storage profile, credentials, delete profile, rename, status, protection,
+/// format-version policy, and deletion — are accepted only from instance
+/// administrators; other callers are rejected even when their grants would
+/// otherwise allow it. Child resources (namespaces, tables, grants), task-queue
+/// configuration, and data access are unaffected.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    strum_macros::Display,
+    strum_macros::EnumIter,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+#[cfg_attr(feature = "sqlx-postgres", derive(sqlx::Type))]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[cfg_attr(
+    feature = "sqlx-postgres",
+    sqlx(type_name = "managed_by", rename_all = "kebab-case")
+)]
+pub enum ManagedBy {
+    /// Self-managed: the warehouse's own owners mutate the spec through the usual
+    /// grants. No external control plane locks it. This is the default.
+    #[default]
+    SelfManaged,
+    /// Managed by the instance: spec mutations require instance-admin privilege
+    /// (any principal in `LAKEKEEPER__INSTANCE_ADMINS`, or an in-process caller).
+    InstanceAdmin,
+}
+
+impl ManagedBy {
+    /// Whether an external control plane manages the spec, locking it against the
+    /// warehouse's own grant-holders. `false` for [`ManagedBy::SelfManaged`].
+    ///
+    /// The exact set of locked actions is defined by
+    /// [`CatalogWarehouseAction::is_spec_mutation`]; notably `ModifyTaskQueueConfig`
+    /// is excluded.
+    #[must_use]
+    pub fn is_externally_managed(self) -> bool {
+        !matches!(self, ManagedBy::SelfManaged)
+    }
 }
 
 impl WarehouseStatus {
@@ -70,6 +128,105 @@ impl WarehouseStatus {
 
 define_version_newtype!(WarehouseVersion);
 
+/// The set of Iceberg table format versions that may be created in, or upgraded
+/// to, within a warehouse. Always non-empty; deduplicated and sorted ascending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedFormatVersions(Vec<FormatVersion>);
+
+impl Default for AllowedFormatVersions {
+    /// All format versions supported by Lakekeeper.
+    fn default() -> Self {
+        Self(vec![
+            FormatVersion::V1,
+            FormatVersion::V2,
+            FormatVersion::V3,
+        ])
+    }
+}
+
+impl AllowedFormatVersions {
+    /// Build from an iterator of versions, deduplicating and sorting ascending.
+    ///
+    /// # Errors
+    /// Returns [`EmptyAllowedFormatVersionsError`] if no versions are provided.
+    pub fn try_new(
+        versions: impl IntoIterator<Item = FormatVersion>,
+    ) -> Result<Self, EmptyAllowedFormatVersionsError> {
+        let mut versions: Vec<FormatVersion> = versions.into_iter().collect();
+        versions.sort_unstable();
+        versions.dedup();
+        if versions.is_empty() {
+            return Err(EmptyAllowedFormatVersionsError::new());
+        }
+        Ok(Self(versions))
+    }
+
+    /// Whether `version` is permitted.
+    #[must_use]
+    pub fn contains(&self, version: FormatVersion) -> bool {
+        self.0.contains(&version)
+    }
+
+    /// Highest allowed format version. The set is non-empty, so this always
+    /// returns a value; `V2` is only a defensive fallback.
+    #[must_use]
+    pub fn max(&self) -> FormatVersion {
+        self.0.iter().copied().max().unwrap_or(FormatVersion::V2)
+    }
+
+    /// Resolve the effective format version for a create-table request that does
+    /// not specify one: the configured `default_format_version` if set, otherwise
+    /// `V2` if allowed, else the highest allowed version.
+    #[must_use]
+    pub fn resolve_default(&self, configured: Option<FormatVersion>) -> FormatVersion {
+        configured.unwrap_or_else(|| {
+            if self.contains(FormatVersion::V2) {
+                FormatVersion::V2
+            } else {
+                self.max()
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[FormatVersion] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<FormatVersion> {
+        self.0.clone()
+    }
+}
+
+define_simple_error!(
+    EmptyAllowedFormatVersionsError,
+    "allowed_format_versions must contain at least one format version."
+);
+
+impl From<EmptyAllowedFormatVersionsError> for ErrorModel {
+    fn from(err: EmptyAllowedFormatVersionsError) -> Self {
+        ErrorModel::builder()
+            .r#type("EmptyAllowedFormatVersions")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// Per-warehouse Iceberg table format version policy: which versions may be
+/// created in / upgraded to, and the default applied when a create-table request
+/// omits one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarehouseFormatVersionPolicy {
+    /// Versions that may be created in, or upgraded to, within the warehouse.
+    pub allowed_format_versions: AllowedFormatVersions,
+    /// Default version used when a create-table request omits one. When `None`,
+    /// resolves to `V2` if allowed, otherwise the highest allowed version.
+    pub default_format_version: Option<FormatVersion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedWarehouse {
     /// ID of the warehouse.
@@ -77,7 +234,7 @@ pub struct ResolvedWarehouse {
     /// Name of the warehouse.
     pub name: String,
     /// Project ID in which the warehouse is created.
-    pub project_id: ProjectId,
+    pub project_id: ArcProjectId,
     /// Storage profile used for the warehouse.
     pub storage_profile: StorageProfile,
     /// Storage secret ID used for the warehouse.
@@ -88,6 +245,17 @@ pub struct ResolvedWarehouse {
     pub tabular_delete_profile: TabularDeleteProfile,
     /// Whether the warehouse is protected from being deleted.
     pub protected: bool,
+    /// Which control plane, if any, exclusively manages this warehouse's spec.
+    /// When not [`ManagedBy::SelfManaged`], spec mutations are restricted to the
+    /// managing control plane (see [`ManagedBy`]).
+    pub managed_by: ManagedBy,
+    /// Iceberg table format versions that may be created in, or upgraded to,
+    /// within this warehouse.
+    pub allowed_format_versions: AllowedFormatVersions,
+    /// Default Iceberg table format version used when a create-table request
+    /// does not specify one. When `None`, resolves to `V2` if allowed, otherwise
+    /// the highest allowed version. Always a member of `allowed_format_versions`.
+    pub default_format_version: Option<FormatVersion>,
     /// Timestamp when the warehouse metadata was last updated.
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Version of the warehouse entity.
@@ -106,12 +274,15 @@ impl ResolvedWarehouse {
         Self {
             warehouse_id,
             name,
-            project_id: ProjectId::new_random(),
+            project_id: Arc::new(ProjectId::new_random()),
             storage_profile: MemoryProfile::default().into(),
             storage_secret_id: None,
             status: WarehouseStatus::Active,
             tabular_delete_profile: TabularDeleteProfile::default(),
             protected: false,
+            managed_by: crate::service::ManagedBy::SelfManaged,
+            allowed_format_versions: AllowedFormatVersions::default(),
+            default_format_version: None,
             updated_at: None,
             version: WarehouseVersion(0),
         }
@@ -126,12 +297,15 @@ impl ResolvedWarehouse {
         Self {
             warehouse_id,
             name,
-            project_id: ProjectId::new_random(),
+            project_id: Arc::new(ProjectId::new_random()),
             storage_profile: MemoryProfile::default().into(),
             storage_secret_id: None,
             status: WarehouseStatus::Active,
             tabular_delete_profile: TabularDeleteProfile::default(),
             protected: false,
+            managed_by: crate::service::ManagedBy::SelfManaged,
+            allowed_format_versions: AllowedFormatVersions::default(),
+            default_format_version: None,
             updated_at: None,
             version: WarehouseVersion(0),
         }
@@ -158,13 +332,42 @@ impl_error_stack_methods!(WarehouseIdNotFound);
 
 impl From<WarehouseIdNotFound> for ErrorModel {
     fn from(err: WarehouseIdNotFound) -> Self {
-        ErrorModel {
-            r#type: "WarehouseNotFound".to_string(),
-            code: StatusCode::NOT_FOUND.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("NoSuchWarehouseException")
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+#[error("Warehouse id is missing")]
+pub struct WarehouseIdMissing {
+    pub stack: Vec<String>,
+}
+impl Default for WarehouseIdMissing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WarehouseIdMissing {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { stack: Vec::new() }
+    }
+}
+impl_error_stack_methods!(WarehouseIdMissing);
+
+impl From<WarehouseIdMissing> for ErrorModel {
+    fn from(err: WarehouseIdMissing) -> Self {
+        ErrorModel::builder()
+            .r#type("WarehouseIdMissing")
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -187,13 +390,12 @@ impl_error_stack_methods!(WarehouseNameNotFound);
 
 impl From<WarehouseNameNotFound> for ErrorModel {
     fn from(err: WarehouseNameNotFound) -> Self {
-        ErrorModel {
-            r#type: "WarehouseNotFound".to_string(),
-            code: StatusCode::NOT_FOUND.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("NoSuchWarehouseException")
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -222,13 +424,13 @@ impl From<StorageProfileSerializationError> for ErrorModel {
         let message = err.to_string();
         let StorageProfileSerializationError { source, stack } = err;
 
-        ErrorModel {
-            r#type: "StorageProfileSerializationError".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            message,
-            stack,
-            source: Some(Box::new(source)),
-        }
+        ErrorModel::builder()
+            .r#type("StorageProfileSerializationError")
+            .code(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+            .message(message)
+            .stack(stack)
+            .source(Some(Box::new(source)))
+            .build()
     }
 }
 
@@ -238,6 +440,7 @@ define_transparent_error! {
     stack_message: "Error creating warehouse in catalog",
     variants: [
         WarehouseAlreadyExists,
+        WarehouseIdAlreadyExists,
         CatalogBackendError,
         StorageProfileSerializationError,
         ProjectIdNotFoundError,
@@ -268,13 +471,45 @@ impl_error_stack_methods!(WarehouseAlreadyExists);
 
 impl From<WarehouseAlreadyExists> for ErrorModel {
     fn from(err: WarehouseAlreadyExists) -> Self {
-        ErrorModel {
-            r#type: "WarehouseAlreadyExists".to_string(),
-            code: StatusCode::CONFLICT.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
+        ErrorModel::builder()
+            .r#type("WarehouseAlreadyExists")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+// Warehouse ids are unique across the whole instance, so this conflict may be
+// with a warehouse in a project the caller cannot see. The message therefore
+// names neither the owning project nor the warehouse: a caller who may create
+// warehouses somewhere must not be able to use a requested id as an oracle for
+// what exists elsewhere on the instance.
+#[derive(thiserror::Error, PartialEq, Debug)]
+#[error("A warehouse with id '{warehouse_id}' already exists")]
+pub struct WarehouseIdAlreadyExists {
+    pub warehouse_id: WarehouseId,
+    pub stack: Vec<String>,
+}
+impl WarehouseIdAlreadyExists {
+    #[must_use]
+    pub fn new(warehouse_id: WarehouseId) -> Self {
+        Self {
+            warehouse_id,
+            stack: Vec::new(),
         }
+    }
+}
+impl_error_stack_methods!(WarehouseIdAlreadyExists);
+
+impl From<WarehouseIdAlreadyExists> for ErrorModel {
+    fn from(err: WarehouseIdAlreadyExists) -> Self {
+        ErrorModel::builder()
+            .r#type("WarehouseIdAlreadyExists")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -296,13 +531,12 @@ impl ProjectIdNotFoundError {
 }
 impl From<ProjectIdNotFoundError> for ErrorModel {
     fn from(err: ProjectIdNotFoundError) -> Self {
-        ErrorModel {
-            r#type: "ProjectNotFound".to_string(),
-            code: StatusCode::NOT_FOUND.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("ProjectNotFound")
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -326,13 +560,12 @@ define_simple_error!(
 
 impl From<WarehouseHasUnfinishedTasks> for ErrorModel {
     fn from(err: WarehouseHasUnfinishedTasks) -> Self {
-        ErrorModel {
-            r#type: "WarehouseHasUnfinishedTasks".to_string(),
-            code: StatusCode::CONFLICT.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("WarehouseHasUnfinishedTasks")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -347,24 +580,22 @@ define_simple_error!(
 
 impl From<WarehouseNotEmpty> for ErrorModel {
     fn from(err: WarehouseNotEmpty) -> Self {
-        ErrorModel {
-            r#type: "WarehouseNotEmpty".to_string(),
-            code: StatusCode::CONFLICT.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("WarehouseNotEmpty")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 impl From<WarehouseProtected> for ErrorModel {
     fn from(err: WarehouseProtected) -> Self {
-        ErrorModel {
-            r#type: "WarehouseProtected".to_string(),
-            code: StatusCode::CONFLICT.as_u16(),
-            message: err.to_string(),
-            stack: err.stack,
-            source: None,
-        }
+        ErrorModel::builder()
+            .r#type("WarehouseProtected")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
     }
 }
 
@@ -454,7 +685,85 @@ define_transparent_error! {
     ]
 }
 
-#[derive(Debug, Clone, Default)]
+// --------------------- Set Warehouse Format Version Policy Error ---------------------
+define_transparent_error! {
+    pub enum SetWarehouseFormatVersionPolicyError,
+    stack_message: "Error setting warehouse format version policy in catalog",
+    variants: [
+        CatalogBackendError,
+        WarehouseIdNotFound,
+        DatabaseIntegrityError,
+    ]
+}
+
+// --------------------------- Set Warehouse Managed-By Error ---------------------------
+define_transparent_error! {
+    pub enum SetWarehouseManagedByError,
+    stack_message: "Error setting warehouse managed-by marker in catalog",
+    variants: [
+        CatalogBackendError,
+        WarehouseIdNotFound,
+        DatabaseIntegrityError,
+    ]
+}
+
+// --------------------------- Warehouse Spec Locked (managed-by) ---------------------------
+/// Returned when a spec mutation targets a managed warehouse and the caller is
+/// not the managing control plane (instance admin / in-process). HTTP 403 with a
+/// stable `WarehouseManaged` type so clients can recognise the conflict.
+#[derive(thiserror::Error, Debug, PartialEq)]
+#[error(
+    "Warehouse spec is managed by '{managed_by}' and cannot be modified by this caller. \
+     Manage it through the controlling instance admin (e.g. your operator / IaC), \
+     or have an instance admin clear the managed-by marker."
+)]
+pub struct WarehouseSpecLocked {
+    pub managed_by: ManagedBy,
+    pub stack: Vec<String>,
+}
+impl WarehouseSpecLocked {
+    #[must_use]
+    pub fn new(managed_by: ManagedBy) -> Self {
+        Self {
+            managed_by,
+            stack: Vec::new(),
+        }
+    }
+}
+impl_error_stack_methods!(WarehouseSpecLocked);
+
+impl From<WarehouseSpecLocked> for ErrorModel {
+    fn from(err: WarehouseSpecLocked) -> Self {
+        ErrorModel::builder()
+            .r#type("WarehouseManaged")
+            .code(StatusCode::FORBIDDEN.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+impl AuthorizationFailureSource for WarehouseSpecLocked {
+    fn to_failure_reason(&self) -> AuthorizationFailureReason {
+        AuthorizationFailureReason::ActionForbidden
+    }
+
+    fn into_error_model(self) -> ErrorModel {
+        self.into()
+    }
+}
+
+define_transparent_error! {
+    pub enum EnsureWarehouseSpecMutableError,
+    stack_message: "Error verifying warehouse spec is mutable",
+    variants: [
+        CatalogBackendError,
+        WarehouseSpecLocked,
+        DatabaseIntegrityError,
+    ]
+}
+
+#[derive(Debug, Clone, Default, Copy)]
 pub enum CachePolicy {
     /// Use cached data if available
     #[default]
@@ -472,34 +781,55 @@ where
 {
     /// Create a warehouse.
     async fn create_warehouse<'a>(
-        warehouse_name: String,
         project_id: &ProjectId,
-        storage_profile: StorageProfile,
-        tabular_delete_profile: TabularDeleteProfile,
-        storage_secret_id: Option<SecretId>,
+        request: CatalogCreateWarehouseRequest,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
     ) -> Result<Arc<ResolvedWarehouse>, CatalogCreateWarehouseError> {
-        let warehouse = Self::create_warehouse_impl(
-            warehouse_name,
-            project_id,
-            storage_profile,
-            tabular_delete_profile,
-            storage_secret_id,
-            transaction,
-        )
-        .await?;
+        let warehouse = Self::create_warehouse_impl(project_id, request, transaction).await?;
         let warehouse_ref = Arc::new(warehouse);
         Ok(warehouse_ref)
     }
 
-    /// Delete a warehouse.
+    /// Set (or clear) the managed-by marker on a warehouse.
+    async fn set_warehouse_managed_by<'a>(
+        warehouse_id: WarehouseId,
+        managed_by: ManagedBy,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<Arc<ResolvedWarehouse>, SetWarehouseManagedByError> {
+        Self::set_warehouse_managed_by_impl(warehouse_id, managed_by, transaction)
+            .await
+            .map(Arc::new)
+    }
+
+    /// Verify, within the active write transaction, that `action` may mutate this
+    /// warehouse's spec given the managed-by lock. `bypass` should be
+    /// `request_metadata.bypasses_control_plane_authz(None)` (instance admin or
+    /// in-process).
+    ///
+    /// [`CatalogWarehouseAction::is_spec_mutation`] is the single source of truth
+    /// for what the lock covers: only spec-mutating actions consult the marker, so
+    /// a handler may call this unconditionally with the action it is performing.
+    /// For a locked action it loads the warehouse row `FOR UPDATE`, making the
+    /// check TOCTOU-safe against concurrent marker changes.
+    async fn ensure_warehouse_spec_mutable<'a>(
+        warehouse_id: WarehouseId,
+        action: &CatalogWarehouseAction,
+        bypass: bool,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<(), EnsureWarehouseSpecMutableError> {
+        if !action.is_spec_mutation() {
+            return Ok(());
+        }
+        Self::ensure_warehouse_spec_mutable_impl(warehouse_id, bypass, transaction).await
+    }
+
+    /// Delete a warehouse, returning the storage secret it referenced, if any.
     async fn delete_warehouse<'a>(
         warehouse_id: WarehouseId,
         query: DeleteWarehouseQuery,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
-    ) -> Result<(), CatalogDeleteWarehouseError> {
-        Self::delete_warehouse_impl(warehouse_id, query, transaction).await?;
-        Ok(())
+    ) -> Result<Option<SecretId>, CatalogDeleteWarehouseError> {
+        Self::delete_warehouse_impl(warehouse_id, query, transaction).await
     }
 
     /// Rename a warehouse.
@@ -545,23 +875,20 @@ where
         status_filter: &[WarehouseStatus],
         state: Self::State,
     ) -> Result<Option<Arc<ResolvedWarehouse>>, CatalogGetWarehouseByIdError> {
-        let cached_warehouse = warehouse_cache_get_by_id(warehouse_id).await;
-        if let Some(warehouse) = cached_warehouse {
-            let warehouse = Some(warehouse).filter(|w| status_filter.contains(&w.status));
-            return Ok(warehouse);
-        }
+        // Single-flight read-through: concurrent misses for the same warehouse
+        // coalesce onto one load (see `warehouse_cache_get_or_load`). The helper
+        // owns the version-gated insert + secondary-index population. `status_filter`
+        // is applied to the result, never to what is cached.
+        let warehouse = warehouse_cache_get_or_load(warehouse_id, async move {
+            Ok::<_, CatalogGetWarehouseByIdError>(
+                Self::get_warehouse_by_id_impl(warehouse_id, state)
+                    .await?
+                    .map(Arc::new),
+            )
+        })
+        .await?;
 
-        let warehouse = Self::get_warehouse_by_id_impl(warehouse_id, state)
-            .await?
-            .map(Arc::new);
-
-        if let Some(warehouse) = warehouse.clone() {
-            warehouse_cache_insert(warehouse).await;
-        }
-
-        let warehouse = warehouse.filter(|w| status_filter.contains(&w.status));
-
-        Ok(warehouse)
+        Ok(warehouse.filter(|w| status_filter.contains(&w.status)))
     }
 
     async fn get_active_warehouse_by_id(
@@ -640,39 +967,47 @@ where
         Ok(warehouse)
     }
 
-    // /// Wrapper around `get_warehouse` that returns a not-found error if the warehouse does not exist.
-    // async fn require_warehouse_by_id<'a>(
-    //     warehouse_id: WarehouseId,
-    //     state: Self::State,
-    // ) -> Result<Arc<ResolvedWarehouse>, CatalogGetWarehouseByIdError> {
-    //     Self::get_warehouse_by_id(warehouse_id, state)
-    //         .await?
-    //         .ok_or(WarehouseIdNotFound::new(warehouse_id).into())
-    // }
-
-    // async fn require_warehouse_by_id_cache_aware(
-    //     warehouse_id: WarehouseId,
-    //     status_filter: &[WarehouseStatus],
-    //     cache_policy: CachePolicy,
-    //     state: Self::State,
-    // ) -> Result<Arc<ResolvedWarehouse>, CatalogGetWarehouseByIdError> {
-    //     Self::get_warehouse_by_id_cache_aware(warehouse_id, status_filter, cache_policy, state)
-    //         .await?
-    //         .ok_or(WarehouseIdNotFound::new(warehouse_id).into())
-    // }
-
     async fn get_warehouse_by_name(
         warehouse_name: &str,
-        project_id: &ProjectId,
+        project_id: &ArcProjectId,
         status_filter: &[WarehouseStatus],
         catalog_state: Self::State,
     ) -> Result<Option<Arc<ResolvedWarehouse>>, CatalogGetWarehouseByNameError> {
+        // Fast path: name → id → warehouse (records hit/miss metrics).
         let cached_warehouse = warehouse_cache_get_by_name(warehouse_name, project_id).await;
         if let Some(warehouse) = cached_warehouse {
             let warehouse = Some(warehouse).filter(|w| status_filter.contains(&w.status));
             return Ok(warehouse);
         }
 
+        // Single-flight the cold name→id resolution: concurrent misses for the same
+        // (project, name) coalesce onto one by-name DB query, which also primes the
+        // by-id cache. Clients usually address warehouses by name, so this is the
+        // burst this cache is meant to absorb.
+        let loader_state = catalog_state.clone();
+        let loader_name = warehouse_name.to_string();
+        let loader_project = project_id.clone();
+        let warehouse_id =
+            warehouse_name_to_id_get_or_load(project_id.clone(), warehouse_name, async move {
+                Ok::<_, CatalogGetWarehouseByNameError>(
+                    Self::get_warehouse_by_name_impl(&loader_name, &loader_project, loader_state)
+                        .await?
+                        .map(Arc::new),
+                )
+            })
+            .await?;
+
+        let Some(warehouse_id) = warehouse_id else {
+            return Ok(None);
+        };
+
+        // Common case: the loader primed the by-id cache → hit.
+        if let Some(warehouse) = warehouse_cache_get_by_id(warehouse_id).await {
+            return Ok(Some(warehouse).filter(|w| status_filter.contains(&w.status)));
+        }
+
+        // Rare: evicted between prime and read. Re-load by name (same error domain)
+        // rather than return a spurious not-found for a warehouse that exists.
         let warehouse = Self::get_warehouse_by_name_impl(warehouse_name, project_id, catalog_state)
             .await?
             .map(Arc::new);
@@ -680,9 +1015,7 @@ where
             warehouse_cache_insert(warehouse).await;
         }
 
-        let warehouse = warehouse.filter(|w| status_filter.contains(&w.status));
-
-        Ok(warehouse)
+        Ok(warehouse.filter(|w| status_filter.contains(&w.status)))
     }
 
     // /// Wrapper around `get_warehouse_by_name` that returns
@@ -743,6 +1076,76 @@ where
             .await
             .map(Arc::new)
     }
+
+    /// Set the per-warehouse Iceberg table format version policy.
+    async fn set_warehouse_format_version_policy(
+        warehouse_id: WarehouseId,
+        policy: &WarehouseFormatVersionPolicy,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> std::result::Result<Arc<ResolvedWarehouse>, SetWarehouseFormatVersionPolicyError> {
+        Self::set_warehouse_format_version_policy_impl(warehouse_id, policy, transaction)
+            .await
+            .map(Arc::new)
+    }
 }
 
 impl<T> CatalogWarehouseOps for T where T: CatalogStore {}
+
+#[cfg(test)]
+mod allowed_format_versions_tests {
+    use iceberg::spec::FormatVersion;
+
+    use super::AllowedFormatVersions;
+
+    #[test]
+    fn try_new_rejects_empty() {
+        assert!(AllowedFormatVersions::try_new([]).is_err());
+    }
+
+    #[test]
+    fn try_new_dedups_and_sorts() {
+        let allowed = AllowedFormatVersions::try_new([
+            FormatVersion::V3,
+            FormatVersion::V2,
+            FormatVersion::V3,
+        ])
+        .unwrap();
+        assert_eq!(allowed.as_slice(), &[FormatVersion::V2, FormatVersion::V3]);
+    }
+
+    #[test]
+    fn contains_and_max() {
+        let allowed =
+            AllowedFormatVersions::try_new([FormatVersion::V1, FormatVersion::V2]).unwrap();
+        assert!(allowed.contains(FormatVersion::V1));
+        assert!(!allowed.contains(FormatVersion::V3));
+        assert_eq!(allowed.max(), FormatVersion::V2);
+    }
+
+    #[test]
+    fn resolve_default_prefers_configured() {
+        let allowed = AllowedFormatVersions::default();
+        assert_eq!(
+            allowed.resolve_default(Some(FormatVersion::V1)),
+            FormatVersion::V1
+        );
+    }
+
+    #[test]
+    fn resolve_default_falls_back_to_v2_when_allowed() {
+        let allowed = AllowedFormatVersions::try_new([
+            FormatVersion::V1,
+            FormatVersion::V2,
+            FormatVersion::V3,
+        ])
+        .unwrap();
+        assert_eq!(allowed.resolve_default(None), FormatVersion::V2);
+    }
+
+    #[test]
+    fn resolve_default_falls_back_to_max_when_v2_disallowed() {
+        let allowed =
+            AllowedFormatVersions::try_new([FormatVersion::V1, FormatVersion::V3]).unwrap();
+        assert_eq!(allowed.resolve_default(None), FormatVersion::V3);
+    }
+}

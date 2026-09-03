@@ -1,94 +1,54 @@
+---
+description: "Choose and configure a Lakekeeper Authorizer — OpenFGA or Cedar — and learn how grants, privileges and roles control access to catalog objects."
+---
+
 # Authorization
 
-Authorization can only be enabled if Authentication is enabled. Please check the [Authentication Docs](./authentication.md) for more information.
+Authentication verifies *who* you are, while authorization determines *what* you can do. Authorization can only be enabled if Authentication is enabled — see the [Authentication docs](./authentication.md).
 
-Lakekeeper's default permission model uses the CNCF project [OpenFGA](http://openfga.dev) to store and evaluate permissions. OpenFGA enables a powerful permission model with bi-directional inheritance, essential for managing modern lakehouses with hierarchical namespaces. Our model balances usability and control for administrators. In addition to OpenFGA, Lakekeeper's OPA bridge provides an additional translation layer that allows query engines such as trino to access Lakekeeper's permissions via Open Policy Agent (OPA). Please find more information in the [OPA Bridge Guide](./opa.md).
+## Choose an authorizer
 
-Please check the [Authorization Configuration](./configuration.md#authorization) for details on enabling Authorization with Lakekeeper.
+Lakekeeper delegates every access decision to one configured **Authorizer**. This is the first decision to make: it determines how permissions are expressed, who changes them, and what day-to-day administration looks like.
 
-## Grants
-The default permission model is focused on collaborating on data. Permissions are additive. The underlying OpenFGA model is defined in [`schema.fga` on Github](https://github.com/lakekeeper/lakekeeper/blob/main/authz/openfga/). The following grants are available:
+| | [OpenFGA](./authorization-openfga.md) | [Cedar](./authorization-cedar.md)<span class="lkp"></span> |
+|---|---|---|
+| Availability | Open source | Lakekeeper Plus |
+| Extra service to run | Yes — an OpenFGA deployment with its own database | No, built in |
+| How permissions are expressed | Relationships between principals and objects, stored as data | Policies you author and deploy |
+| Who changes them | Admins **and** object owners, at runtime, through the UI or API | Whoever can deploy the policy source |
+| Conditions on attributes | No | Yes — time, tags, request attributes |
+| Grants API | Full vocabulary | Planned for 0.14 |
+| Changing your mind later | You can switch **to** OpenFGA on a running deployment | Switching away generally needs a new Lakekeeper instance |
 
-| Entity    | Grant                                                            |
-|-----------|------------------------------------------------------------------|
-| server    | admin, operator                                                  |
-| project   | project_admin, security_admin, data_admin, role_creator, describe, select, create, modify |
-| warehouse | ownership, pass_grants, manage_grants, describe, select, create, modify |
-| namespace | ownership, pass_grants, manage_grants, describe, select, create, modify |
-| table     | ownership, pass_grants, manage_grants, describe, select, modify  |
-| view      | ownership, pass_grants, manage_grants, describe, modify          |
-| role      | assignee, ownership                                              |
+Two further authorizers exist for narrower purposes. **AllowAll** permits every request and is meant for development and testing only — it records grants faithfully but enforces nothing. **Custom** lets you implement the `Authorizer` trait yourself; see [Customize](./customize.md).
 
+Neither engine expresses row filters or column masks. Both decide whether a principal may perform an action on an object; filtering rows or columns *within* an object is not something Lakekeeper enforces.
 
-### Ownership
-Owners of objects have all rights on the specific object. When principals create new objects, they automatically become owners of these objects. This enables powerful self-service szenarios where users can act autonomously in a (sub-)namespace. By default, Owners of objects are also able to access grants on objects, which enables them to expand the access to their owned objects to new users. Enabling [Managed Access](#managed-access) for a Warehouse or Namespace removes the `grant` privilege from owners.
+Configuration for each is in the [Authorization configuration](./configuration.md#authorization) reference.
 
-### Server: Admin
-A `server`'s `admin` role is the most powerful role (apart from `operator`) on the server. In order to guarantee auditability, this role can list and administrate all Projects, but does not have access to data in projects. While the `admin` can assign himself the `project_admin` role for a project, this assignment is tracked by `OpenFGA` for audits. `admin`s can also manage all projects (but no entities within it), server settings and users.
+## What to read next
 
-### Server: Operator
-The `operator` has unrestricted access to all objects in Lakekeeper. It is designed to be used by technical users (e.g., a Kubernetes Operator) managing the Lakekeeper deployment.
+- **Evaluating Lakekeeper?** Read the page for the authorizer you are leaning towards, and stop there.
+- **Setting one up?** The same page — each carries its own model, roles and configuration.
+- **Need Alice to read a table?** Under OpenFGA, use the UI — or the [Grants API](./grants.md) if you are automating it — and note that object owners can hand out access to their own objects. Under Cedar, access comes from your policy source, so change that instead.
+- **Operating the deployment?** See [Instance Admins](./instance-admins.md) for administrative access that does not depend on the authorizer being healthy.
 
-### Project: Security Admin
-A `security_admin` in a project can manage all security-related aspects, including grants and ownership for the project and all objects within it. However, they cannot modify or access the content of any object, except for listing and browsing purposes.
+## Grants, privileges and roles
 
-### Project: Data Admin
-A `data_admin` in a project can manage all data-related aspects, including creating, modifying, and deleting objects within the project. However, they cannot grant privileges or manage ownership.
+Three words are used consistently across the authorizers and the API:
 
-### Project: Admin
-A `project_admin` in a project has the combined responsibilities of both `security_admin` and `data_admin`. They can manage all security-related aspects, including grants and ownership, as well as all data-related aspects, including creating, modifying, and deleting objects within the project.
+- A **privilege** is the name of a capability — `select`, `modify`. Which privileges exist is defined by your authorizer.
+- A **grant** gives one privilege on one resource to one principal: *Alice may `select` on this warehouse*.
+- A **principal** is a user or a **role**. Granting to a role once and then managing its membership is how you keep the number of grants manageable. Where role membership comes from — an identity provider, or Lakekeeper itself — depends on your setup; see [Configuration](./configuration.md).
 
-### Project: Role Creator
-A `role_creator` in a project can create new roles within it. This role is essential for delegating the creation of roles without granting broader administrative privileges.
+### Provider-managed roles { .lkp }
 
-### Describe
-The `describe` grant allows a user to view metadata and details about an object without modifying it. This includes listing objects and viewing their properties. The `describe` grant is inherited down the object hierarchy, meaning if a user has the `describe` grant on a higher-level entity, they can also describe all child entities within it. The `describe` grant is implicitly included with the `select`, `create`, and `modify` grants.
+A role's `provider-id` says who owns it. `lakekeeper` roles are yours to manage through the API; roles in a [role provider's](./configuration.md#role-provider) namespace belong to that provider, so create, rename, delete and member (un)assignment are rejected with `400 ManagedRoleImmutable` — change them in the identity provider instead. They are still ordinary grant principals: grant privileges to them like any other role.
 
-### Select
-The `select` grant allows a user to read data from an object, such as tables or views. This includes querying and retrieving data. The `select` grant is inherited down the object hierarchy, meaning if a user has the `select` grant on a higher-level entity, they can select all views and tables within it. The `select` grant implicitly includes the `describe` grant.
+Membership is synced per user at login. A provider-managed role therefore appears once its first member authenticates, and lists only the members Lakekeeper has seen so far — not the full group. A group nobody has logged in from does not exist as a role yet and cannot be granted to; under Cedar, match on `principal.project_roles` instead, which needs no catalog role.
 
-### Create
-The `create` grant allows a user to create new objects within an entity, such as tables, views, or namespaces. The `create` grant is inherited down the object hierarchy, meaning if a user has the `create` grant on a higher-level entity, they can also create objects within all child entities. The `create` grant implicitly includes the `describe` grant.
+### Direct grants are not effective permissions
 
-### Modify
-The `modify` grant allows a user to change the content or properties of an object, such as updating data in tables or altering views. The `modify` grant is inherited down the object hierarchy, meaning if a user has the `modify` grant on a higher-level entity, they can also modify all child entities within it. The `modify` grant implicitly includes the `select` and `describe` grants.
+A grant recorded on a resource is not the whole answer to "what can Alice do here". Your authorizer's model decides what a grant *reaches*: whether `select` implies `describe`, and whether a warehouse grant covers the tables inside it. Role membership and inheritance are resolved when a request is decided, not stored as extra grants.
 
-### Pass Grants
-The `pass_grants` grant allows a user to pass their own privileges to other users. This means that if a user has certain permissions on an object, they can grant those same permissions to others. However, the `pass_grants` grant does not include the ability to pass the `pass_grants` privilege itself.
-
-### Manage Grants
-The `manage_grants` grant allows a user to manage all grants on an object, including creating, modifying, and revoking grants. This also includes `manage_grants` and `pass_grants`.
-
-## Inheritance
-
-* **To-Down-Inheritance**: Permissions in higher up entities are inherited to their children. For example if the `modify` privilege is granted on a `warehouse` for a principal, this principal is also able to `modify` any namespaces, including nesting ones, tables and views within it.
-* **Bottom-Up-Inheritance**: Permissions on lower entities, for example tables, inherit basic navigational privileges to all higher layer principals. For example, if a user is granted the `select` privilege on table `ns1.ns2.table_1`, that user is implicitly granted limited list privileges on `ns1` and `ns2`. Only items in the direct path are presented to users. If `ns1.ns3` would exist as well, a list on `ns1` would only show `ns1.ns2`.
-
-## Managed Access
-Managed access is a feature designed to provide stricter control over access privileges within Lakekeeper. It is particularly useful for organizations that require a more restrictive access control model to ensure data security and compliance.
-
-In some cases, the default ownership model, which grants all privileges to the creator of an object, can be too permissive. This can lead to situations where non-admin users unintentionally share data with unauthorized users by granting privileges outside the scope defined by administrators. Managed access addresses this concern by removing the `grant` privilege from owners and centralizing the management of access privileges.
-
-With managed access, admin-like users can define access privileges on high-level container objects, such as warehouses or namespaces, and ensure that all child objects inherit these privileges. This approach prevents non-admin users from granting privileges that are not authorized by administrators, thereby reducing the risk of unintentional data sharing and enhancing overall security.
-
-Managed access combines elements of Role-Based Access Control (RBAC) and Discretionary Access Control (DAC). While RBAC allows privileges to be assigned to roles and users, DAC assigns ownership to the creator of an object. By integrating managed access, Lakekeeper provides a balanced access control model that supports both self-service analytics and data democratization while maintaining strict security controls.
-
-Managed access can be enabled or disabled for warehouses and namespaces using the UI or the `../managed-access` Endpoints. Managed access settings are inherited down the object hierarchy, meaning if managed access is enabled on a higher-level entity, it applies to all child entities within it.
-
-## Best Practices
-We recommend separating access to data from the ability to grant privileges. To achieve this, the `security_admin` and `data_admin` roles divide the responsibilities of the initial `project_admin`, who has the authority to perform tasks in both areas.
-
-## OpenFGA in Production
-When deploying OpenFGA in production environments, ensure you follow the [OpenFGA Production Checklist](https://openfga.dev/docs/best-practices/running-in-production).
-
-Lakekeeper includes [Query Consistency](https://openfga.dev/docs/interacting/consistency) specifications with each authorization request to OpenFGA. For most operations, `MINIMIZE_LATENCY` consistency provides optimal performance while maintaining sufficient data consistency guarantees.
-
-For medium to large-scale deployments, we strongly recommend enabling caching in OpenFGA and increasing the database connection pool limits. These optimizations significantly reduce database load and improve authorization latency. Configure the following environment variables in OpenFGA (written for version 1.10). You may increase the number of connections further if your database deployment can handle additional connections:
-
-```sh
-OPENFGA_DATASTORE_MAX_OPEN_CONNS=200
-OPENFGA_DATASTORE_MAX_IDLE_CONNS=100
-OPENFGA_CACHE_CONTROLLER_ENABLED=true
-OPENFGA_CHECK_QUERY_CACHE_ENABLED=true
-OPENFGA_CHECK_ITERATOR_CACHE_ENABLED=true
-```
+So a listing of grants on a table shows what was recorded *there*, for *that* principal. To ask what a principal may effectively do, use the per-resource `.../actions` endpoints or `POST /management/v1/action/batch-check`.

@@ -166,6 +166,15 @@ impl From<DeleteError> for DeleteBatchError {
     }
 }
 
+impl From<DeleteBatchError> for DeleteError {
+    fn from(err: DeleteBatchError) -> Self {
+        match err {
+            DeleteBatchError::InvalidLocation(e) => DeleteError::InvalidLocation(e),
+            DeleteBatchError::IOError(e) => DeleteError::IOError(e),
+        }
+    }
+}
+
 // #[derive(Debug, Clone, PartialEq, Eq)]
 // pub struct BatchDeleteError {
 //     /// The path that was failed for deletion, if available
@@ -277,6 +286,11 @@ impl IOError {
     pub fn context(&self) -> &[String] {
         &self.context
     }
+
+    #[must_use]
+    pub fn into_source(self) -> Option<anyhow::Error> {
+        self.source
+    }
 }
 
 impl RetryableError for IOError {
@@ -287,7 +301,6 @@ impl RetryableError for IOError {
 
 /// `ErrorKind` is all kinds of Error of opendal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum_macros::Display)]
-#[non_exhaustive]
 pub enum ErrorKind {
     Unexpected,
     RequestTimeout,

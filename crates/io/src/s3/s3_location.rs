@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::{error::InvalidLocationError, s3::S3_CUSTOM_SCHEMES, Location};
+use crate::{Location, error::InvalidLocationError, s3::S3_CUSTOM_SCHEMES};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Invalid bucket name `{bucket}`: {reason}")]
@@ -319,7 +319,7 @@ mod tests {
 
         for case in cases {
             let result = S3Location::try_from_str(case, false);
-            assert!(result.is_err());
+            assert!(result.is_err(), "expected error for `{case}`");
         }
     }
 

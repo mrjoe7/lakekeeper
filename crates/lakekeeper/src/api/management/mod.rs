@@ -1,12 +1,19 @@
 #![allow(deprecated)]
 
 pub mod v1 {
+    pub mod check;
+    pub mod generic_table;
+    pub mod grant;
+    pub mod lakekeeper_actions;
     pub mod namespace;
     pub mod project;
     pub mod role;
+    pub mod role_membership;
     pub mod server;
     pub mod table;
     pub mod tabular;
+    pub mod tag;
+    pub mod task_queue;
     pub mod tasks;
     pub mod user;
     pub mod view;
@@ -15,19 +22,36 @@ pub mod v1 {
     #[cfg(feature = "open-api")]
     pub mod openapi;
 
-    use std::marker::PhantomData;
+    use std::{marker::PhantomData, sync::Arc};
 
     use axum::{
-        extract::{Path, Query, State as AxumState},
-        response::{IntoResponse, Response},
-        routing::{get, post},
         Extension, Json, Router,
+        extract::{Path, State as AxumState},
+        response::{IntoResponse, Response},
+        routing::{delete, get, post, put},
+    };
+    use axum_extra::extract::Query;
+    use generic_table::GenericTableManagementService as _;
+    use grant::{
+        ApplyGrantsRequest, GetGrantAccessQuery, GrantablePrivilegesResponse, ListGrantsQuery,
+        ListGrantsResponse, ResourceGrantablePrivilegesResponse, Service as _,
     };
     use http::StatusCode;
     use iceberg_ext::catalog::rest::ErrorModel;
     #[cfg(feature = "open-api")]
     use iceberg_ext::catalog::rest::IcebergErrorResponse;
-    use namespace::NamespaceManagementService as _;
+    use lakekeeper_actions::{
+        GetLakekeeperGenericTableActionsResponse, GetLakekeeperNamespaceActionsResponse,
+        GetLakekeeperProjectActionsResponse, GetLakekeeperRoleActionsResponse,
+        GetLakekeeperServerActionsResponse, GetLakekeeperTableActionsResponse,
+        GetLakekeeperTagActionsResponse, GetLakekeeperUserActionsResponse,
+        GetLakekeeperViewActionsResponse, GetLakekeeperWarehouseActionsResponse,
+        get_allowed_generic_table_actions, get_allowed_namespace_actions,
+        get_allowed_project_actions, get_allowed_role_actions, get_allowed_server_actions,
+        get_allowed_table_actions, get_allowed_tag_actions, get_allowed_user_actions,
+        get_allowed_view_actions, get_allowed_warehouse_actions,
+    };
+    use namespace::{MoveNamespaceRequest, MoveNamespaceResponse, NamespaceManagementService as _};
     #[cfg(feature = "open-api")]
     pub use openapi::api_doc;
     use project::{
@@ -35,53 +59,114 @@ pub mod v1 {
         RenameProjectRequest, Service as _,
     };
     use role::{
-        CreateRoleRequest, ListRolesQuery, ListRolesResponse, Role, SearchRoleRequest,
-        SearchRoleResponse, Service as _, UpdateRoleRequest,
+        CreateRoleRequest, ListRolesQuery, Role, SearchRoleRequest, Service as _, UpdateRoleRequest,
+    };
+    use role_membership::{
+        AddRoleMembersRequest, AddRoleMembersResponse, ListMembersQuery, ListRoleMembersResponse,
+        ListRoleMembershipsResponse, ListRolesPageQuery, RoleMemberType, Service as _,
     };
     use serde::{Deserialize, Serialize};
     use server::{BootstrapRequest, ServerInfo, Service as _};
     use table::TableManagementService as _;
     use tabular::TabularManagementService as _;
+    use tag::{
+        AppliedTag, CreateTagDefinitionRequest, ListColumnTagsResponse, ListTagAttachmentsQuery,
+        ListTagAttachmentsResponse, ListTagDefinitionsQuery, ListTagDefinitionsResponse,
+        ListTagsQuery, ListTagsResponse, Service as _, SetTagRequest, TagDefinition,
+        UpdateTagDefinitionRequest,
+    };
     use typed_builder::TypedBuilder;
     use user::{
         CreateUserRequest, SearchUserRequest, SearchUserResponse, Service as _, UpdateUserRequest,
-        User,
+        User, WhoamiResponse,
     };
     use view::ViewManagementService as _;
     use warehouse::{
         CreateWarehouseRequest, CreateWarehouseResponse, GetWarehouseResponse,
         ListDeletedTabularsQuery, ListWarehousesRequest, ListWarehousesResponse,
-        RenameWarehouseRequest, Service as _, UpdateWarehouseCredentialRequest,
-        UpdateWarehouseDeleteProfileRequest, UpdateWarehouseStorageRequest,
-        WarehouseStatisticsResponse,
+        RenameWarehouseRequest, Service as _, SetWarehouseManagedByRequest,
+        UpdateWarehouseCredentialRequest, UpdateWarehouseDeleteProfileRequest,
+        UpdateWarehouseFormatVersionPolicyRequest, UpdateWarehouseStorageRequest,
+        ValidateWarehouseResponse, WarehouseStatisticsResponse,
     };
 
+    /// Macro to create an Arc wrapper for a response type that implements `IntoResponse`.
+    /// This is useful for caching responses that are expensive to compute.
+    ///
+    /// # Example
+    /// ```ignore
+    /// impl_arc_into_response!(GetTaskDetailsResponse);
+    /// ```
+    ///
+    /// This generates:
+    /// ```ignore
+    /// pub struct GetTaskDetailsResponseRef(pub Arc<GetTaskDetailsResponse>);
+    ///
+    /// impl IntoResponse for GetTaskDetailsResponseRef {
+    ///     fn into_response(self) -> axum::response::Response {
+    ///         (http::StatusCode::OK, Json(self.0)).into_response()
+    ///     }
+    /// }
+    /// ```
+    macro_rules! impl_arc_into_response {
+        ($type_name:ident) => {
+            pastey::paste! {
+                #[derive(Clone, Debug)]
+                pub struct [<$type_name Ref>](pub Arc<$type_name>);
+
+                impl IntoResponse for [<$type_name Ref>] {
+                    fn into_response(self) -> axum::response::Response {
+                        (http::StatusCode::OK, Json(self.0)).into_response()
+                    }
+                }
+            }
+        };
+    }
+
+    pub(crate) use impl_arc_into_response;
+
+    #[cfg(feature = "open-api")]
+    use crate::api::management::v1::{role::RoleMetadata, tasks::GetTaskDetailsResponse};
     use crate::{
+        ProjectId, WarehouseId,
         api::{
+            ApiContext, Result,
             endpoints::ManagementV1Endpoint,
             iceberg::{types::PageToken, v1::PaginationQuery},
             management::v1::{
+                check::{CatalogActionsBatchCheckRequest, CatalogActionsBatchCheckResponse},
+                lakekeeper_actions::GetAccessQuery,
                 project::{EndpointStatisticsResponse, GetEndpointStatisticsRequest},
+                role::{
+                    ListRolesResponse, RoleMetadataRef, SearchRoleResponse,
+                    UpdateRoleSourceSystemRequest,
+                },
                 tabular::{SearchTabularRequest, SearchTabularResponse},
+                task_queue::{
+                    GetTaskQueueConfigResponse, ScheduleTaskRequest, ScheduleTaskResponse,
+                    SetTaskQueueConfigRequest,
+                },
                 tasks::{
-                    ControlTasksRequest, GetTaskDetailsQuery, GetTaskDetailsResponse,
+                    ControlTasksRequest, GetProjectTaskDetailsResponse, GetTaskDetailsQuery,
+                    GetTaskDetailsResponseRef, ListProjectTasksRequest, ListProjectTasksResponse,
                     ListTasksRequest, ListTasksResponse, Service,
                 },
                 user::{ListUsersQuery, ListUsersResponse},
-                warehouse::{
-                    GetTaskQueueConfigResponse, SetTaskQueueConfigRequest, UndropTabularsRequest,
-                },
+                warehouse::UndropTabularsRequest,
             },
-            ApiContext, Result,
         },
         request_metadata::RequestMetadata,
         service::{
-            authn::UserId, authz::Authorizer, tasks::TaskId, Actor, CatalogStore,
-            CreateOrUpdateUserResponse, NamespaceId, RoleId, SecretStore, State, TableId,
-            TabularId, ViewId,
+            Actor, CatalogStore, CreateOrUpdateUserResponse, GenericTableId, NamespaceId, RoleId,
+            SecretStore, State, TableId, TabularId, TagDefinitionId, ViewId,
+            authn::UserId,
+            authz::Authorizer,
+            tasks::{TaskId, TaskQueueName},
         },
-        ProjectId, WarehouseId,
     };
+
+    pub const PROJECT_ID_HEADER_DESCRIPTION: &str =
+        "Project ID (optional; falls back to the default project if not provided)";
 
     #[derive(Clone, Debug)]
     pub struct ApiServer<C: CatalogStore, A: Authorizer + Clone, S: SecretStore> {
@@ -110,6 +195,32 @@ pub mod v1 {
         ApiServer::<C, A, S>::server_info(api_context, metadata)
             .await
             .map(|user| (StatusCode::OK, Json(user)))
+    }
+
+    /// Get allowed server actions
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "server",
+    path = ManagementV1Endpoint::GetServerActions.path(),
+    params(GetAccessQuery),
+    responses(
+        (status = 200, body = GetLakekeeperServerActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_server_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperServerActionsResponse>)> {
+        let relations = get_allowed_server_actions(api_context, metadata, query).await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperServerActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
     }
 
     /// Bootstrap
@@ -208,6 +319,34 @@ pub mod v1 {
             .map(|user| (StatusCode::OK, Json(user)))
     }
 
+    /// Get allowed actions on a user
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "user",
+        path = ManagementV1Endpoint::GetUserActions.path(),
+        params(GetAccessQuery, ("user_id" = String,)),
+        responses(
+            (status = 200, body = GetLakekeeperUserActionsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_user_actions<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(user_id): Path<UserId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperUserActionsResponse>)> {
+        let relations =
+            get_allowed_user_actions(api_context, metadata, query, Arc::new(user_id)).await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperUserActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
     /// Whoami
     ///
     /// Returns information about the user associated with the current authentication token.
@@ -216,14 +355,14 @@ pub mod v1 {
         tag = "user",
         path = ManagementV1Endpoint::Whoami.path(),
         responses(
-            (status = 200, description = "User details", body = User),
+            (status = 200, description = "Current user and instance-admin status", body = WhoamiResponse),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
     async fn whoami<C: CatalogStore, A: Authorizer, S: SecretStore>(
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
-    ) -> Result<(StatusCode, Json<User>)> {
+    ) -> Result<(StatusCode, Json<WhoamiResponse>)> {
         let id = match metadata.actor() {
             Actor::Role { principal, .. } | Actor::Principal(principal) => principal.clone(),
             Actor::Anonymous => {
@@ -232,13 +371,22 @@ pub mod v1 {
                     "GetMyUserWithoutToken",
                     None,
                 )
-                .into())
+                .into());
             }
         };
 
+        let is_instance_admin = metadata.is_instance_admin();
         ApiServer::<C, A, S>::get_user(api_context, metadata, id)
             .await
-            .map(|user| (StatusCode::OK, Json(user)))
+            .map(|user| {
+                (
+                    StatusCode::OK,
+                    Json(WhoamiResponse {
+                        user,
+                        is_instance_admin,
+                    }),
+                )
+            })
     }
 
     /// Replace User
@@ -317,6 +465,7 @@ pub mod v1 {
         post,
         tag = "role",
         path = ManagementV1Endpoint::CreateRole.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
         request_body = CreateRoleRequest,
         responses(
             (status = 201, description = "Role successfully created", body = Role),
@@ -341,9 +490,10 @@ pub mod v1 {
         post,
         tag = "role",
         path = ManagementV1Endpoint::SearchRole.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
         request_body = SearchRoleRequest,
         responses(
-            (status = 200, description = "List of users", body = SearchRoleResponse),
+            (status = 200, description = "List of roles", body = SearchRoleResponse),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
@@ -352,7 +502,8 @@ pub mod v1 {
         Extension(metadata): Extension<RequestMetadata>,
         Json(request): Json<SearchRoleRequest>,
     ) -> Result<SearchRoleResponse> {
-        ApiServer::<C, A, S>::search_role(api_context, metadata, request).await
+        let response = ApiServer::<C, A, S>::search_role(api_context, metadata, request).await?;
+        Ok(response)
     }
 
     /// List Roles
@@ -362,7 +513,7 @@ pub mod v1 {
         get,
         tag = "role",
         path = ManagementV1Endpoint::ListRole.path(),
-        params(ListRolesQuery),
+        params(ListRolesQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
         responses(
             (status = 200, description = "List of roles", body = ListRolesResponse),
             (status = "4XX", body = IcebergErrorResponse),
@@ -373,7 +524,8 @@ pub mod v1 {
         Query(query): Query<ListRolesQuery>,
         Extension(metadata): Extension<RequestMetadata>,
     ) -> Result<ListRolesResponse> {
-        ApiServer::<C, A, S>::list_roles(api_context, query, metadata).await
+        let response = ApiServer::<C, A, S>::list_roles(api_context, query, metadata).await?;
+        Ok(response)
     }
 
     /// Delete Role
@@ -383,7 +535,7 @@ pub mod v1 {
         delete,
         tag = "role",
         path = ManagementV1Endpoint::DeleteRole.path(),
-        params(("role_id" = Uuid,)),
+        params(("role_id" = Uuid, Path, description = "Role ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
         responses(
             (status = 204, description = "Role deleted successfully"),
             (status = "4XX", body = IcebergErrorResponse),
@@ -406,7 +558,7 @@ pub mod v1 {
         get,
         tag = "role",
         path = ManagementV1Endpoint::GetRole.path(),
-        params(("role_id" = Uuid,)),
+        params(("role_id" = Uuid, Path, description = "Role ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
         responses(
             (status = 200, description = "Role details", body = Role),
             (status = "4XX", body = IcebergErrorResponse),
@@ -422,12 +574,37 @@ pub mod v1 {
             .map(|role| (StatusCode::OK, Json(role)))
     }
 
+    /// Get Role Metadata
+    ///
+    /// Retrieves high-level metadata about a specific role.
+    /// Depending on the authorizer, this method is typically allowed also for roles in
+    /// other projects.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "role",
+        path = ManagementV1Endpoint::GetRoleMetadata.path(),
+        params(("role_id" = Uuid, Path, description = "Role ID")),
+        responses(
+            (status = 200, description = "High level Role Metadata", body = RoleMetadata),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_role_metadata<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<RoleMetadataRef> {
+        let response =
+            ApiServer::<C, A, S>::get_role_metadata(api_context, metadata, role_id).await?;
+        Ok(RoleMetadataRef(response))
+    }
+
     /// Update Role
     #[cfg_attr(feature = "open-api", utoipa::path(
         post,
         tag = "role",
         path = ManagementV1Endpoint::UpdateRole.path(),
-        params(("role_id" = Uuid,)),
+        params(("role_id" = Uuid, Path, description = "Role ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
         request_body = UpdateRoleRequest,
         responses(
             (status = 200, description = "Role updated successfully", body = Role),
@@ -443,6 +620,1645 @@ pub mod v1 {
         ApiServer::<C, A, S>::update_role(api_context, metadata, role_id, request)
             .await
             .map(|role| (StatusCode::OK, Json(role)))
+    }
+
+    /// Set the source system for a role
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "role",
+        path = ManagementV1Endpoint::UpdateRoleSourceSystem.path(),
+        params(("role_id" = Uuid, Path, description = "Role ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = UpdateRoleSourceSystemRequest,
+        responses(
+            (status = 200, description = "Role Source System updated successfully", body = Role),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn update_role_source_system<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<UpdateRoleSourceSystemRequest>,
+    ) -> Result<(StatusCode, Json<Role>)> {
+        ApiServer::<C, A, S>::update_role_source_system(api_context, metadata, role_id, request)
+            .await
+            .map(|role| (StatusCode::OK, Json(role)))
+    }
+
+    /// Create Tag Definition
+    ///
+    /// Registers a tag definition in the project's vocabulary.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tag",
+        path = ManagementV1Endpoint::CreateTagDefinition.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
+        request_body = CreateTagDefinitionRequest,
+        responses(
+            (status = 201, description = "Tag definition successfully created", body = TagDefinition),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn create_tag_definition<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<CreateTagDefinitionRequest>,
+    ) -> Response {
+        match ApiServer::<C, A, S>::create_tag_definition(request, api_context, metadata).await {
+            Ok(tag_definition) => (StatusCode::CREATED, Json(tag_definition)).into_response(),
+            Err(e) => e.into_response(),
+        }
+    }
+
+    /// List Tag Definitions
+    ///
+    /// Returns the tag definitions of the project.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListTagDefinitions.path(),
+        params(ListTagDefinitionsQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "List of tag definitions", body = ListTagDefinitionsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_tag_definitions<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Query(query): Query<ListTagDefinitionsQuery>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<ListTagDefinitionsResponse> {
+        let response =
+            ApiServer::<C, A, S>::list_tag_definitions(api_context, query, metadata).await?;
+        Ok(response)
+    }
+
+    /// Get Tag Definition
+    ///
+    /// Retrieves a tag definition, including the allowed values of an
+    /// enumerated definition.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::GetTagDefinition.path(),
+        params(("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tag definition details", body = TagDefinition),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_tag_definition<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, Json<TagDefinition>)> {
+        ApiServer::<C, A, S>::get_tag_definition(api_context, metadata, tag_definition_id)
+            .await
+            .map(|tag_definition| (StatusCode::OK, Json(tag_definition)))
+    }
+
+    /// List Tag Attachments
+    ///
+    /// Lists the targets a tag definition is attached to (reverse lookup).
+    /// Direct attachments only — no hierarchy expansion. Restricted to tag owners
+    /// and project security admins.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListTagAttachments.path(),
+        params(ListTagAttachmentsQuery, ("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Targets carrying this tag", body = ListTagAttachmentsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_tag_attachments<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Query(query): Query<ListTagAttachmentsQuery>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<ListTagAttachmentsResponse> {
+        ApiServer::<C, A, S>::list_tag_attachments(api_context, metadata, tag_definition_id, query)
+            .await
+    }
+
+    /// Update Tag Definition
+    ///
+    /// Replaces name, description and scope, and adds allowed values. Scope can
+    /// only be widened; the value kind is immutable.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tag",
+        path = ManagementV1Endpoint::UpdateTagDefinition.path(),
+        params(("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = UpdateTagDefinitionRequest,
+        responses(
+            (status = 200, description = "Tag definition updated successfully", body = TagDefinition),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn update_tag_definition<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<UpdateTagDefinitionRequest>,
+    ) -> Result<(StatusCode, Json<TagDefinition>)> {
+        ApiServer::<C, A, S>::update_tag_definition(
+            api_context,
+            metadata,
+            tag_definition_id,
+            request,
+        )
+        .await
+        .map(|tag_definition| (StatusCode::OK, Json(tag_definition)))
+    }
+
+    /// Delete Tag Definition
+    ///
+    /// Removes a tag definition that is no longer applied to any target.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteTagDefinition.path(),
+        params(("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag definition deleted successfully"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_tag_definition<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_tag_definition(api_context, metadata, tag_definition_id)
+            .await
+            .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// Set Warehouse Tag
+    ///
+    /// Applies a tag to the warehouse, or updates its value if already applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetWarehouseTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_warehouse_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, tag_name)): Path<(WarehouseId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_warehouse_tag(
+            warehouse_id,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete Warehouse Tag
+    ///
+    /// Removes a tag from the warehouse. Succeeds without change if the tag
+    /// is not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteWarehouseTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_warehouse_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, tag_name)): Path<(WarehouseId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_warehouse_tag(warehouse_id, tag_name, api_context, metadata)
+            .await
+            .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// Get Available Privileges [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the privileges that may be granted, per resource type. The vocabulary
+    /// belongs to the configured authorizer, so it differs between deployments and a
+    /// name this server does not know is rejected — fetch it rather than hard-coding it.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetGrantablePrivileges.path(),
+        responses(
+            (status = 200, description = "Grantable privileges per resource type", body = GrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<GrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_grantable_privileges(api_context, metadata).await
+    }
+
+    /// List Warehouse Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held directly on this warehouse. Grants do not inherit: a
+    /// grant held by a role belongs to that role, and a grant on an ancestor belongs
+    /// to the ancestor. Use the action-check endpoints to ask what a principal may
+    /// effectively do.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the warehouse; every other listing
+    /// requires the warehouse's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListWarehouseGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the warehouse", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_warehouse_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(warehouse_id): Path<WarehouseId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_warehouse_grants(
+            warehouse_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply Warehouse Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent: granting twice creates one grant, revoking a grant that is not
+    /// held is not an error. Which privileges are legal differs between authorizers.
+    ///
+    /// Success is `204` with no body: whether an entry was already in the requested
+    /// state is not reported. Read the grants back, or read the `grant_created` and
+    /// `grant_revoked` audit records, for what changed.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyWarehouseGrants.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_warehouse_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(warehouse_id): Path<WarehouseId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_warehouse_grants(warehouse_id, api_context, metadata, request)
+            .await
+            .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists everything one principal holds across the project — "what does this
+    /// principal have here". Exactly one of `principalUser` or `principalRole` is
+    /// **required**; a request naming neither is refused with `MissingGrantPrincipal`
+    /// (400). To read every grant held on a single resource, use that resource's own
+    /// listing.
+    ///
+    /// Grants are reported at the layer they are held: a grant a role holds is listed
+    /// under that role, not under the users who have the role, and a grant on an
+    /// ancestor is listed under the ancestor. Server grants belong to no project and are
+    /// not included.
+    ///
+    /// Listing your own grants needs no extra permission; any other principal requires
+    /// the project-level grant-read permission.
+    ///
+    /// **Availability depends on the configured authorizer.** This listing crosses every
+    /// resource in the project, which an authorizer that stores permissions per resource
+    /// cannot answer without reading its whole store. Those report
+    /// `GrantListingNotImplemented` (501) — under OpenFGA, for example. Read one
+    /// resource's grants from its own endpoint instead; those listings work, and page,
+    /// under every authorizer. `GET /info` reports the configured backend.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants the principal holds in the project", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+            (status = 501, description = "Project-wide grant listing is not supported under the configured authorizer backend", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_grants(api_context, metadata, query, pagination).await
+    }
+
+    /// List Namespace Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held directly on this namespace. Grants do not inherit, in
+    /// either direction: a child namespace's grants are its own.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the namespace; every other listing
+    /// requires the namespace's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListNamespaceGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("namespace_id" = Uuid, Path, description = "Namespace ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the namespace", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_namespace_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(WarehouseId, NamespaceId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_namespace_grants(
+            warehouse_id,
+            namespace_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply Namespace Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyNamespaceGrants.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("namespace_id" = Uuid, Path, description = "Namespace ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_namespace_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(WarehouseId, NamespaceId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_namespace_grants(
+            warehouse_id,
+            namespace_id,
+            api_context,
+            metadata,
+            request,
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Tag Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held on this tag definition — who may apply it, and who may
+    /// manage it. Distinct from the grants on the objects the tag is attached to.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the tag definition; every other listing
+    /// requires the tag definition's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListTagGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the tag definition", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_tag_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_tag_grants(
+            tag_definition_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply Tag Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyTagGrants.path(),
+        params(("tag_definition_id" = Uuid, Path, description = "Tag Definition ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_tag_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_tag_grants(tag_definition_id, api_context, metadata, request)
+            .await
+            .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Server Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held on the server itself. Server grants belong to no project,
+    /// so they are the one level the project-scoped listing does not report.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself needs no permission, and is the only way to read your own server grants;
+    /// every other listing requires the server's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListServerGrants.path(),
+        params(ListGrantsQuery, PaginationQuery),
+        responses(
+            (status = 200, description = "Grants held on the server", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_server_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_server_grants(api_context, metadata, query, pagination).await
+    }
+
+    /// Apply Server Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyServerGrants.path(),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_server_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_server_grants(api_context, metadata, request)
+            .await
+            .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Project Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held on the project named by `x-project-id`, or the default
+    /// project. Grants on resources inside the project are not included — use those
+    /// resources' own endpoints, or `GET /grants` for one principal's across the whole
+    /// project.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the project; every other listing requires
+    /// the project's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListProjectGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the project", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_project_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_project_grants(api_context, metadata, query, pagination).await
+    }
+
+    /// Apply Project Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyProjectGrants.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_project_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_project_grants(api_context, metadata, request)
+            .await
+            .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Table Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held directly on this table. Grants do not inherit — a grant on
+    /// the containing namespace or warehouse belongs to that resource, not to the table.
+    /// A table in the recycle bin still reports its grants, because an undrop restores
+    /// them.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the table; every other listing requires
+    /// the table's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListTableGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the table", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_table_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_table_grants(
+            warehouse_id,
+            table_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply Table Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyTableGrants.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_table_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_table_grants(
+            warehouse_id,
+            table_id,
+            api_context,
+            metadata,
+            request,
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List View Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held directly on this view. Grants do not inherit.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the view; every other listing requires the
+    /// view's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListViewGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("view_id" = Uuid, Path, description = "View ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the view", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_view_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_view_grants(
+            warehouse_id,
+            view_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply View Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyViewGrants.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("view_id" = Uuid, Path, description = "View ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_view_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_view_grants(
+            warehouse_id,
+            view_id,
+            api_context,
+            metadata,
+            request,
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Generic Table Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Lists the grants held directly on this generic table. Grants do not inherit.
+    ///
+    /// Supply `principalUser` or `principalRole` to narrow to one principal. Narrowing to
+    /// yourself requires only permission to see the generic table; every other listing
+    /// requires the generic table's grant-read permission.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::ListGenericTableGrants.path(),
+        params(ListGrantsQuery, PaginationQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("generic_table_id" = Uuid, Path, description = "Generic Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Grants held on the generic table", body = ListGrantsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_generic_table_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListGrantsQuery>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<ListGrantsResponse> {
+        ApiServer::<C, A, S>::list_generic_table_grants(
+            warehouse_id,
+            generic_table_id,
+            api_context,
+            metadata,
+            query,
+            pagination,
+        )
+        .await
+    }
+
+    /// Apply Generic Table Grants [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Creates the grants in `writes` and removes those in `deletes`, atomically.
+    /// Idempotent. Success is `204` with no body: whether an entry was already in
+    /// the requested state is not reported.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "grant",
+        path = ManagementV1Endpoint::ApplyGenericTableGrants.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("generic_table_id" = Uuid, Path, description = "Generic Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = ApplyGrantsRequest,
+        responses(
+            (status = 204, description = "Grants applied"),
+            (status = 409, body = IcebergErrorResponse, description = "Conflict — the request was not applied and can be retried."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn apply_generic_table_grants<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<ApplyGrantsRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::apply_generic_table_grants(
+            warehouse_id,
+            generic_table_id,
+            api_context,
+            metadata,
+            request,
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Warehouse Tags
+    ///
+    /// Returns the tags applied to the warehouse.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListWarehouseTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the warehouse (direct; or effective with ?effective=true, which is a no-op here as a warehouse has no ancestors)", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_warehouse_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(warehouse_id): Path<WarehouseId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_warehouse_tags(warehouse_id, api_context, metadata, query).await
+    }
+
+    /// Set Namespace Tag
+    ///
+    /// Applies a tag to the namespace, or updates its value if already applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetNamespaceTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("namespace_id" = Uuid, Path, description = "Namespace ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_namespace_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id, tag_name)): Path<(WarehouseId, NamespaceId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_namespace_tag(
+            warehouse_id,
+            namespace_id,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete Namespace Tag
+    ///
+    /// Removes a tag from the namespace. Succeeds without change if the tag
+    /// is not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteNamespaceTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("namespace_id" = Uuid, Path, description = "Namespace ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_namespace_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id, tag_name)): Path<(WarehouseId, NamespaceId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_namespace_tag(
+            warehouse_id,
+            namespace_id,
+            tag_name,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// List Namespace Tags
+    ///
+    /// Returns the tags applied to the namespace.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListNamespaceTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("namespace_id" = Uuid, Path, description = "Namespace ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the namespace", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_namespace_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(WarehouseId, NamespaceId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_namespace_tags(
+            warehouse_id,
+            namespace_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Set Table Tag
+    ///
+    /// Applies a tag to the table, or updates its value if already applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetTableTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_table_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id, tag_name)): Path<(WarehouseId, TableId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_table_tag(
+            warehouse_id,
+            table_id,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete Table Tag
+    ///
+    /// Removes a tag from the table. Succeeds without change if the tag is
+    /// not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteTableTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_table_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id, tag_name)): Path<(WarehouseId, TableId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_table_tag(
+            warehouse_id,
+            table_id,
+            tag_name,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// List Table Tags
+    ///
+    /// Returns the tags applied to the table.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListTableTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the table", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_table_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_table_tags(warehouse_id, table_id, api_context, metadata, query)
+            .await
+    }
+
+    /// Set Table Column Tag
+    ///
+    /// Applies a tag to a column of the table's current schema, or updates
+    /// its value if already applied. Nested columns are addressed with `.`
+    /// as separator (e.g. `address.zip`).
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetTableColumnTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("column_name" = String, Path, description = "Column name in the table's current schema"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_table_column_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id, column_name, tag_name)): Path<(
+            WarehouseId,
+            TableId,
+            String,
+            String,
+        )>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_table_column_tag(
+            warehouse_id,
+            table_id,
+            column_name,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete Table Column Tag
+    ///
+    /// Removes a tag from a column of the table's current schema. Succeeds
+    /// without change if the tag is not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteTableColumnTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("column_name" = String, Path, description = "Column name in the table's current schema"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_table_column_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id, column_name, tag_name)): Path<(
+            WarehouseId,
+            TableId,
+            String,
+            String,
+        )>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_table_column_tag(
+            warehouse_id,
+            table_id,
+            column_name,
+            tag_name,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// List Table Column Tags
+    ///
+    /// Returns the tags applied to a column of the table's current schema.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListTableColumnTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("column_name" = String, Path, description = "Column name in the table's current schema"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the column", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_table_column_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id, column_name)): Path<(WarehouseId, TableId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_table_column_tags(
+            warehouse_id,
+            table_id,
+            column_name,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// List All Column Tags
+    ///
+    /// Returns the governance tags on every column of the table in one call, grouped by
+    /// column (field-id). Columns without tags are omitted. Requires metadata access on
+    /// the table.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListColumnTags.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("table_id" = Uuid, Path, description = "Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on each column of the table", body = ListColumnTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_column_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<ListColumnTagsResponse> {
+        ApiServer::<C, A, S>::list_column_tags(warehouse_id, table_id, api_context, metadata).await
+    }
+
+    /// Set View Tag
+    ///
+    /// Applies a tag to the view, or updates its value if already applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetViewTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("view_id" = Uuid, Path, description = "View ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_view_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id, tag_name)): Path<(WarehouseId, ViewId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_view_tag(
+            warehouse_id,
+            view_id,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete View Tag
+    ///
+    /// Removes a tag from the view. Succeeds without change if the tag is
+    /// not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteViewTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("view_id" = Uuid, Path, description = "View ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_view_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id, tag_name)): Path<(WarehouseId, ViewId, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_view_tag(
+            warehouse_id,
+            view_id,
+            tag_name,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// List View Tags
+    ///
+    /// Returns the tags applied to the view.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListViewTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("view_id" = Uuid, Path, description = "View ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the view", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_view_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_view_tags(warehouse_id, view_id, api_context, metadata, query)
+            .await
+    }
+
+    /// Set Generic Table Tag
+    ///
+    /// Applies a tag to the generic table, or updates its value if already
+    /// applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        put,
+        tag = "tag",
+        path = ManagementV1Endpoint::SetGenericTableTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("generic_table_id" = Uuid, Path, description = "Generic Table ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        request_body = SetTagRequest,
+        responses(
+            (status = 200, description = "Tag applied", body = AppliedTag),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_generic_table_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, generic_table_id, tag_name)): Path<(
+            WarehouseId,
+            GenericTableId,
+            String,
+        )>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SetTagRequest>,
+    ) -> Result<(StatusCode, Json<AppliedTag>)> {
+        ApiServer::<C, A, S>::set_generic_table_tag(
+            warehouse_id,
+            generic_table_id,
+            tag_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|applied| (StatusCode::OK, Json(applied)))
+    }
+
+    /// Delete Generic Table Tag
+    ///
+    /// Removes a tag from the generic table. Succeeds without change if the
+    /// tag is not applied.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "tag",
+        path = ManagementV1Endpoint::DeleteGenericTableTag.path(),
+        params(("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("generic_table_id" = Uuid, Path, description = "Generic Table ID"), ("tag_name" = String, Path, description = "Name of the tag definition"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Tag removed"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn delete_generic_table_tag<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, generic_table_id, tag_name)): Path<(
+            WarehouseId,
+            GenericTableId,
+            String,
+        )>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<(StatusCode, ())> {
+        ApiServer::<C, A, S>::delete_generic_table_tag(
+            warehouse_id,
+            generic_table_id,
+            tag_name,
+            api_context,
+            metadata,
+        )
+        .await
+        .map(|()| (StatusCode::NO_CONTENT, ()))
+    }
+
+    /// List Generic Table Tags
+    ///
+    /// Returns the tags applied to the generic table.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tag",
+        path = ManagementV1Endpoint::ListGenericTableTags.path(),
+        params(ListTagsQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"), ("generic_table_id" = Uuid, Path, description = "Generic Table ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Tags on the generic table", body = ListTagsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_generic_table_tags<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListTagsQuery>,
+    ) -> Result<ListTagsResponse> {
+        ApiServer::<C, A, S>::list_generic_table_tags(
+            warehouse_id,
+            generic_table_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get allowed actions for a role
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "role",
+    path = ManagementV1Endpoint::GetRoleActions.path(),
+    params(GetAccessQuery, ("role_id" = Uuid, Path, description = "Role ID"), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+    responses(
+        (status = 200, body = GetLakekeeperRoleActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_role_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperRoleActionsResponse>)> {
+        let relations = get_allowed_role_actions(api_context, metadata, query, role_id).await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperRoleActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
+    /// List Role Members
+    ///
+    /// Lists the direct members of a role — users and member roles — as one merged,
+    /// keyset-paginated page. Optionally filtered to a single member kind via `?type=`.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "role",
+        path = ManagementV1Endpoint::ListRoleMembers.path(),
+        params(
+            ListMembersQuery,
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Direct members of the role", body = ListRoleMembersResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_role_members<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListMembersQuery>,
+    ) -> Result<ListRoleMembersResponse> {
+        ApiServer::<C, A, S>::list_role_members(api_context, metadata, role_id, query).await
+    }
+
+    /// Add Role Members
+    ///
+    /// Adds one or more members (users and/or roles) to a role in a single atomic
+    /// (all-or-nothing) batch. Idempotent — already-present members are accepted.
+    /// Returns the requested members confirmed present.
+    ///
+    /// Handling of a not-yet-provisioned member depends on the configured
+    /// authorization backend: a backend that stores assignments itself accepts the
+    /// member by id, whereas catalog-backed authorization requires the member to
+    /// exist first and otherwise returns `404` — provision the user (via
+    /// `POST /user`) or create the role before assigning. Behavior is consistent
+    /// within a deployment.
+    ///
+    /// Roles from the `system` provider are provisioned, not self-service: adding a
+    /// member requires an instance admin (`403`), and a role may not be added as a
+    /// member of one (`400`) — they hold users directly.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "role",
+        path = ManagementV1Endpoint::AddRoleMembers.path(),
+        params(
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        request_body = AddRoleMembersRequest,
+        responses(
+            (status = 200, description = "Members added", body = AddRoleMembersResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn add_role_members<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<AddRoleMembersRequest>,
+    ) -> Result<AddRoleMembersResponse> {
+        ApiServer::<C, A, S>::add_role_members(api_context, metadata, role_id, request).await
+    }
+
+    /// Remove Role Member
+    ///
+    /// Removes a single member (a user or a role) from a role. Idempotent — removing
+    /// an absent member is a no-op and still returns `204`.
+    ///
+    /// Removing a member of a `system`-provider role requires an instance admin
+    /// (`403`). Unlike adding, removing a role-type member is permitted, so an
+    /// existing nesting can be cleaned up.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        delete,
+        tag = "role",
+        path = ManagementV1Endpoint::RemoveRoleMember.path(),
+        params(
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("member_type" = RoleMemberType, Path, description = "Member kind: `user` or `role`"),
+            ("member_id" = String, Path, description = "User id or role UUID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 204, description = "Member removed (or already absent)"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn remove_role_member<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((role_id, member_type, member_id)): Path<(RoleId, RoleMemberType, String)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::remove_role_member(
+            api_context,
+            metadata,
+            role_id,
+            member_type,
+            member_id,
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+    }
+
+    /// List Roles a Role Is a Member Of
+    ///
+    /// Lists the roles that the given role is a direct member of, keyset-paginated.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "role",
+        path = ManagementV1Endpoint::ListRoleMemberOf.path(),
+        params(
+            ListRolesPageQuery,
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Roles the role is a member of", body = ListRoleMembershipsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_role_member_of<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListRolesPageQuery>,
+    ) -> Result<ListRoleMembershipsResponse> {
+        ApiServer::<C, A, S>::list_role_member_of(api_context, metadata, role_id, query).await
+    }
+
+    /// List User Roles
+    ///
+    /// Lists the roles a user is directly assigned to, keyset-paginated.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "user",
+        path = ManagementV1Endpoint::ListUserRoles.path(),
+        params(
+            ListRolesPageQuery,
+            ("user_id" = String, Path, description = "User ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Roles the user is assigned to", body = ListRoleMembershipsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_user_roles<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(user_id): Path<UserId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListRolesPageQuery>,
+    ) -> Result<ListRoleMembershipsResponse> {
+        ApiServer::<C, A, S>::list_user_roles(api_context, metadata, user_id, query).await
+    }
+
+    /// List Transitive Role Members
+    ///
+    /// Lists the role's transitive members — users assigned to the role or any role
+    /// in its downward membership closure, plus every role in that closure — as one
+    /// keyset-paginated page, optionally filtered to one kind. Supported only when
+    /// assignments are catalog-managed; an assignment-managing authorizer (e.g.
+    /// OpenFGA) returns `501`.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "role",
+        path = ManagementV1Endpoint::ListRoleTransitiveMembers.path(),
+        params(
+            ListMembersQuery,
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Transitive members of the role", body = ListRoleMembersResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+            (status = 501, description = "Transitive listing is not supported under the configured authorizer backend", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_role_transitive_members<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListMembersQuery>,
+    ) -> Result<ListRoleMembersResponse> {
+        ApiServer::<C, A, S>::list_role_transitive_members(api_context, metadata, role_id, query)
+            .await
+    }
+
+    /// List Transitive User Roles
+    ///
+    /// Lists the full effective (transitive) role set a user holds — direct
+    /// assignments plus every role reachable upward through membership — keyset-
+    /// paginated. Supported only when assignments are catalog-managed; an
+    /// assignment-managing authorizer (e.g. OpenFGA) returns `501`.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "user",
+        path = ManagementV1Endpoint::ListUserTransitiveRoles.path(),
+        params(
+            ListRolesPageQuery,
+            ("user_id" = String, Path, description = "User ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Transitive roles the user holds", body = ListRoleMembershipsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+            (status = 501, description = "Transitive listing is not supported under the configured authorizer backend", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_user_transitive_roles<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(user_id): Path<UserId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListRolesPageQuery>,
+    ) -> Result<ListRoleMembershipsResponse> {
+        ApiServer::<C, A, S>::list_user_transitive_roles(api_context, metadata, user_id, query)
+            .await
+    }
+
+    /// List Transitive Role Member-Of
+    ///
+    /// Lists the full transitive member-of set of a role — every role it
+    /// effectively belongs to, reachable upward through membership — keyset-
+    /// paginated. Supported only when assignments are catalog-managed; an
+    /// assignment-managing authorizer (e.g. OpenFGA) returns `501`.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "role",
+        path = ManagementV1Endpoint::ListRoleTransitiveMemberOf.path(),
+        params(
+            ListRolesPageQuery,
+            ("role_id" = Uuid, Path, description = "Role ID"),
+            ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)
+        ),
+        responses(
+            (status = 200, description = "Transitive roles the role belongs to", body = ListRoleMembershipsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+            (status = 501, description = "Transitive listing is not supported under the configured authorizer backend", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_role_transitive_member_of<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(role_id): Path<RoleId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<ListRolesPageQuery>,
+    ) -> Result<ListRoleMembershipsResponse> {
+        ApiServer::<C, A, S>::list_role_transitive_member_of(api_context, metadata, role_id, query)
+            .await
     }
 
     /// Create Warehouse
@@ -513,41 +2329,18 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         get,
         tag = "project",
-        path = ManagementV1Endpoint::GetDefaultProject.path(),
-        params(("x-project-id" = String, Header, description = "Optional project ID"),),
+        path = ManagementV1Endpoint::GetProject.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
         responses(
             (status = 200, description = "Project details", body = GetProjectResponse),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn get_default_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    async fn get_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
     ) -> Result<GetProjectResponse> {
-        ApiServer::<C, A, S>::get_project(None, api_context, metadata).await
-    }
-
-    /// Get Default Project
-    ///
-    /// Retrieves information about the user's default project.
-    /// This endpoint is deprecated and will be removed in a future version.
-    #[cfg_attr(feature = "open-api", utoipa::path(
-            get,
-            tag = "project",
-            path = ManagementV1Endpoint::GetDefaultProjectDeprecated.path(),
-            responses(
-                (status = 200, description = "Project details", body = GetProjectResponse),
-                (status = "4XX", body = IcebergErrorResponse),
-            )
-        ))]
-    #[deprecated(
-        since = "0.8.0",
-        note = "This endpoint is deprecated and will be removed in a future version. Use `/v1/projects/default` instead."
-    )]
-    async fn get_default_project_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
-        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
-        Extension(metadata): Extension<RequestMetadata>,
-    ) -> Result<GetProjectResponse> {
+        // project_id header is parsed by RequestMetadata and used from there.
         ApiServer::<C, A, S>::get_project(None, api_context, metadata).await
     }
 
@@ -555,14 +2348,18 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         get,
         tag = "project",
-        path = ManagementV1Endpoint::GetDefaultProjectById.path(),
+        path = ManagementV1Endpoint::GetProjectByIdDeprecated.path(),
         params(("project_id" = String,)),
         responses(
             (status = 200, description = "Project details", body = GetProjectResponse),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn get_project_by_id<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    #[deprecated(
+        since = "0.11.0",
+        note = "This endpoint is deprecated and will be removed in a future version. Use `/management/v1/project` and set the `x-project-id` header instead."
+    )]
+    async fn get_project_by_id_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
         Path(project_id): Path<ProjectId>,
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
@@ -574,40 +2371,14 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         delete,
         tag = "project",
-        path = ManagementV1Endpoint::DeleteDefaultProject.path(),
-        params(("x-project-id" = String, Header, description = "Optional project ID"),),
+        path = ManagementV1Endpoint::DeleteProject.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
         responses(
             (status = 204, description = "Project deleted successfully"),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn delete_default_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
-        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
-        Extension(metadata): Extension<RequestMetadata>,
-    ) -> Result<(StatusCode, ())> {
-        ApiServer::<C, A, S>::delete_project(None, api_context, metadata)
-            .await
-            .map(|()| (StatusCode::NO_CONTENT, ()))
-    }
-
-    /// Delete default Project
-    ///
-    /// Removes the user's default project and all its resources.
-    /// This endpoint is deprecated and will be removed in a future version.
-    #[cfg_attr(feature = "open-api", utoipa::path(
-            delete,
-            tag = "project",
-            path = ManagementV1Endpoint::DeleteDefaultProjectDeprecated .path(),
-            responses(
-                (status = 204, description = "Project deleted successfully"),
-                (status = "4XX", body = IcebergErrorResponse),
-            )
-        ))]
-    #[deprecated(
-        since = "0.8.0",
-        note = "This endpoint is deprecated and will be removed in a future version. Use `/v1/projects/default` instead."
-    )]
-    async fn delete_default_project_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    async fn delete_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
     ) -> Result<(StatusCode, ())> {
@@ -622,14 +2393,18 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         delete,
         tag = "project",
-        path = ManagementV1Endpoint::DeleteProjectById.path(),
+        path = ManagementV1Endpoint::DeleteProjectByIdDeprecated.path(),
         params(("project_id" = String,)),
         responses(
             (status = 204, description = "Project deleted successfully"),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn delete_project_by_id<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    #[deprecated(
+        since = "0.11.0",
+        note = "This endpoint is deprecated and will be removed in a future version. Use `/management/v1/project` and set the `x-project-id` header instead."
+    )]
+    async fn delete_project_by_id_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
         Path(project_id): Path<ProjectId>,
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
@@ -643,39 +2418,14 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         post,
         tag = "project",
-        path = ManagementV1Endpoint::RenameDefaultProject.path(),
-        params(("x-project-id" = String, Header, description = "Optional project ID"),),
+        path = ManagementV1Endpoint::RenameProject.path(),
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
         responses(
             (status = 200, description = "Project renamed successfully"),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn rename_default_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
-        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
-        Extension(metadata): Extension<RequestMetadata>,
-        Json(request): Json<RenameProjectRequest>,
-    ) -> Result<()> {
-        ApiServer::<C, A, S>::rename_project(None, request, api_context, metadata).await
-    }
-
-    /// Rename the default project.
-    ///
-    /// Updates the name of the user's default project.
-    /// This endpoint is deprecated and will be removed in a future version.
-    #[cfg_attr(feature = "open-api", utoipa::path(
-            post,
-            tag = "project",
-            path = ManagementV1Endpoint::RenameDefaultProjectDeprecated.path(),
-            responses(
-                (status = 200, description = "Project renamed successfully"),
-                (status = "4XX", body = IcebergErrorResponse),
-            )
-        ))]
-    #[deprecated(
-        since = "0.8.0",
-        note = "This endpoint is deprecated and will be removed in a future version. Use `/v1/projects/default` instead."
-    )]
-    async fn rename_default_project_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    async fn rename_project<C: CatalogStore, A: Authorizer, S: SecretStore>(
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
         Json(request): Json<RenameProjectRequest>,
@@ -689,20 +2439,53 @@ pub mod v1 {
     #[cfg_attr(feature = "open-api", utoipa::path(
         post,
         tag = "project",
-        path = ManagementV1Endpoint::RenameProjectById.path(),
+        path = ManagementV1Endpoint::RenameProjectByIdDeprecated.path(),
         params(("project_id" = String,)),
         responses(
             (status = 200, description = "Project renamed successfully"),
             (status = "4XX", body = IcebergErrorResponse),
         )
     ))]
-    async fn rename_project_by_id<C: CatalogStore, A: Authorizer, S: SecretStore>(
+    #[deprecated(
+        since = "0.11.0",
+        note = "This endpoint is deprecated and will be removed in a future version. Use `/management/v1/project/rename` and set the `x-project-id` header instead."
+    )]
+    async fn rename_project_by_id_deprecated<C: CatalogStore, A: Authorizer, S: SecretStore>(
         Path(project_id): Path<ProjectId>,
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Extension(metadata): Extension<RequestMetadata>,
         Json(request): Json<RenameProjectRequest>,
     ) -> Result<()> {
         ApiServer::<C, A, S>::rename_project(Some(project_id), request, api_context, metadata).await
+    }
+
+    /// Get allowed actions for a project
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "project",
+    params(GetAccessQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION),),
+    path = ManagementV1Endpoint::GetProjectActions.path(),
+    responses(
+        (status = 200, body = GetLakekeeperProjectActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_project_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperProjectActionsResponse>)> {
+        let project_id = metadata.require_project_id(None)?;
+
+        let actions =
+            get_allowed_project_actions(api_context, metadata, query, &project_id).await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperProjectActionsResponse {
+                allowed_actions: actions,
+            }),
+        ))
     }
 
     /// List Warehouses
@@ -842,6 +2625,41 @@ pub mod v1 {
         .await
     }
 
+    /// Update Format Version Policy
+    ///
+    /// Configures which Iceberg table format versions may be created in, or
+    /// upgraded to, within a warehouse, and the default version applied when a
+    /// create-table request does not specify one.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::UpdateWarehouseFormatVersionPolicy.path(),
+        params(("warehouse_id" = Uuid,)),
+        request_body = UpdateWarehouseFormatVersionPolicyRequest,
+        responses(
+            (status = 200, body = GetWarehouseResponse, description = "Format version policy updated successfully"),
+        (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn update_warehouse_format_version_policy<
+        C: CatalogStore,
+        A: Authorizer + Clone,
+        S: SecretStore,
+    >(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<UpdateWarehouseFormatVersionPolicyRequest>,
+    ) -> Result<GetWarehouseResponse> {
+        ApiServer::<C, A, S>::update_warehouse_format_version_policy(
+            warehouse_id.into(),
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
     /// Deactivate Warehouse
     ///
     /// Temporarily disables access to a warehouse without deleting its data.
@@ -882,6 +2700,35 @@ pub mod v1 {
         Extension(metadata): Extension<RequestMetadata>,
     ) -> Result<()> {
         ApiServer::<C, A, S>::activate_warehouse(warehouse_id.into(), api_context, metadata).await
+    }
+
+    /// Get allowed actions for a warehouse
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "warehouse",
+    path = ManagementV1Endpoint::GetWarehouseActions.path(),
+    params(GetAccessQuery, ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),),
+    responses(
+        (status = 200, body = GetLakekeeperWarehouseActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_warehouse_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path(warehouse_id): Path<WarehouseId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperWarehouseActionsResponse>)> {
+        let relations =
+            get_allowed_warehouse_actions::<A, C, S>(api_context, metadata, query, warehouse_id)
+                .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperWarehouseActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
     }
 
     /// Update Storage Profile
@@ -936,6 +2783,130 @@ pub mod v1 {
             metadata,
         )
         .await
+    }
+
+    /// Validate Warehouse Configuration
+    ///
+    /// Runs the checks `Create Warehouse` runs — profile syntax, name and ID
+    /// availability, location overlap, format-version policy, `managed-by`, and
+    /// physical storage access including credential vending — without creating
+    /// anything. No warehouse is persisted and no credential is stored.
+    ///
+    /// Returns 200 whether or not the configuration is usable; inspect `valid` and
+    /// the per-check results. Requires the same permission as creating a warehouse.
+    ///
+    /// Results are advisory and reserve nothing: a concurrent request can take a
+    /// name or ID between this call and the create. `warehouse-id-available` in
+    /// particular examines only the caller's own project, while warehouse IDs are
+    /// unique across the whole instance — so an ID it reports as available can
+    /// still be refused with `409 WarehouseIdAlreadyExists` on create.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::ValidateWarehouse.path(),
+        request_body = CreateWarehouseRequest,
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "Validation ran; see `valid` and `checks` for the outcome", body = ValidateWarehouseResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn validate_warehouse<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<CreateWarehouseRequest>,
+    ) -> Result<ValidateWarehouseResponse> {
+        ApiServer::<C, A, S>::validate_warehouse(request, api_context, metadata).await
+    }
+
+    /// Validate Storage Profile Update
+    ///
+    /// Dry-run of `Update Storage Profile`: checks that the warehouse's spec may
+    /// be changed, that the new profile is a permitted evolution of the current
+    /// one, and that the storage is reachable — without changing the warehouse.
+    ///
+    /// Probes the incoming profile as supplied, before it would be merged into
+    /// the stored one, matching what the real update validates.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::ValidateStorageProfile.path(),
+        params(("warehouse_id" = Uuid,)),
+        request_body = UpdateWarehouseStorageRequest,
+        responses(
+            (status = 200, description = "Validation ran; see `valid` and `checks` for the outcome", body = ValidateWarehouseResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn validate_storage_profile<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<UpdateWarehouseStorageRequest>,
+    ) -> Result<ValidateWarehouseResponse> {
+        ApiServer::<C, A, S>::validate_storage_profile(
+            warehouse_id.into(),
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Validate Storage Credential
+    ///
+    /// Dry-run of `Update Storage Credential`: probes the warehouse's stored
+    /// storage profile with the supplied replacement credential. The stored
+    /// credential is left untouched.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::ValidateStorageCredential.path(),
+        params(("warehouse_id" = Uuid,)),
+        request_body = UpdateWarehouseCredentialRequest,
+        responses(
+            (status = 200, description = "Validation ran; see `valid` and `checks` for the outcome", body = ValidateWarehouseResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn validate_storage_credential<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<UpdateWarehouseCredentialRequest>,
+    ) -> Result<ValidateWarehouseResponse> {
+        ApiServer::<C, A, S>::validate_storage_credential(
+            warehouse_id.into(),
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Validate Stored Warehouse Configuration
+    ///
+    /// Re-runs the storage checks against the configuration the warehouse is
+    /// currently running with, using its stored profile and stored credential.
+    /// Use this to find out whether a warehouse's storage access still works —
+    /// for example after a credential has expired or a bucket policy changed.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::ValidateStorageAccess.path(),
+        params(("warehouse_id" = Uuid,)),
+        responses(
+            (status = 200, description = "Validation ran; see `valid` and `checks` for the outcome", body = ValidateWarehouseResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn validate_storage_access<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+    ) -> Result<ValidateWarehouseResponse> {
+        ApiServer::<C, A, S>::validate_storage_access(warehouse_id.into(), api_context, metadata)
+            .await
     }
 
     #[derive(Deserialize, Debug)]
@@ -1130,40 +3101,6 @@ pub mod v1 {
     /// Undrop Tabular
     ///
     /// Restores previously deleted tables or views to make them accessible again.
-    /// This endpoint is deprecated and will be removed soon.
-    #[cfg_attr(feature = "open-api", utoipa::path(
-        post,
-        tag = "warehouse",
-        path = ManagementV1Endpoint::UndropTabularsDeprecated.path(),
-        params(("warehouse_id" = Uuid,)),
-        responses(
-            (status = 204, description = "Tabular undropped successfully"),
-            (status = "4XX", body = IcebergErrorResponse),
-        )
-    ))]
-    #[deprecated(
-        since = "0.7.0",
-        note = "This endpoint is deprecated and will be removed soon, please use /management/v1/warehouse/{warehouse_id}/deleted-tabulars/undrop instead."
-    )]
-    async fn undrop_tabulars_deprecated<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
-        Path(warehouse_id): Path<uuid::Uuid>,
-        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
-        Extension(metadata): Extension<RequestMetadata>,
-        Json(request): Json<UndropTabularsRequest>,
-    ) -> Result<StatusCode> {
-        ApiServer::<C, A, S>::undrop_tabulars(
-            WarehouseId::from(warehouse_id),
-            metadata,
-            request,
-            api_context,
-        )
-        .await?;
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    /// Undrop Tabular
-    ///
-    /// Restores previously deleted tables or views to make them accessible again.
     #[cfg_attr(feature = "open-api", utoipa::path(
         post,
         tag = "warehouse",
@@ -1261,6 +3198,40 @@ pub mod v1 {
         .await
     }
 
+    /// Get allowed actions for a table
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "warehouse",
+    path = ManagementV1Endpoint::GetTableActions.path(),
+    params(GetAccessQuery, ("warehouse_id" = Uuid,),("table_id" = Uuid,)),
+    responses(
+        (status = 200, body = GetLakekeeperTableActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_table_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperTableActionsResponse>)> {
+        let relations = get_allowed_table_actions::<A, C, S>(
+            api_context,
+            metadata,
+            query,
+            warehouse_id,
+            table_id,
+        )
+        .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperTableActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
     /// Get View Protection
     ///
     /// Retrieves whether a view is protected from deletion.
@@ -1309,6 +3280,433 @@ pub mod v1 {
     ) -> Result<ProtectionResponse> {
         ApiServer::<C, A, S>::set_view_protection(
             ViewId::from(view_id),
+            warehouse_id.into(),
+            protected,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Get allowed actions for a view
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "warehouse",
+    path = ManagementV1Endpoint::GetViewActions.path(),
+    params(GetAccessQuery, ("warehouse_id" = Uuid,),("view_id" = Uuid,)),
+    responses(
+        (status = 200, body = GetLakekeeperViewActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_view_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperViewActionsResponse>)> {
+        let relations = get_allowed_view_actions::<A, C, S>(
+            api_context,
+            metadata,
+            query,
+            warehouse_id,
+            view_id,
+        )
+        .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperViewActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
+    /// Get allowed actions for a generic table
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "warehouse",
+    path = ManagementV1Endpoint::GetGenericTableActions.path(),
+    params(GetAccessQuery, ("warehouse_id" = Uuid,),("generic_table_id" = Uuid,)),
+    responses(
+        (status = 200, body = GetLakekeeperGenericTableActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_generic_table_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperGenericTableActionsResponse>)> {
+        let relations = get_allowed_generic_table_actions::<A, C, S>(
+            api_context,
+            metadata,
+            query,
+            warehouse_id,
+            generic_table_id,
+        )
+        .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperGenericTableActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
+    /// Get Grantable Privileges on a server [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this server publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this server's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetServerGrantablePrivileges.path(),
+        params(GetGrantAccessQuery),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_server_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_server_grantable_privileges(api_context, metadata, query).await
+    }
+
+    /// Get Grantable Privileges on a project [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this project publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this project's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetProjectGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_project_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_project_grantable_privileges(api_context, metadata, query).await
+    }
+
+    /// Get Grantable Privileges on a warehouse [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this warehouse publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this warehouse's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetWarehouseGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("warehouse_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_warehouse_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(warehouse_id): Path<WarehouseId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_warehouse_grantable_privileges(
+            warehouse_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get Grantable Privileges on a namespace [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this namespace publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this namespace's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetNamespaceGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("warehouse_id" = Uuid,),("namespace_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_namespace_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(WarehouseId, NamespaceId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_namespace_grantable_privileges(
+            warehouse_id,
+            namespace_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get Grantable Privileges on a table [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this table publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this table's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetTableGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("warehouse_id" = Uuid,),("table_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_table_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_table_grantable_privileges(
+            warehouse_id,
+            table_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get Grantable Privileges on a view [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this view publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this view's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetViewGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("warehouse_id" = Uuid,),("view_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_view_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_view_grantable_privileges(
+            warehouse_id,
+            view_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get Grantable Privileges on a generic table [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this generic table publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this generic table's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetGenericTableGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("warehouse_id" = Uuid,),("generic_table_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_generic_table_grantable_privileges<
+        C: CatalogStore,
+        A: Authorizer,
+        S: SecretStore,
+    >(
+        Path((warehouse_id, generic_table_id)): Path<(WarehouseId, GenericTableId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_generic_table_grantable_privileges(
+            warehouse_id,
+            generic_table_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get Grantable Privileges on a tag definition [Preview]
+    ///
+    /// This API may change in a backward-incompatible way in a future release.
+    ///
+    /// Every privilege this tag definition publishes, each marked with whether the caller may
+    /// administer it here. Not filtered: a picker needs to show the ones it
+    /// cannot offer, not omit them. Pass `principalUser` or `principalRole` to ask on
+    /// another principal's behalf, which requires authority to read this tag definition's
+    /// grants.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "grant",
+        path = ManagementV1Endpoint::GetTagGrantablePrivileges.path(),
+        params(GetGrantAccessQuery, ("tag_definition_id" = Uuid,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, description = "This resource's privileges, each marked allowed or not", body = ResourceGrantablePrivilegesResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_tag_grantable_privileges<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetGrantAccessQuery>,
+    ) -> Result<ResourceGrantablePrivilegesResponse> {
+        ApiServer::<C, A, S>::get_tag_grantable_privileges(
+            tag_definition_id,
+            api_context,
+            metadata,
+            query,
+        )
+        .await
+    }
+
+    /// Get allowed actions for a tag definition
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "tag",
+    path = ManagementV1Endpoint::GetTagActions.path(),
+    params(GetAccessQuery, ("tag_definition_id" = Uuid,)),
+    responses(
+        (status = 200, body = GetLakekeeperTagActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_tag_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path(tag_definition_id): Path<TagDefinitionId>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperTagActionsResponse>)> {
+        let relations =
+            get_allowed_tag_actions::<A, C, S>(api_context, metadata, query, tag_definition_id)
+                .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperTagActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
+    /// Get Generic Table Protection
+    ///
+    /// Retrieves whether a generic table is protected from deletion.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::GetGenericTableProtection.path(),
+        params(("warehouse_id" = Uuid,),("generic_table_id" = Uuid,)),
+        responses(
+            (status = 200, body = ProtectionResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_generic_table_protection<
+        C: CatalogStore,
+        A: Authorizer + Clone,
+        S: SecretStore,
+    >(
+        Path((warehouse_id, generic_table_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+    ) -> Result<ProtectionResponse> {
+        ApiServer::<C, A, S>::get_generic_table_protection(
+            GenericTableId::from(generic_table_id),
+            warehouse_id.into(),
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Set Generic Table Protection
+    ///
+    /// Configures whether a generic table should be protected from deletion.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::SetGenericTableProtection.path(),
+        params(("warehouse_id" = Uuid,),("generic_table_id" = Uuid,)),
+        responses(
+            (status = 200, body = ProtectionResponse, description = "Generic table protection set successfully"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_generic_table_protection<
+        C: CatalogStore,
+        A: Authorizer + Clone,
+        S: SecretStore,
+    >(
+        Path((warehouse_id, generic_table_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(SetProtectionRequest { protected }): Json<SetProtectionRequest>,
+    ) -> Result<ProtectionResponse> {
+        ApiServer::<C, A, S>::set_generic_table_protection(
+            GenericTableId::from(generic_table_id),
             warehouse_id.into(),
             protected,
             api_context,
@@ -1373,6 +3771,97 @@ pub mod v1 {
         .await
     }
 
+    /// Move a Namespace
+    ///
+    /// Moves a namespace to a new location in the warehouse's namespace hierarchy,
+    /// re-parenting it and/or renaming it. The request body carries the full destination path:
+    /// its last element is the new name, the preceding elements identify the new parent, so a
+    /// single-element path moves the namespace to the warehouse root. The path must not be
+    /// empty.
+    ///
+    /// Requires grant authority at **both** ends, because re-parenting makes the namespace's
+    /// contents inherit the destination subtree's permissions without any assignment being
+    /// recorded:
+    ///
+    /// - `move` on the namespace being moved,
+    /// - `create_namespace` **and** `accept_moved_namespace` on the destination parent (or on
+    ///   the warehouse, when moving to the root).
+    ///
+    /// Both `move` and `accept_moved_namespace` require `manage_grants` on top of the ordinary
+    /// write privilege (`modify` at the source, `create` at the destination). `create_namespace`
+    /// alone is not sufficient at the destination: it authorizes adding an *empty* child,
+    /// whereas a move arrives carrying existing contents and their grants.
+    ///
+    /// Constraints:
+    /// - Namespaces that contain child namespaces cannot be moved.
+    /// - Moves stay within one warehouse.
+    /// - Protected namespaces require `force`.
+    /// - Rejected for warehouses whose storage layout derives physical locations from
+    ///   namespace names or from the namespace hierarchy.
+    ///
+    /// A destination equal to the namespace's current path is a no-op and returns 200, so a
+    /// retried request cannot fail with a spurious conflict.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::MoveNamespace.path(),
+        params(("warehouse_id" = Uuid,),("namespace_id" = Uuid,)),
+        request_body = MoveNamespaceRequest,
+        responses(
+            (status = 200, body = MoveNamespaceResponse, description = "Namespace moved successfully"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn move_namespace<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<MoveNamespaceRequest>,
+    ) -> Result<MoveNamespaceResponse> {
+        ApiServer::<C, A, S>::move_namespace(
+            NamespaceId::from(namespace_id),
+            warehouse_id.into(),
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Get allowed actions for a namespace
+    #[cfg_attr(feature = "open-api", utoipa::path(
+    get,
+    tag = "warehouse",
+    path = ManagementV1Endpoint::GetNamespaceActions.path(),
+    params(GetAccessQuery, ("warehouse_id" = Uuid,),("namespace_id" = Uuid,)),
+    responses(
+        (status = 200, body = GetLakekeeperNamespaceActionsResponse),
+        (status = "4XX", body = IcebergErrorResponse),
+    )
+    ))]
+    async fn get_namespace_actions<A: Authorizer, C: CatalogStore, S: SecretStore>(
+        Path((warehouse_id, namespace_id)): Path<(WarehouseId, NamespaceId)>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Query(query): Query<GetAccessQuery>,
+    ) -> Result<(StatusCode, Json<GetLakekeeperNamespaceActionsResponse>)> {
+        let relations = get_allowed_namespace_actions::<A, C, S>(
+            api_context,
+            metadata,
+            query,
+            warehouse_id,
+            namespace_id,
+        )
+        .await?;
+
+        Ok((
+            StatusCode::OK,
+            Json(GetLakekeeperNamespaceActionsResponse {
+                allowed_actions: relations,
+            }),
+        ))
+    }
+
     /// Set Warehouse Protection
     ///
     /// Configures whether a warehouse should be protected from deletion.
@@ -1395,6 +3884,37 @@ pub mod v1 {
         ApiServer::<C, A, S>::set_warehouse_protection(
             warehouse_id.into(),
             protected,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Set Warehouse Managed-By
+    ///
+    /// Sets (or clears) the managed-by marker on a warehouse. When set, the
+    /// warehouse spec becomes mutable only by the managing control plane
+    /// (instance admins). Requires instance-admin privilege.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::SetWarehouseManagedBy.path(),
+        params(("warehouse_id" = Uuid,)),
+        request_body = SetWarehouseManagedByRequest,
+        responses(
+            (status = 200, body = GetWarehouseResponse, description = "Warehouse managed-by marker set successfully"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_warehouse_managed_by<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<SetWarehouseManagedByRequest>,
+    ) -> Result<GetWarehouseResponse> {
+        ApiServer::<C, A, S>::set_warehouse_managed_by(
+            warehouse_id.into(),
+            request,
             api_context,
             metadata,
         )
@@ -1497,11 +4017,18 @@ pub mod v1 {
         Extension(metadata): Extension<RequestMetadata>,
         AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
         Query(query): Query<GetTaskDetailsQuery>,
-    ) -> Result<GetTaskDetailsResponse> {
+    ) -> Result<GetTaskDetailsResponseRef> {
         let warehouse_id = WarehouseId::from(warehouse_id);
         let task_id = TaskId::from(task_id);
-        ApiServer::<C, A, S>::get_task_details(warehouse_id, task_id, query, api_context, metadata)
-            .await
+        let response = ApiServer::<C, A, S>::get_task_details(
+            warehouse_id,
+            task_id,
+            query,
+            api_context,
+            metadata,
+        )
+        .await?;
+        Ok(GetTaskDetailsResponseRef(response))
     }
 
     /// Control a set of tasks by their IDs (e.g., cancel, request stop, run now)
@@ -1529,17 +4056,219 @@ pub mod v1 {
         Ok(StatusCode::NO_CONTENT)
     }
 
+    /// Schedule a task for an entity.
+    ///
+    /// Pre-checks run against the warehouse config and target entity
+    /// properties before the task is enqueued. A failure surfaces as `400`
+    /// with a specific error code (see the operator guide for the full set
+    /// of pre-check codes).
+    ///
+    /// When a task is already active for the same (warehouse, entity,
+    /// queue) triple, the call returns `409 TaskAlreadyActive` with the
+    /// existing `task-id` in the body — chain to `POST /task/control`
+    /// with `run-now` or `run-at` to retime it without an extra
+    /// `task/list` round-trip.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tasks",
+        path = ManagementV1Endpoint::ScheduleTask.path(),
+        params(("warehouse_id" = Uuid,), ("queue_name" = String,)),
+        request_body = ScheduleTaskRequest,
+        responses(
+            (status = 200, body = ScheduleTaskResponse, description = "Task scheduled"),
+            (status = 400, body = IcebergErrorResponse, description = "Pre-check failed (e.g. scheduling disabled at the warehouse, entity opted out, unsupported entity type) or the request violates a shape limit (e.g. scheduled-for too far in the future)."),
+            (status = 404, body = IcebergErrorResponse, description = "Target entity not found in this warehouse."),
+            (status = 409, body = IcebergErrorResponse, description = "A task is already active for this (warehouse, entity, queue). The error message includes the existing task-id; retime or cancel via POST /task/control."),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn schedule_task<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path((warehouse_id, queue_name)): Path<(uuid::Uuid, String)>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<ScheduleTaskRequest>,
+    ) -> Result<ScheduleTaskResponse> {
+        let queue_name = TaskQueueName::from(queue_name);
+        ApiServer::<C, A, S>::schedule_task(
+            warehouse_id.into(),
+            &queue_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await
+    }
+
+    /// Set the configuration for a Project-level Task Queue.
+    ///
+    /// These configurations are global per project and shared across all instances of this kind of task.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tasks",
+        path = ManagementV1Endpoint::SetProjectTaskQueueConfig.path(),
+        params(("queue_name" = String,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "Project-level Task queue config set successfully"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn set_project_task_queue_config<
+        C: CatalogStore,
+        A: Authorizer + Clone,
+        S: SecretStore,
+    >(
+        Path(queue_name): Path<String>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<SetTaskQueueConfigRequest>,
+    ) -> Result<StatusCode> {
+        let queue_name = TaskQueueName::from(queue_name);
+        ApiServer::<C, A, S>::set_project_task_queue_config(
+            &queue_name,
+            request,
+            api_context,
+            metadata,
+        )
+        .await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    /// Get the configuration for a Project-level Task Queue.
+    ///
+    /// These configurations are global per project and shared across all instances of this kind of task.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tasks",
+        path = ManagementV1Endpoint::GetProjectTaskQueueConfig.path(),
+        params(("queue_name" = String,), ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, body = GetTaskQueueConfigResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_project_task_queue_config<
+        C: CatalogStore,
+        A: Authorizer + Clone,
+        S: SecretStore,
+    >(
+        Path(queue_name): Path<String>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+    ) -> Result<GetTaskQueueConfigResponse> {
+        let queue_name = TaskQueueName::from(queue_name);
+        ApiServer::<C, A, S>::get_project_task_queue_config(&queue_name, api_context, metadata)
+            .await
+    }
+
+    /// List active and historic Project-level tasks.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tasks",
+        path = ManagementV1Endpoint::ListProjectTasks.path(),
+        request_body = ListProjectTasksRequest,
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, body = ListProjectTasksResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn list_project_tasks<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<ListProjectTasksRequest>,
+    ) -> Result<ListProjectTasksResponse> {
+        ApiServer::<C, A, S>::list_project_tasks(request, api_context, metadata).await
+    }
+
+    /// Get Details about a specific Project-level task by its ID.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        get,
+        tag = "tasks",
+        path = ManagementV1Endpoint::GetProjectTaskDetails.path(),
+        params(("task_id" = Uuid,), GetTaskDetailsQuery, ("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 200, body = GetProjectTaskDetailsResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn get_project_task_details<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Path(task_id): Path<uuid::Uuid>,
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Query(query): Query<GetTaskDetailsQuery>,
+    ) -> Result<GetProjectTaskDetailsResponse> {
+        let task_id = TaskId::from(task_id);
+        ApiServer::<C, A, S>::get_project_task_details(task_id, query, api_context, metadata).await
+    }
+
+    /// Control a set of Project-level tasks by their IDs (e.g., cancel, request stop, run now)
+    ///
+    /// Accepts at most 100 task IDs in one request.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "tasks",
+        path = ManagementV1Endpoint::ControlProjectTasks.path(),
+        request_body = ControlTasksRequest,
+        params(("x-project-id" = Option<String>, Header, description = PROJECT_ID_HEADER_DESCRIPTION)),
+        responses(
+            (status = 204, description = "All requested actions were successful"),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn control_project_tasks<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+        Extension(metadata): Extension<RequestMetadata>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Json(request): Json<ControlTasksRequest>,
+    ) -> Result<StatusCode> {
+        ApiServer::<C, A, S>::control_project_tasks(request, api_context, metadata).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    /// Batch Check Catalog Actions
+    ///
+    /// Performs authorization checks for multiple catalog actions in a single request.
+    /// This endpoint allows checking permissions across different resource types (servers, projects,
+    /// warehouses, namespaces, tables, and views) efficiently.
+    ///
+    /// The endpoint supports:
+    /// - Checking actions for different identities (users or roles)
+    /// - Mixing different resource types in a single batch
+    /// - Optional error-on-not-found behavior (default: treat missing resources as denied)
+    ///
+    /// Each check in the request can optionally override the identity being checked.
+    /// If no identity is specified, the current user's identity is used.
+    #[cfg_attr(feature = "open-api", utoipa::path(
+        post,
+        tag = "authorization",
+        path = ManagementV1Endpoint::BatchCheckActions.path(),
+        request_body = CatalogActionsBatchCheckRequest,
+        responses(
+            (status = 200, description = "Batch check results, one per request item and in request order", body = CatalogActionsBatchCheckResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    ))]
+    async fn batch_check_actions<C: CatalogStore, A: Authorizer, S: SecretStore>(
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<CatalogActionsBatchCheckRequest>,
+    ) -> Result<Json<CatalogActionsBatchCheckResponse>> {
+        check::check_internal(api_context, metadata, request)
+            .await
+            .map(Json)
+            .map_err(Into::into)
+    }
+
     #[derive(Debug, Serialize)]
     #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
     #[serde(rename_all = "kebab-case")]
     pub struct ListDeletedTabularsResponse {
         /// List of tabulars
-        pub tabulars: Vec<DeletedTabularResponse>,
+        pub tabulars: Arc<Vec<DeletedTabularResponse>>,
         /// Token to fetch the next page
         pub next_page_token: Option<String>,
     }
 
-    #[derive(Debug, Serialize)]
+    #[derive(Clone, Debug, Serialize)]
     #[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
     #[serde(rename_all = "kebab-case")]
     pub struct DeletedTabularResponse {
@@ -1567,6 +4296,7 @@ pub mod v1 {
             match ident {
                 TabularId::Table(_) => TabularType::Table,
                 TabularId::View(_) => TabularType::View,
+                TabularId::GenericTable(_) => TabularType::GenericTable,
             }
         }
     }
@@ -1578,6 +4308,7 @@ pub mod v1 {
     pub enum TabularType {
         Table,
         View,
+        GenericTable,
     }
 
     #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, strum_macros::Display)]
@@ -1595,6 +4326,10 @@ pub mod v1 {
                 // Server
                 .route("/info", get(get_server_info))
                 .route("/bootstrap", post(bootstrap))
+                .route(
+                    ManagementV1Endpoint::GetServerActions.path_in_management_v1(),
+                    get(get_server_actions),
+                )
                 .route("/endpoint-statistics", post(get_endpoint_statistics))
                 // Role management
                 .route("/role", get(list_roles).post(create_role))
@@ -1602,39 +4337,230 @@ pub mod v1 {
                     "/role/{role_id}",
                     get(get_role).post(update_role).delete(delete_role),
                 )
+                .route(
+                    ManagementV1Endpoint::UpdateRoleSourceSystem.path_in_management_v1(),
+                    put(update_role_source_system),
+                )
                 .route("/search/role", post(search_role))
+                .route(
+                    ManagementV1Endpoint::GetRoleActions.path_in_management_v1(),
+                    get(get_role_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::GetRoleMetadata.path_in_management_v1(),
+                    get(get_role_metadata),
+                )
+                // Tag management
+                .route(
+                    ManagementV1Endpoint::CreateTagDefinition.path_in_management_v1(),
+                    get(list_tag_definitions).post(create_tag_definition),
+                )
+                .route(
+                    ManagementV1Endpoint::GetTagDefinition.path_in_management_v1(),
+                    get(get_tag_definition)
+                        .post(update_tag_definition)
+                        .delete(delete_tag_definition),
+                )
+                .route(
+                    ManagementV1Endpoint::ListTagAttachments.path_in_management_v1(),
+                    get(list_tag_attachments),
+                )
+                .route(
+                    ManagementV1Endpoint::GetTagActions.path_in_management_v1(),
+                    get(get_tag_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::SetWarehouseTag.path_in_management_v1(),
+                    put(set_warehouse_tag).delete(delete_warehouse_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListWarehouseTags.path_in_management_v1(),
+                    get(list_warehouse_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::ListWarehouseGrants.path_in_management_v1(),
+                    get(list_warehouse_grants).post(apply_warehouse_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::GetGrantablePrivileges.path_in_management_v1(),
+                    get(get_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetServerGrantablePrivileges.path_in_management_v1(),
+                    get(get_server_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetProjectGrantablePrivileges.path_in_management_v1(),
+                    get(get_project_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetWarehouseGrantablePrivileges.path_in_management_v1(),
+                    get(get_warehouse_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetNamespaceGrantablePrivileges.path_in_management_v1(),
+                    get(get_namespace_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetTableGrantablePrivileges.path_in_management_v1(),
+                    get(get_table_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetViewGrantablePrivileges.path_in_management_v1(),
+                    get(get_view_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetGenericTableGrantablePrivileges
+                        .path_in_management_v1(),
+                    get(get_generic_table_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::GetTagGrantablePrivileges.path_in_management_v1(),
+                    get(get_tag_grantable_privileges),
+                )
+                .route(
+                    ManagementV1Endpoint::ListGrants.path_in_management_v1(),
+                    get(list_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListServerGrants.path_in_management_v1(),
+                    get(list_server_grants).post(apply_server_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListProjectGrants.path_in_management_v1(),
+                    get(list_project_grants).post(apply_project_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListNamespaceGrants.path_in_management_v1(),
+                    get(list_namespace_grants).post(apply_namespace_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListTagGrants.path_in_management_v1(),
+                    get(list_tag_grants).post(apply_tag_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListTableGrants.path_in_management_v1(),
+                    get(list_table_grants).post(apply_table_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListViewGrants.path_in_management_v1(),
+                    get(list_view_grants).post(apply_view_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::ListGenericTableGrants.path_in_management_v1(),
+                    get(list_generic_table_grants).post(apply_generic_table_grants),
+                )
+                .route(
+                    ManagementV1Endpoint::SetNamespaceTag.path_in_management_v1(),
+                    put(set_namespace_tag).delete(delete_namespace_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListNamespaceTags.path_in_management_v1(),
+                    get(list_namespace_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::SetTableTag.path_in_management_v1(),
+                    put(set_table_tag).delete(delete_table_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListTableTags.path_in_management_v1(),
+                    get(list_table_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::SetTableColumnTag.path_in_management_v1(),
+                    put(set_table_column_tag).delete(delete_table_column_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListTableColumnTags.path_in_management_v1(),
+                    get(list_table_column_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::ListColumnTags.path_in_management_v1(),
+                    get(list_column_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::SetViewTag.path_in_management_v1(),
+                    put(set_view_tag).delete(delete_view_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListViewTags.path_in_management_v1(),
+                    get(list_view_tags),
+                )
+                .route(
+                    ManagementV1Endpoint::SetGenericTableTag.path_in_management_v1(),
+                    put(set_generic_table_tag).delete(delete_generic_table_tag),
+                )
+                .route(
+                    ManagementV1Endpoint::ListGenericTableTags.path_in_management_v1(),
+                    get(list_generic_table_tags),
+                )
+                // Role membership management
+                .route(
+                    ManagementV1Endpoint::ListRoleMembers.path_in_management_v1(),
+                    get(list_role_members).post(add_role_members),
+                )
+                .route(
+                    ManagementV1Endpoint::RemoveRoleMember.path_in_management_v1(),
+                    delete(remove_role_member),
+                )
+                .route(
+                    ManagementV1Endpoint::ListRoleMemberOf.path_in_management_v1(),
+                    get(list_role_member_of),
+                )
+                .route(
+                    ManagementV1Endpoint::ListUserRoles.path_in_management_v1(),
+                    get(list_user_roles),
+                )
+                .route(
+                    ManagementV1Endpoint::ListRoleTransitiveMembers.path_in_management_v1(),
+                    get(list_role_transitive_members),
+                )
+                .route(
+                    ManagementV1Endpoint::ListUserTransitiveRoles.path_in_management_v1(),
+                    get(list_user_transitive_roles),
+                )
+                .route(
+                    ManagementV1Endpoint::ListRoleTransitiveMemberOf.path_in_management_v1(),
+                    get(list_role_transitive_member_of),
+                )
                 // User management
                 .route("/whoami", get(whoami))
                 .route("/search/user", post(search_user))
                 .route(
-                    "/user/{user_id}",
+                    ManagementV1Endpoint::GetUser.path_in_management_v1(),
                     get(get_user).put(update_user).delete(delete_user),
+                )
+                .route(
+                    ManagementV1Endpoint::GetUserActions.path_in_management_v1(),
+                    get(get_user_actions),
                 )
                 .route("/user", get(list_user).post(create_user))
                 // Default project
-                .route(
-                    "/default-project",
-                    get(get_default_project_deprecated).delete(delete_default_project_deprecated),
-                )
-                .route(
-                    "/default-project/rename",
-                    post(rename_default_project_deprecated),
-                )
-                .route("/project/rename", post(rename_default_project))
+                .route("/project/rename", post(rename_project))
                 // Create a new project
                 .route(
-                    "/project",
-                    post(create_project)
-                        .get(get_default_project)
-                        .delete(delete_default_project),
+                    ManagementV1Endpoint::GetProject.path_in_management_v1(),
+                    post(create_project).get(get_project).delete(delete_project),
                 )
                 .route(
-                    "/project/{project_id}",
-                    get(get_project_by_id).delete(delete_project_by_id),
+                    ManagementV1Endpoint::GetProjectActions.path_in_management_v1(),
+                    get(get_project_actions),
                 )
-                .route("/project/{project_id}/rename", post(rename_project_by_id))
+                .route(
+                    ManagementV1Endpoint::GetProjectByIdDeprecated.path_in_management_v1(),
+                    get(get_project_by_id_deprecated).delete(delete_project_by_id_deprecated),
+                )
+                .route(
+                    "/project/{project_id}/rename",
+                    post(rename_project_by_id_deprecated),
+                )
                 // Create a new warehouse
                 .route("/warehouse", post(create_warehouse).get(list_warehouses))
+                // Dry-run of warehouse creation
+                .route(
+                    ManagementV1Endpoint::ValidateWarehouse.path_in_management_v1(),
+                    post(validate_warehouse),
+                )
                 // List all projects
                 .route("/project-list", get(list_projects))
                 .route(
@@ -1664,6 +4590,20 @@ pub mod v1 {
                     "/warehouse/{warehouse_id}/storage-credential",
                     post(update_storage_credential),
                 )
+                // Dry-runs of the two storage updates above
+                .route(
+                    ManagementV1Endpoint::ValidateStorageProfile.path_in_management_v1(),
+                    post(validate_storage_profile),
+                )
+                .route(
+                    ManagementV1Endpoint::ValidateStorageCredential.path_in_management_v1(),
+                    post(validate_storage_credential),
+                )
+                // Validate the configuration the warehouse currently runs with
+                .route(
+                    ManagementV1Endpoint::ValidateStorageAccess.path_in_management_v1(),
+                    post(validate_storage_access),
+                )
                 // Get warehouse statistics
                 .route(
                     "/warehouse/{warehouse_id}/statistics",
@@ -1678,11 +4618,6 @@ pub mod v1 {
                     get(list_deleted_tabulars),
                 )
                 .route(
-                    "/warehouse/{warehouse_id}/deleted_tabulars/undrop",
-                    #[allow(deprecated)]
-                    post(undrop_tabulars_deprecated),
-                )
-                .route(
                     "/warehouse/{warehouse_id}/deleted-tabulars/undrop",
                     post(undrop_tabulars),
                 )
@@ -1691,20 +4626,56 @@ pub mod v1 {
                     post(update_warehouse_delete_profile),
                 )
                 .route(
-                    "/warehouse/{warehouse_id}/table/{table_id}/protection",
+                    "/warehouse/{warehouse_id}/format-version-policy",
+                    post(update_warehouse_format_version_policy),
+                )
+                .route(
+                    ManagementV1Endpoint::GetWarehouseActions.path_in_management_v1(),
+                    get(get_warehouse_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::GetTableProtection.path_in_management_v1(),
                     get(get_table_protection).post(set_table_protection),
                 )
                 .route(
-                    "/warehouse/{warehouse_id}/view/{view_id}/protection",
+                    ManagementV1Endpoint::GetTableActions.path_in_management_v1(),
+                    get(get_table_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::GetViewProtection.path_in_management_v1(),
                     get(get_view_protection).post(set_view_protection),
                 )
                 .route(
-                    "/warehouse/{warehouse_id}/namespace/{namespace_id}/protection",
+                    ManagementV1Endpoint::GetViewActions.path_in_management_v1(),
+                    get(get_view_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::GetGenericTableActions.path_in_management_v1(),
+                    get(get_generic_table_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::GetGenericTableProtection.path_in_management_v1(),
+                    get(get_generic_table_protection).post(set_generic_table_protection),
+                )
+                .route(
+                    ManagementV1Endpoint::GetNamespaceProtection.path_in_management_v1(),
                     get(get_namespace_protection).post(set_namespace_protection),
                 )
                 .route(
-                    "/warehouse/{warehouse_id}/protection",
+                    ManagementV1Endpoint::GetNamespaceActions.path_in_management_v1(),
+                    get(get_namespace_actions),
+                )
+                .route(
+                    ManagementV1Endpoint::MoveNamespace.path_in_management_v1(),
+                    post(move_namespace),
+                )
+                .route(
+                    ManagementV1Endpoint::SetWarehouseProtection.path_in_management_v1(),
                     post(set_warehouse_protection),
+                )
+                .route(
+                    ManagementV1Endpoint::SetWarehouseManagedBy.path_in_management_v1(),
+                    post(set_warehouse_managed_by),
                 )
                 .route(
                     ManagementV1Endpoint::SetTaskQueueConfig.path_in_management_v1(),
@@ -1721,6 +4692,30 @@ pub mod v1 {
                 .route(
                     ManagementV1Endpoint::ControlTasks.path_in_management_v1(),
                     post(control_tasks),
+                )
+                .route(
+                    ManagementV1Endpoint::ScheduleTask.path_in_management_v1(),
+                    post(schedule_task),
+                )
+                .route(
+                    ManagementV1Endpoint::SetProjectTaskQueueConfig.path_in_management_v1(),
+                    post(set_project_task_queue_config).get(get_project_task_queue_config),
+                )
+                .route(
+                    ManagementV1Endpoint::ListProjectTasks.path_in_management_v1(),
+                    post(list_project_tasks),
+                )
+                .route(
+                    ManagementV1Endpoint::GetProjectTaskDetails.path_in_management_v1(),
+                    get(get_project_task_details),
+                )
+                .route(
+                    ManagementV1Endpoint::ControlProjectTasks.path_in_management_v1(),
+                    post(control_project_tasks),
+                )
+                .route(
+                    ManagementV1Endpoint::BatchCheckActions.path_in_management_v1(),
+                    post(batch_check_actions),
                 )
                 .merge(authorizer.new_router())
         }

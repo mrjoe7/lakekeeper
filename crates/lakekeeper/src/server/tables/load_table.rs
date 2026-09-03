@@ -1,37 +1,87 @@
 use std::{collections::HashMap, sync::Arc};
 
 use http::StatusCode;
-use iceberg_ext::catalog::rest::StorageCredential;
+use iceberg_ext::catalog::rest::ETag;
 
 use crate::{
+    CONFIG, WarehouseId,
     api::iceberg::v1::{
-        tables::{DataAccessMode, LoadTableFilters},
-        ApiContext, LoadTableResult, Result, TableIdent, TableParameters,
+        ApiContext, LoadTableResult, LoadTableResultOrNotModified, Result, TableIdent,
+        TableParameters,
+        tables::{DataAccessMode, LoadTableFilters, LoadTableRequest},
     },
     request_metadata::RequestMetadata,
     server::{
         maybe_get_secret, require_warehouse_id,
-        tables::{authorize_load_table, parse_location, validate_table_or_view_ident},
+        tables::{
+            authorize_load_table,
+            etag::{StorageAccess, TableETag, TableResponseShape},
+            load_response_config, parse_location, validate_referenced_by,
+            validate_table_or_view_ident,
+        },
     },
     service::{
-        authz::{Authorizer, AuthzWarehouseOps},
-        secrets::SecretStore,
         AuthZTableInfo as _, CachePolicy, CatalogStore, CatalogTableOps, CatalogWarehouseOps,
         LoadTableResponse as CatalogLoadTableResult, State, TableId, TableIdentOrId,
-        TabularListFlags, TabularNotFound, Transaction, WarehouseStatus,
+        TabularListFlags, TabularNotFound, Transaction, WarehouseStatus, WarehouseVersion,
+        authz::{Authorizer, AuthzWarehouseOps, CatalogTableAction},
+        events::{
+            APIEventContext,
+            context::{ResolvedTable, authz_to_error_no_audit},
+        },
+        secrets::SecretStore,
+        storage::{StoragePermissions, credential_revalidate_after_ms, now_epoch_ms},
     },
-    WarehouseId,
 };
 
-/// Load a table from the catalog
-#[allow(clippy::too_many_lines)]
-pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
+/// Load a table from the catalog.
+pub async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>(
     parameters: TableParameters,
-    data_access: impl Into<DataAccessMode> + Send,
-    filters: LoadTableFilters,
+    request: LoadTableRequest,
     state: ApiContext<State<A, C, S>>,
     request_metadata: RequestMetadata,
-) -> Result<LoadTableResult> {
+) -> Result<LoadTableResultOrNotModified> {
+    load_table_with_flags(
+        parameters,
+        request,
+        state,
+        request_metadata,
+        TabularListFlags::active(),
+    )
+    .await
+}
+
+/// [`load_table`], but with control over whether a staged table is visible.
+///
+/// `loadTable` itself must never serve a staged table — a client that sees one
+/// would treat an uncommitted table as real. The idempotency replay path is the
+/// exception: a `createTable` with `stage_create` returns a staged
+/// [`LoadTableResult`], and replaying that key has to reproduce it rather than
+/// 404. Staged-ness is gated twice — once when resolving the table for authz and
+/// once on the loaded row — so both have to agree.
+///
+/// # Panics
+/// May panic if internal invariants are violated (e.g., an entry expected to
+/// exist in a pre-resolved map is missing).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn load_table_with_flags<
+    C: CatalogStore,
+    A: Authorizer + Clone,
+    S: SecretStore,
+>(
+    parameters: TableParameters,
+    request: LoadTableRequest,
+    state: ApiContext<State<A, C, S>>,
+    request_metadata: RequestMetadata,
+    list_flags: TabularListFlags,
+) -> Result<LoadTableResultOrNotModified> {
+    let LoadTableRequest {
+        data_access,
+        filters,
+        etags,
+        referenced_by,
+    } = request;
+
     // ------------------- VALIDATIONS -------------------
     let TableParameters { prefix, table } = parameters;
     let warehouse_id = require_warehouse_id(prefix.as_ref())?;
@@ -44,34 +94,95 @@ pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: Secret
         }
         return Err(e);
     }
+    validate_referenced_by(
+        referenced_by.as_deref(),
+        CONFIG.referenced_by.max_nesting_depth,
+    )?;
 
     // ------------------- AUTHZ -------------------
     let authorizer = state.v1_state.authz;
     let catalog_state = state.v1_state.catalog;
 
-    let (warehouse, table_info, storage_permissions) = authorize_load_table::<C, A>(
-        &request_metadata,
-        table,
+    let event_ctx = APIEventContext::for_table(
+        Arc::new(request_metadata.clone()),
+        state.v1_state.events,
         warehouse_id,
-        TabularListFlags::active(),
-        authorizer.clone(),
-        catalog_state.clone(),
-    )
-    .await?;
+        table.clone(),
+        CatalogTableAction::GetMetadata,
+    );
+
+    let (event_ctx, (warehouse, table_info, storage_permissions)) = event_ctx.emit_authz(
+        authorize_load_table::<C, A>(
+            &request_metadata,
+            table,
+            warehouse_id,
+            list_flags,
+            authorizer.clone(),
+            catalog_state.clone(),
+            referenced_by.as_deref(),
+        )
+        .await,
+    )?;
+
+    let mut event_ctx = event_ctx.resolve(ResolvedTable {
+        warehouse,
+        table: Arc::new(table_info),
+        storage_permissions,
+    });
+
+    // ------------------- ETAG CHECK -------------------
+    // The 304 decision rides on the client-echoed ETag's revalidation point; this
+    // flag only governs the cases where the ETag carries none (metadata-only /
+    // wildcard). Not the raw `vended-credentials` flag, since backends vend
+    // expiring credentials even for the default request (S3 auto-promotes;
+    // GCS/Azure vend for any delegated access).
+    let vends_credentials = storage_permissions.is_some()
+        && event_ctx
+            .resolved()
+            .warehouse
+            .storage_profile
+            .vends_expiring_credentials(data_access);
+    // The warehouse version is a parameter rather than read from `event_ctx`,
+    // because the two call sites see different versions: the 304 check below
+    // runs before the table is loaded, while the response tag must name the
+    // version the body was actually generated from — which the refetch further
+    // down may have advanced.
+    let shape_at = |warehouse_version| {
+        TableResponseShape::for_load(
+            &filters,
+            storage_access_for(storage_permissions, data_access, warehouse_version),
+        )
+    };
+    if let Some(etag) = match_not_modified(
+        &etags,
+        warehouse_id,
+        event_ctx
+            .resolved()
+            .table
+            .metadata_location
+            .as_ref()
+            .map(lakekeeper_io::Location::as_str),
+        shape_at(event_ctx.resolved().warehouse.version),
+        now_epoch_ms(),
+        vends_credentials,
+    ) {
+        return Ok(LoadTableResultOrNotModified::NotModifiedResponse(etag));
+    }
 
     // ------------------- BUSINESS LOGIC -------------------
     let mut t = C::Transaction::begin_read(catalog_state.clone()).await?;
     let CatalogLoadTableResult {
-        table_id,
+        table_id: _,
         namespace_id: _,
         table_metadata,
         metadata_location,
         warehouse_version,
     } = load_table_inner::<C>(
         warehouse_id,
-        table_info.table_id(),
-        table_info.table_ident(),
+        event_ctx.resolved().table.table_id(),
+        event_ctx.resolved().table.table_ident(),
         false,
+        list_flags.include_staged,
         &filters,
         &mut t,
     )
@@ -79,7 +190,7 @@ pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: Secret
     t.commit().await?;
 
     // Refetch warehouse if version is stale
-    let warehouse = if warehouse.version < warehouse_version {
+    if event_ctx.resolved().warehouse.version < warehouse_version {
         let warehouse = C::get_warehouse_by_id_cache_aware(
             warehouse_id,
             WarehouseStatus::active(),
@@ -87,10 +198,16 @@ pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: Secret
             catalog_state.clone(),
         )
         .await;
-        authorizer.require_warehouse_presence(warehouse_id, warehouse)?
-    } else {
-        warehouse
-    };
+        let fresh_warehouse = authorizer
+            .require_warehouse_presence(warehouse_id, warehouse)
+            .map_err(authz_to_error_no_audit)?;
+        event_ctx.resolved_mut().warehouse = fresh_warehouse;
+    }
+    let warehouse = &event_ctx.resolved().warehouse;
+    // Bound to the version `generate_table_config` below reads the profile from,
+    // which the refetch above may have advanced past the one the 304 check used.
+    // Reusing that earlier shape would let one tag stand for two different bodies.
+    let response_shape = shape_at(warehouse.version);
 
     let table_location =
         parse_location(table_metadata.location(), StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -98,17 +215,17 @@ pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: Secret
     let storage_config = if let Some(storage_permissions) = storage_permissions {
         let storage_secret =
             maybe_get_secret(warehouse.storage_secret_id, &state.v1_state.secrets).await?;
+        let storage_secret_ref = storage_secret.as_deref();
         Some(
             warehouse
                 .storage_profile
                 .generate_table_config(
-                    data_access.into(),
-                    storage_secret.as_ref(),
+                    data_access,
+                    storage_secret_ref,
                     &table_location,
                     storage_permissions,
                     &request_metadata,
-                    warehouse_id,
-                    table_id.into(),
+                    &*event_ctx.resolved().table,
                 )
                 .await?,
         )
@@ -116,34 +233,81 @@ pub(super) async fn load_table<C: CatalogStore, A: Authorizer + Clone, S: Secret
         None
     };
 
-    let storage_credentials = storage_config.as_ref().and_then(|c| {
-        (!c.creds.inner().is_empty()).then(|| {
-            vec![StorageCredential {
-                prefix: table_location.to_string(),
-                config: c.creds.clone().into(),
-            }]
-        })
-    });
+    let storage_credentials = storage_config
+        .as_ref()
+        .and_then(|c| c.storage_credentials(&table_location));
+    let credentials_revalidate_after_ms = storage_config
+        .as_ref()
+        .and_then(|c| c.credentials_expiration_ms)
+        .map(credential_revalidate_after_ms);
 
+    let metadata_ref = Arc::new(table_metadata);
+    let metadata_location_ref = metadata_location.map(Arc::new);
+
+    event_ctx.emit_table_loaded_async(metadata_ref.clone(), metadata_location_ref.clone());
+
+    let remote_signing_config = storage_config
+        .as_ref()
+        .and_then(|c| c.remote_signing.clone());
     let load_table_result = LoadTableResult {
-        metadata_location: metadata_location.as_ref().map(ToString::to_string),
-        metadata: Arc::new(table_metadata),
-        config: storage_config.map(|c| c.config.into()),
+        metadata_location: metadata_location_ref.as_ref().map(ToString::to_string),
+        metadata: metadata_ref,
+        config: Some(load_response_config(storage_config.map(|c| c.config))),
         storage_credentials,
+        remote_signing_config,
+        etag: metadata_location_ref.as_ref().map(|loc| {
+            TableETag::new(
+                warehouse_id,
+                loc.as_str(),
+                response_shape,
+                credentials_revalidate_after_ms,
+            )
+            .into_etag()
+        }),
     };
 
-    Ok(load_table_result)
+    Ok(LoadTableResultOrNotModified::LoadTableResult(
+        load_table_result,
+    ))
 }
 
-/// Load a table from the catalog, ensuring that it is not staged
+/// Which [`StorageAccess`] a load response has, from the two per-request inputs
+/// to `generate_table_config`.
+///
+/// Without storage access the `config` holds only the catalog-wide keys — a load
+/// made before access was granted must not answer one made after; and credentials
+/// are policy-scoped per permission level, so a read-scoped body must not answer a
+/// request from a caller who can now write.
+///
+/// Named rather than inlined at its one call site so a test can drive the mapping
+/// directly: inlined, the `None` arm was reachable only through a full request and
+/// nothing pinned which variant it produced.
+fn storage_access_for(
+    storage_permissions: Option<StoragePermissions>,
+    delegation: DataAccessMode,
+    warehouse_version: WarehouseVersion,
+) -> StorageAccess {
+    match storage_permissions {
+        None => StorageAccess::CatalogDefaultsOnly { warehouse_version },
+        Some(permissions) => StorageAccess::Config {
+            delegation,
+            permissions,
+            warehouse_version,
+        },
+    }
+}
+
+/// Load a table from the catalog, by default rejecting a staged one.
 ///
 /// # Errors
-/// Returns an error if the table is staged, if it cannot be found, or if a DB error occurs.
+/// Returns an error if the table is staged and `include_staged` is false, if it
+/// cannot be found, or if a DB error occurs.
 async fn load_table_inner<C: CatalogStore>(
     warehouse_id: WarehouseId,
     table_id: TableId,
     table_ident: &TableIdent,
     include_deleted: bool,
+    include_staged: bool,
     load_table_filters: &LoadTableFilters,
     t: &mut C::Transaction,
 ) -> Result<CatalogLoadTableResult> {
@@ -170,11 +334,13 @@ async fn load_table_inner<C: CatalogStore>(
             metadatas.keys()
         );
     }
-    require_not_staged(
-        warehouse_id,
-        table_ident.clone(),
-        result.metadata_location.as_ref(),
-    )?;
+    if !include_staged {
+        require_not_staged(
+            warehouse_id,
+            table_ident.clone(),
+            result.metadata_location.as_ref(),
+        )?;
+    }
     Ok(result)
 }
 
@@ -191,597 +357,521 @@ fn require_not_staged<T>(
     Ok(())
 }
 
+/// Decide whether a conditional `loadTable` may return `304 Not Modified`,
+/// returning the [`ETag`] to echo back if so.
+///
+/// When the client-echoed [`ETag`] carries a revalidation point (it cached a
+/// credential-bearing response), a 304 is served only while `now` is before it.
+/// When it carries none (metadata-only / wildcard), a 304 is served only if this
+/// load also vends no expiring credentials (`!vends_credentials`). Anything we
+/// can't parse isn't matched, so the client reloads — never a 304 with stale
+/// credentials.
+///
+/// `shape` describes the body *this* request would produce. It is folded into
+/// the comparison tag, so a client that cached one shape and revalidates for
+/// another — a different `snapshots` filter, or different access delegation —
+/// misses and gets a full response instead of a 304 for content it never
+/// received.
+fn match_not_modified(
+    client_etags: &[ETag],
+    warehouse_id: WarehouseId,
+    metadata_location: Option<&str>,
+    shape: TableResponseShape,
+    now_ms: i64,
+    vends_credentials: bool,
+) -> Option<ETag> {
+    let metadata_location = metadata_location?;
+    let current = TableETag::new(warehouse_id, metadata_location, shape, None);
+
+    for client in client_etags {
+        // Wildcard matches the metadata, but carries no revalidation point. Asked
+        // before normalising, because it is the quotes that distinguish it from a
+        // tag whose opaque value is `*`.
+        if client.is_wildcard() {
+            if vends_credentials {
+                continue;
+            }
+            return Some(current.clone().into_etag());
+        }
+
+        // Not `as_str`: entries arrive as the client spelled them, and an
+        // in-process caller echoes back the tag exactly as it was minted, weak
+        // marker and quotes included. Comparing the raw value matches nothing, so
+        // the conditional load silently never succeeds.
+        let value = client.validator();
+
+        // Not parseable as one of our ETags → reload.
+        let Some(parsed) = TableETag::parse(value) else {
+            continue;
+        };
+        if parsed.hash() != current.hash() {
+            continue;
+        }
+        match parsed.revalidate_after_ms() {
+            // Client holds credentials: 304 only while still within their window.
+            Some(revalidate_after) => {
+                if now_ms < revalidate_after {
+                    return Some(parsed.into_etag());
+                }
+            }
+            // Metadata-only cached response: 304 only if we'd add no creds now.
+            None => {
+                if !vends_credentials {
+                    return Some(parsed.into_etag());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use iceberg::{
-        spec::{
-            NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
-            SnapshotRetention, Summary, Type, UnboundPartitionSpec, MAIN_BRANCH,
-        },
-        NamespaceIdent, TableIdent, TableUpdate,
-    };
-    use iceberg_ext::catalog::rest::{CreateTableRequest, LoadTableResult};
-    use sqlx::PgPool;
-
+mod etag_tests {
+    use super::*;
     use crate::{
-        api::{
-            iceberg::v1::{
-                namespace::NamespaceService as _,
-                tables::{DataAccess, LoadTableFilters, SnapshotsQuery, TablesService as _},
-                NamespaceParameters, TableParameters,
-            },
-            management::v1::warehouse::TabularDeleteProfile,
-            ApiContext,
-        },
-        implementations::postgres::{PostgresBackend, SecretsState},
-        server::{test::setup, CatalogServer},
-        service::{authz::AllowAllAuthorizer, State},
-        tests::random_request_metadata,
+        api::iceberg::v1::tables::{DataAccess, DataAccessMode, SnapshotsQuery},
+        service::{WarehouseVersion, storage::StoragePermissions},
     };
 
-    fn create_test_schema() -> Schema {
-        Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-            ])
-            .build()
-            .unwrap()
+    const LOC: &str = "s3://bucket/table/metadata.json";
+    const NOW: i64 = 1_750_000_000_000;
+    /// Default shape: all snapshots, default (unspecified) delegation.
+    fn wv() -> WarehouseVersion {
+        WarehouseVersion::new(7)
     }
 
-    fn create_table_request(table_name: &str) -> CreateTableRequest {
-        CreateTableRequest {
-            name: table_name.to_string(),
-            location: None,
-            schema: create_test_schema(),
-            partition_spec: Some(UnboundPartitionSpec::builder().build()),
-            write_order: None,
-            stage_create: Some(false),
-            properties: None,
+    fn delegated(vended_credentials: bool, remote_signing: bool) -> DataAccessMode {
+        DataAccessMode::ServerDelegated(DataAccess {
+            vended_credentials,
+            remote_signing,
+        })
+    }
+
+    /// A config-bearing shape with the given snapshot filter.
+    fn shape_of(
+        snapshots: SnapshotsQuery,
+        delegation: DataAccessMode,
+        permissions: StoragePermissions,
+    ) -> TableResponseShape {
+        TableResponseShape::new(
+            snapshots,
+            StorageAccess::Config {
+                delegation,
+                permissions,
+                warehouse_version: wv(),
+            },
+        )
+    }
+
+    /// A default delegated load: all snapshots, unspecified delegation, writer.
+    fn all() -> TableResponseShape {
+        shape_of(
+            SnapshotsQuery::All,
+            delegated(false, false),
+            StoragePermissions::ReadWriteDelete,
+        )
+    }
+
+    /// The same, refs-filtered.
+    fn refs() -> TableResponseShape {
+        shape_of(
+            SnapshotsQuery::Refs,
+            delegated(false, false),
+            StoragePermissions::ReadWriteDelete,
+        )
+    }
+
+    /// Fixed: the tag is scoped to a warehouse, and every helper here uses the
+    /// same one so a mismatch means a real shape difference.
+    fn wh() -> WarehouseId {
+        WarehouseId::new(uuid::uuid!("019bbf1a-0000-7000-8000-0000000000a1"))
+    }
+
+    /// Build a client-supplied `ETag` for a given shape, in the form
+    /// `parse_etags` yields. `revalidate_after` = `None` for a metadata-only
+    /// cached response.
+    fn client_etag_for(
+        loc: &str,
+        shape: TableResponseShape,
+        revalidate_after: Option<i64>,
+    ) -> ETag {
+        as_client_etag(&TableETag::new(wh(), loc, shape, revalidate_after).into_etag())
+    }
+
+    /// The shape a client echoes back: the wire value with the weak marker and
+    /// quotes stripped, exactly as the HTTP layer's `parse_etags` produces.
+    fn as_client_etag(etag: &ETag) -> ETag {
+        ETag::from(etag.validator())
+    }
+
+    /// Default-shape client [`ETag`].
+    fn client_etag(loc: &str, revalidate_after: Option<i64>) -> ETag {
+        client_etag_for(loc, all(), revalidate_after)
+    }
+
+    fn matches_repr(etags: &[ETag], shape: TableResponseShape, vends_credentials: bool) -> bool {
+        match_not_modified(etags, wh(), Some(LOC), shape, NOW, vends_credentials).is_some()
+    }
+
+    fn matches(etags: &[ETag], vends_credentials: bool) -> bool {
+        matches_repr(etags, all(), vends_credentials)
+    }
+
+    #[test]
+    fn metadata_only_load_returns_304_for_matching_etags() {
+        // A metadata-only ETag and the wildcard match when this load vends no creds.
+        assert!(matches(&[client_etag(LOC, None)], false));
+        assert!(matches(&[ETag::from("*")], false));
+    }
+
+    #[test]
+    fn unparseable_etag_triggers_reload() {
+        // A pre-upgrade bare-hash ETag (or any non-`lk2` value) can't be parsed,
+        // so it never yields a 304. The client reloads once and re-primes.
+        let legacy = ETag::from(TableETag::new(wh(), LOC, all(), None).hash());
+        assert!(!matches(&[legacy], false));
+        assert!(!matches(&[ETag::from("not-our-etag")], false));
+    }
+
+    #[test]
+    fn no_match_when_metadata_differs() {
+        let other = client_etag("s3://bucket/table/metadata-2.json", Some(NOW + 60_000));
+        assert!(!matches(std::slice::from_ref(&other), false));
+        assert!(!matches(&[other], true));
+    }
+
+    /// A quoted `*` is an entity-tag whose opaque value happens to be `*`, not
+    /// `If-None-Match`'s wildcard. Reading it as one skipped validator
+    /// comparison entirely and answered `304` from a tag nothing ever minted, so
+    /// the client kept serving whatever it had cached.
+    #[test]
+    fn a_quoted_asterisk_is_not_the_wildcard() {
+        for sent in ["\"*\"", "W/\"*\"", "\"W/*\""] {
+            assert!(
+                match_not_modified(&[ETag::from(sent)], wh(), Some(LOC), all(), NOW, false)
+                    .is_none(),
+                "{sent} was honoured as a wildcard"
+            );
+        }
+        // The bare token still is one, so the refusals above are the quotes.
+        assert!(
+            match_not_modified(&[ETag::from("*")], wh(), Some(LOC), all(), NOW, false).is_some()
+        );
+    }
+
+    #[test]
+    fn no_match_when_metadata_location_absent() {
+        assert!(match_not_modified(&[ETag::from("*")], wh(), None, all(), NOW, false).is_none());
+    }
+
+    #[test]
+    fn never_304s_at_or_after_credential_expiry() {
+        // The safety invariant, end-to-end: compose the producer
+        // (`revalidate_after_at`, including its clamp) with the checker. Whatever
+        // revalidation point we mint for a credential, a conditional request at or
+        // after the real expiry must never be answered with a 304.
+        use crate::service::storage::revalidate_after_at;
+        for (expiry, vend_now) in [
+            (NOW + 600_000, NOW),       // 10-min credential
+            (NOW + 4 * 3_600_000, NOW), // long credential (1h cap)
+            (NOW + 1, NOW),             // about to expire
+            (NOW, NOW),                 // already at expiry
+        ] {
+            let etag = client_etag(LOC, Some(revalidate_after_at(expiry, vend_now)));
+            for check_now in [expiry, expiry + 1, expiry + 60_000] {
+                assert!(
+                    match_not_modified(
+                        std::slice::from_ref(&etag),
+                        wh(),
+                        Some(LOC),
+                        all(),
+                        check_now,
+                        true
+                    )
+                    .is_none(),
+                    "served a 304 at/after expiry (expiry={expiry}, check_now={check_now})"
+                );
+            }
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn setup_table_with_snapshots(
-        pool: PgPool,
-    ) -> (
-        ApiContext<State<AllowAllAuthorizer, PostgresBackend, SecretsState>>,
-        NamespaceParameters,
-        TableIdent,
-        LoadTableResult,
-    ) {
-        let prof = crate::server::test::memory_io_profile();
-        let (ctx, warehouse) = setup(
-            pool,
-            prof,
-            None,
-            AllowAllAuthorizer::default(),
-            TabularDeleteProfile::Hard {},
-            None,
-        )
-        .await;
-
-        // Create namespace
-        let ns_name = NamespaceIdent::new("test_namespace".to_string());
-        let ns_params = NamespaceParameters {
-            namespace: ns_name.clone(),
-            prefix: Some(warehouse.warehouse_id.to_string().into()),
-        };
-
-        let _ = CatalogServer::create_namespace(
-            ns_params.prefix.clone(),
-            crate::api::iceberg::v1::CreateNamespaceRequest {
-                namespace: ns_name.clone(),
-                properties: None,
-            },
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Create table
-        let table_ident = TableIdent::new(ns_name, "test_table".to_string());
-        let table = CatalogServer::create_table(
-            ns_params.clone(),
-            create_table_request("test_table"),
-            DataAccess::not_specified(),
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Add multiple snapshots to the table
-        let table_params = TableParameters {
-            prefix: Some(warehouse.warehouse_id.to_string().into()),
-            table: table_ident.clone(),
-        };
-
-        // Add first snapshot (snapshot_id: 1) - use current time plus some offset
-        let base_time = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-
-        let snapshot1 = Snapshot::builder()
-            .with_snapshot_id(1)
-            .with_timestamp_ms(base_time + 1000)
-            .with_sequence_number(1)
-            .with_manifest_list("/path/to/manifest1.avro")
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_schema_id(0)
-            .build();
-
-        let commit_request1 = iceberg_ext::catalog::rest::CommitTableRequest {
-            identifier: Some(table_ident.clone()),
-            requirements: vec![],
-            updates: vec![TableUpdate::AddSnapshot {
-                snapshot: snapshot1,
-            }],
-        };
-
-        CatalogServer::commit_table(
-            table_params.clone(),
-            commit_request1,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Add second snapshot (snapshot_id: 2)
-        let snapshot2 = Snapshot::builder()
-            .with_snapshot_id(2)
-            .with_timestamp_ms(base_time + 2000)
-            .with_sequence_number(2)
-            .with_manifest_list("/path/to/manifest2.avro")
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_schema_id(0)
-            .build();
-
-        let commit_request2 = iceberg_ext::catalog::rest::CommitTableRequest {
-            identifier: Some(table_ident.clone()),
-            requirements: vec![],
-            updates: vec![TableUpdate::AddSnapshot {
-                snapshot: snapshot2,
-            }],
-        };
-
-        CatalogServer::commit_table(
-            table_params.clone(),
-            commit_request2,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Add third snapshot (snapshot_id: 3)
-        let snapshot3 = Snapshot::builder()
-            .with_snapshot_id(3)
-            .with_timestamp_ms(base_time + 3000)
-            .with_sequence_number(3)
-            .with_manifest_list("/path/to/manifest3.avro")
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_schema_id(0)
-            .build();
-
-        let commit_request3 = iceberg_ext::catalog::rest::CommitTableRequest {
-            identifier: Some(table_ident.clone()),
-            requirements: vec![],
-            updates: vec![TableUpdate::AddSnapshot {
-                snapshot: snapshot3,
-            }],
-        };
-
-        CatalogServer::commit_table(
-            table_params.clone(),
-            commit_request3,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Set references - add "main" branch pointing to snapshot 2 and "test_branch" pointing to snapshot 3
-        let set_ref_main = TableUpdate::SetSnapshotRef {
-            ref_name: MAIN_BRANCH.to_string(),
-            reference: SnapshotReference {
-                snapshot_id: 2,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            },
-        };
-
-        let set_ref_test_branch = TableUpdate::SetSnapshotRef {
-            ref_name: "test_branch".to_string(),
-            reference: SnapshotReference {
-                snapshot_id: 3,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            },
-        };
-
-        let commit_request_refs = iceberg_ext::catalog::rest::CommitTableRequest {
-            identifier: Some(table_ident.clone()),
-            requirements: vec![],
-            updates: vec![set_ref_main, set_ref_test_branch],
-        };
-
-        CatalogServer::commit_table(
-            table_params.clone(),
-            commit_request_refs,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        (ctx, ns_params, table_ident, table)
+    #[test]
+    fn credential_load_honors_embedded_revalidate_after() {
+        // Revalidation point still in the future → 304.
+        assert!(matches(&[client_etag(LOC, Some(NOW + 1))], true));
+        // Reached/passed → must re-vend (200).
+        assert!(!matches(&[client_etag(LOC, Some(NOW))], true));
+        assert!(!matches(&[client_etag(LOC, Some(NOW - 60_000))], true));
+        // No revalidation point (client cached a metadata-only response) while we
+        // now vend creds → must re-vend so the client gets them.
+        assert!(!matches(&[client_etag(LOC, None)], true));
     }
 
-    #[sqlx::test]
-    async fn test_load_table_snapshots_filter_all(pool: PgPool) {
-        let (ctx, ns_params, table_ident, _) = setup_table_with_snapshots(pool).await;
-
-        let table_params = TableParameters {
-            prefix: ns_params.prefix.clone(),
-            table: table_ident.clone(),
-        };
-
-        // Test with SnapshotsQuery::All - should return all snapshots
-        let filters = LoadTableFilters {
-            snapshots: SnapshotsQuery::All,
-        };
-
-        let result = CatalogServer::load_table(
-            table_params,
-            DataAccess::not_specified(),
-            filters,
-            ctx,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Verify that all snapshots are present (1, 2, and 3)
-        let snapshots: Vec<i64> = result
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
-
-        assert_eq!(snapshots.len(), 3);
-        assert!(snapshots.contains(&1));
-        assert!(snapshots.contains(&2));
-        assert!(snapshots.contains(&3));
-
-        // Verify snapshot details - check manifest lists and that timestamps are reasonable
-        let snapshot1 = result.metadata.snapshot_by_id(1).unwrap();
-        assert!(snapshot1.timestamp_ms() > 0);
-        assert_eq!(snapshot1.manifest_list(), "/path/to/manifest1.avro");
-
-        let snapshot2 = result.metadata.snapshot_by_id(2).unwrap();
-        assert!(snapshot2.timestamp_ms() > snapshot1.timestamp_ms());
-        assert_eq!(snapshot2.manifest_list(), "/path/to/manifest2.avro");
-
-        let snapshot3 = result.metadata.snapshot_by_id(3).unwrap();
-        assert!(snapshot3.timestamp_ms() > snapshot2.timestamp_ms());
-        assert_eq!(snapshot3.manifest_list(), "/path/to/manifest3.avro");
+    #[test]
+    fn future_revalidate_after_serves_304_even_for_metadata_only_load() {
+        // The decision rides on the echoed ETag, not the current load's flag.
+        assert!(matches(&[client_etag(LOC, Some(NOW + 60_000))], false));
     }
 
-    #[sqlx::test]
-    async fn test_load_table_snapshots_filter_refs(pool: PgPool) {
-        let (ctx, ns_params, table_ident, _) = setup_table_with_snapshots(pool).await;
-
-        let table_params = TableParameters {
-            prefix: ns_params.prefix.clone(),
-            table: table_ident.clone(),
-        };
-
-        // Test with SnapshotsQuery::Refs - should return only snapshots referenced by branches
-        let filters = LoadTableFilters {
-            snapshots: SnapshotsQuery::Refs,
-        };
-
-        let result = CatalogServer::load_table(
-            table_params,
-            DataAccess::not_specified(),
-            filters,
-            ctx,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Verify that only referenced snapshots are present (2 and 3)
-        // Snapshot 1 should be filtered out as it's not referenced by any branch
-        let snapshots: Vec<i64> = result
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
-
-        assert_eq!(snapshots.len(), 2);
-        assert!(!snapshots.contains(&1)); // Snapshot 1 should be filtered out
-        assert!(snapshots.contains(&2)); // Referenced by "main" branch
-        assert!(snapshots.contains(&3)); // Referenced by "test_branch"
-
-        // Verify snapshot details for referenced snapshots
-        let snapshot2 = result.metadata.snapshot_by_id(2).unwrap();
-        assert!(snapshot2.timestamp_ms() > 0);
-        assert_eq!(snapshot2.manifest_list(), "/path/to/manifest2.avro");
-
-        let snapshot3 = result.metadata.snapshot_by_id(3).unwrap();
-        assert!(snapshot3.timestamp_ms() > snapshot2.timestamp_ms());
-        assert_eq!(snapshot3.manifest_list(), "/path/to/manifest3.avro");
-
-        // Verify that snapshot 1 is not present
-        assert!(result.metadata.snapshot_by_id(1).is_none());
+    #[test]
+    fn credential_load_rejects_unparseable_and_wildcard() {
+        // Unparseable ETag and wildcard carry no revalidation point → reload.
+        let legacy = ETag::from(TableETag::new(wh(), LOC, all(), None).hash());
+        assert!(!matches(&[legacy], true));
+        assert!(!matches(&[ETag::from("*")], true));
     }
 
-    #[sqlx::test]
-    async fn test_load_table_snapshots_filter_default_behavior(pool: PgPool) {
-        let (ctx, ns_params, table_ident, _) = setup_table_with_snapshots(pool).await;
+    #[test]
+    fn no_304_across_snapshot_representations() {
+        // A client caches `snapshots=refs` (a truncated snapshot list), then
+        // revalidates asking for `snapshots=all`. When both sides hashed only the
+        // metadata location this matched, and the client kept using the truncated
+        // body as if it were complete.
+        let cached_refs = client_etag_for(LOC, refs(), None);
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_refs), all(), false),
+            "304'd an `all` request from a `refs` ETag: client would reuse a truncated snapshot list"
+        );
 
-        let table_params = TableParameters {
-            prefix: ns_params.prefix.clone(),
-            table: table_ident.clone(),
-        };
+        // And the reverse: a full body cached, then a `refs` request.
+        let cached_all = client_etag_for(LOC, all(), None);
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_all), refs(), false),
+            "304'd a `refs` request from an `all` ETag"
+        );
 
-        // Test with default LoadTableFilters (should use SnapshotsQuery::All by default)
-        let filters = LoadTableFilters::default();
-
-        let result = CatalogServer::load_table(
-            table_params,
-            DataAccess::not_specified(),
-            filters,
-            ctx,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Verify that all snapshots are present by default
-        let snapshots: Vec<i64> = result
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
-
-        assert_eq!(snapshots.len(), 3);
-        assert!(snapshots.contains(&1));
-        assert!(snapshots.contains(&2));
-        assert!(snapshots.contains(&3));
+        // Each still 304s against its own representation — the fix must not
+        // disable conditional requests, only stop them crossing representations.
+        assert!(matches_repr(&[cached_refs], refs(), false));
+        assert!(matches_repr(&[cached_all], all(), false));
     }
 
-    #[sqlx::test]
-    async fn test_load_table_snapshots_filter_with_no_refs(pool: PgPool) {
-        let prof = crate::server::test::memory_io_profile();
-        let (ctx, warehouse) = setup(
-            pool,
-            prof,
-            None,
-            AllowAllAuthorizer::default(),
-            TabularDeleteProfile::Hard {},
-            None,
-        )
-        .await;
+    #[test]
+    fn no_304_across_delegation_modes() {
+        // Storage config depends on the delegation the client asked for, so a
+        // tag minted under one mode must not satisfy a request under another.
+        // These cases cover the revalidate-less branch, reachable when the load
+        // vends no expiring credentials — client-managed access, or the in-memory
+        // test profile. See `credential_load_rejects_cross_delegation_304` for
+        // the branch that real S3/GCS/ADLS traffic takes.
+        let signing = shape_of(
+            SnapshotsQuery::All,
+            delegated(false, true),
+            StoragePermissions::ReadWriteDelete,
+        );
+        let client_managed = shape_of(
+            SnapshotsQuery::All,
+            DataAccessMode::ClientManaged,
+            StoragePermissions::ReadWriteDelete,
+        );
 
-        // Create namespace
-        let ns_name = NamespaceIdent::new("test_namespace_no_refs".to_string());
-        let ns_params = NamespaceParameters {
-            namespace: ns_name.clone(),
-            prefix: Some(warehouse.warehouse_id.to_string().into()),
-        };
+        let cached_signing = client_etag_for(LOC, signing, None);
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_signing), all(), false),
+            "304'd an unspecified-delegation request from a remote-signing ETag"
+        );
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_signing), client_managed, false),
+            "304'd a client-managed request from a remote-signing ETag"
+        );
+        // Still 304s its own shape.
+        assert!(matches_repr(&[cached_signing], signing, false));
 
-        let _ = CatalogServer::create_namespace(
-            ns_params.prefix.clone(),
-            crate::api::iceberg::v1::CreateNamespaceRequest {
-                namespace: ns_name.clone(),
-                properties: None,
-            },
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Create table
-        let table_ident = TableIdent::new(ns_name, "test_table_no_refs".to_string());
-        let _table = CatalogServer::create_table(
-            ns_params.clone(),
-            create_table_request("test_table_no_refs"),
-            DataAccess::not_specified(),
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        let table_params = TableParameters {
-            prefix: Some(warehouse.warehouse_id.to_string().into()),
-            table: table_ident.clone(),
-        };
-
-        // Add a snapshot but don't create any references
-        let base_time = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-
-        let snapshot1 = Snapshot::builder()
-            .with_snapshot_id(1)
-            .with_timestamp_ms(base_time + 1000)
-            .with_sequence_number(1)
-            .with_manifest_list("/path/to/manifest1.avro")
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_schema_id(0)
-            .build();
-
-        let commit_request = iceberg_ext::catalog::rest::CommitTableRequest {
-            identifier: Some(table_ident.clone()),
-            requirements: vec![],
-            updates: vec![TableUpdate::AddSnapshot {
-                snapshot: snapshot1,
-            }],
-        };
-
-        CatalogServer::commit_table(
-            table_params.clone(),
-            commit_request,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Test with SnapshotsQuery::Refs - should return no snapshots since there are no refs
-        let filters = LoadTableFilters {
-            snapshots: SnapshotsQuery::Refs,
-        };
-
-        let result = CatalogServer::load_table(
-            table_params.clone(),
-            DataAccess::not_specified(),
-            filters,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Verify that no snapshots are returned when using Refs filter with no references
-        let snapshots: Vec<i64> = result
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
-
-        assert_eq!(snapshots.len(), 0);
-
-        // Test with SnapshotsQuery::All - should return all snapshots
-        let filters_all = LoadTableFilters {
-            snapshots: SnapshotsQuery::All,
-        };
-
-        let result_all = CatalogServer::load_table(
-            table_params,
-            DataAccess::not_specified(),
-            filters_all,
-            ctx,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
-
-        // Verify that all snapshots are returned with All filter
-        let snapshots_all: Vec<i64> = result_all
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
-
-        assert_eq!(snapshots_all.len(), 1);
-        assert!(snapshots_all.contains(&1));
+        // And the reverse direction: a plain cached body must not satisfy a
+        // request that asks for signing.
+        let cached_default = client_etag_for(LOC, all(), None);
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_default), signing, false),
+            "304'd a remote-signing request from an unspecified-delegation ETag: \
+             the client would get no signer config"
+        );
     }
 
-    #[sqlx::test]
-    async fn test_load_table_snapshots_filter_behavior_difference(pool: PgPool) {
-        let (ctx, ns_params, table_ident, _) = setup_table_with_snapshots(pool).await;
+    #[test]
+    fn credential_load_rejects_cross_delegation_304() {
+        // The branch real traffic takes. On S3/GCS/ADLS `vends_expiring_credentials`
+        // is true for *any* server-delegated request — it never inspects
+        // `remote_signing` — so a delegated load always carries a revalidation
+        // point and the `vends_credentials` gate cannot distinguish modes. Inside
+        // that window only the shape stops the 304.
+        let vended = shape_of(
+            SnapshotsQuery::All,
+            delegated(true, false),
+            StoragePermissions::ReadWriteDelete,
+        );
+        let signing = shape_of(
+            SnapshotsQuery::All,
+            delegated(false, true),
+            StoragePermissions::ReadWriteDelete,
+        );
+        // Cached a credential-bearing response, still well inside its window.
+        let cached = client_etag_for(LOC, vended, Some(NOW + 60_000));
 
-        let table_params = TableParameters {
-            prefix: ns_params.prefix.clone(),
-            table: table_ident.clone(),
-        };
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached), signing, true),
+            "304'd a remote-signing request from a vended-credentials ETag while \
+             the credential window was still open"
+        );
+        // Its own shape still 304s inside the window — the gate is unchanged.
+        assert!(matches_repr(&[cached], vended, true));
+    }
 
-        // Test both filter types on the same table to verify behavior difference
-        let filters_all = LoadTableFilters {
-            snapshots: SnapshotsQuery::All,
-        };
+    /// Pins the mapping against the variant literal rather than through
+    /// [`storage_access_for`]. Routing the expectation through the same function
+    /// makes the test move with the code: reverting the `None` arm to
+    /// [`StorageAccess::NoConfig`] would leave both sides agreeing and the
+    /// regression invisible.
+    /// An in-process caller holds the tag exactly as the server minted it — weak
+    /// marker and quotes included — because nothing stripped them on the way back.
+    /// That is the enterprise `refresh()` path, whose conditional load never once
+    /// succeeded while the comparison used the raw value.
+    #[test]
+    fn a_wire_form_etag_still_matches() {
+        let minted = TableETag::new(wh(), LOC, all(), None).into_etag();
+        assert!(
+            minted.as_str().starts_with("W/\""),
+            "premise: the mint is wire form, {:?}",
+            minted.as_str()
+        );
 
-        let filters_refs = LoadTableFilters {
-            snapshots: SnapshotsQuery::Refs,
-        };
+        assert!(
+            matches_repr(std::slice::from_ref(&minted), all(), false),
+            "a tag fed straight back in process must match: {:?}",
+            minted.as_str()
+        );
+        // And the header-parsed spelling of the same tag still matches, so the two
+        // routes agree rather than one being traded for the other.
+        assert!(matches_repr(&[as_client_etag(&minted)], all(), false));
+    }
 
-        let result_all = CatalogServer::load_table(
-            table_params.clone(),
-            DataAccess::not_specified(),
-            filters_all,
-            ctx.clone(),
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn no_storage_access_maps_to_the_catalog_defaults_shape() {
+        let mapped = storage_access_for(None, DataAccessMode::ClientManaged, wv());
+        assert_eq!(
+            mapped,
+            StorageAccess::CatalogDefaultsOnly {
+                warehouse_version: wv()
+            }
+        );
+        // The consequence that matters: a commit's tag must not answer this load.
+        assert_ne!(
+            TableResponseShape::new(SnapshotsQuery::All, mapped),
+            TableResponseShape::commit_response(),
+            "a load with no storage access still carries a config; a commit does not"
+        );
+    }
 
-        let result_refs = CatalogServer::load_table(
-            table_params,
-            DataAccess::not_specified(),
-            filters_refs,
-            ctx,
-            random_request_metadata(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn no_storage_access_is_its_own_shape() {
+        // A load the caller has no storage access for returns a `config` holding
+        // only the catalog-wide keys, and no credentials.
+        // That body must not satisfy a later load made after access is granted.
+        let catalog_defaults_only = TableResponseShape::new(
+            SnapshotsQuery::All,
+            storage_access_for(None, DataAccessMode::ClientManaged, wv()),
+        );
+        let cached = client_etag_for(LOC, catalog_defaults_only, None);
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached), all(), false),
+            "304'd a credential-bearing load from a tag minted without storage access"
+        );
+        assert!(matches_repr(&[cached], catalog_defaults_only, false));
+    }
 
-        let snapshots_all: Vec<i64> = result_all
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
+    #[test]
+    fn no_304_across_storage_permission_levels() {
+        // Vended credentials are policy-scoped per level, so a body built for a
+        // read-only caller must not answer a request from one who can now write.
+        // `create_table`/`register_table` always scope to ReadWriteDelete, so
+        // without this a read-only caller's load could match a create tag.
+        let read = shape_of(
+            SnapshotsQuery::All,
+            delegated(false, false),
+            StoragePermissions::Read,
+        );
+        let cached_read = client_etag_for(LOC, read, Some(NOW + 60_000));
+        assert!(
+            !matches_repr(std::slice::from_ref(&cached_read), all(), true),
+            "304'd a read-write-delete load from a read-scoped ETag: the client \
+             would keep credentials that cannot write"
+        );
+        assert!(matches_repr(&[cached_read], read, true));
+    }
 
-        let snapshots_refs: Vec<i64> = result_refs
-            .metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .collect();
+    #[test]
+    fn commit_etag_does_not_satisfy_a_delegated_load() {
+        // A commit response carries `config: None`, which no load reproduces, so
+        // its tag must not 304 a load that expects storage config.
+        let commit = as_client_etag(&super::super::etag::commit_etag(wh(), LOC));
+        assert!(!matches(std::slice::from_ref(&commit), false));
+        assert!(!matches_repr(&[commit], refs(), false));
+    }
 
-        // Verify the behavior difference
-        assert_eq!(snapshots_all.len(), 3); // All snapshots
-        assert_eq!(snapshots_refs.len(), 2); // Only referenced snapshots
+    #[test]
+    fn wildcard_echoes_the_requested_representation() {
+        // `If-None-Match: *` carries no representation, so the tag we echo must be
+        // the one for the body this request would have produced. Echoing the
+        // default here would hand the client an `all` tag for a `refs` body.
+        let echoed = match_not_modified(&[ETag::from("*")], wh(), Some(LOC), refs(), NOW, false)
+            .expect("wildcard should 304 when no credentials are vended");
+        // Compare against the quoted wire form — `client_etag_for` yields the
+        // unquoted shape a client echoes back, which is not what we emit.
+        assert_eq!(echoed, TableETag::new(wh(), LOC, refs(), None).into_etag());
+        assert_ne!(
+            echoed,
+            TableETag::new(wh(), LOC, all(), None).into_etag(),
+            "wildcard echoed the default representation instead of the requested one"
+        );
+        // That echoed tag must then be accepted for `refs` and rejected for `all`.
+        let echoed_bare = as_client_etag(&echoed);
+        assert!(matches_repr(
+            std::slice::from_ref(&echoed_bare),
+            refs(),
+            false
+        ));
+        assert!(!matches_repr(&[echoed_bare], all(), false));
+    }
 
-        // Verify specific differences
-        assert!(snapshots_all.contains(&1)); // Unreferenced snapshot present in All
-        assert!(!snapshots_refs.contains(&1)); // Unreferenced snapshot filtered out in Refs
+    /// The defect the warehouse-id axis exists for, asserted at the decision
+    /// level rather than only on the hash. Every other helper here shares one
+    /// warehouse — correctly, so that a differing id cannot mask a shape bug —
+    /// which is exactly why this case needs its own test.
+    ///
+    /// `vends_credentials` is true with an open revalidation window on purpose:
+    /// that neuters the credential gate, so only the warehouse axis can refuse.
+    #[test]
+    fn no_304_across_warehouses_at_the_same_location() {
+        let other = WarehouseId::new(uuid::uuid!("f1000000-0000-7000-8000-00000000000f"));
+        let cached_a =
+            as_client_etag(&TableETag::new(wh(), LOC, all(), Some(NOW + 60_000)).into_etag());
 
-        // Both should contain referenced snapshots
-        assert!(snapshots_all.contains(&2) && snapshots_refs.contains(&2));
-        assert!(snapshots_all.contains(&3) && snapshots_refs.contains(&3));
+        assert!(
+            match_not_modified(
+                std::slice::from_ref(&cached_a),
+                other,
+                Some(LOC),
+                all(),
+                NOW,
+                true
+            )
+            .is_none(),
+            "304'd warehouse B's load from warehouse A's ETag"
+        );
+        // Same tag, its own warehouse: still a 304, so the refusal above is the
+        // warehouse axis and not the window.
+        assert!(
+            match_not_modified(&[cached_a], wh(), Some(LOC), all(), NOW, true).is_some(),
+            "the tag must still match its own warehouse"
+        );
+    }
 
-        // Verify that the difference is exactly the unreferenced snapshot
-        let diff: Vec<i64> = snapshots_all
-            .iter()
-            .filter(|id| !snapshots_refs.contains(id))
-            .copied()
-            .collect();
-
-        assert_eq!(diff, vec![1]); // Only snapshot 1 should be filtered out
+    #[test]
+    fn credential_load_picks_valid_etag_among_several() {
+        let etags = vec![
+            client_etag("s3://other/metadata.json", Some(NOW + 60_000)),
+            client_etag(LOC, Some(NOW - 1)),      // passed
+            client_etag(LOC, Some(NOW + 60_000)), // valid
+        ];
+        assert!(matches(&etags, true));
     }
 }

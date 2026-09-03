@@ -3,37 +3,50 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 use futures::FutureExt;
 use http::StatusCode;
 use iceberg::NamespaceIdent;
-use iceberg_ext::configs::{namespace::NamespaceProperties, ConfigProperty as _};
+use iceberg_ext::configs::{ConfigProperty as _, namespace::NamespaceProperties};
 use itertools::Itertools;
 use lakekeeper_io::Location;
 
-use super::{require_warehouse_id, CatalogServer, UnfilteredPage};
+mod create;
+mod list;
+
+use super::{CatalogServer, UnfilteredPage, require_warehouse_id};
 use crate::{
+    CONFIG,
     api::{
+        endpoints::EndpointFlat,
         iceberg::v1::{
-            namespace::{GetNamespacePropertiesQuery, NamespaceDropFlags},
             ApiContext, CreateNamespaceRequest, CreateNamespaceResponse, ErrorModel,
             GetNamespaceResponse, ListNamespacesQuery, ListNamespacesResponse, NamespaceParameters,
             Prefix, Result, UpdateNamespacePropertiesRequest, UpdateNamespacePropertiesResponse,
+            namespace::{GetNamespacePropertiesQuery, NamespaceDropFlags},
         },
         management::v1::warehouse::TabularDeleteProfile,
     },
     request_metadata::RequestMetadata,
     server,
     service::{
+        CachePolicy, CatalogIdempotencyOps, CatalogNamespaceOps, CatalogStore, CatalogTaskOps,
+        NamedEntity, NamespaceHierarchy, NamespaceId, ResolvedWarehouse, State, TabularId,
+        Transaction,
         authz::{
-            AuthZCannotListNamespaces, AuthZCannotUseWarehouseId, Authorizer, AuthzNamespaceOps,
-            AuthzWarehouseOps, CatalogNamespaceAction, CatalogWarehouseAction, NamespaceParent,
+            Authorizer, AuthzNamespaceOps, CatalogNamespaceAction, CatalogWarehouseAction,
+            GrantResource, NamespaceParent, emit_bootstrap_grants_async, write_bootstrap_grants,
         },
+        events::{
+            APIEventContext, EventDispatcher, NamespaceOrWarehouseAPIContext,
+            context::{
+                ResolvedNamespace, Unresolved, UserProvidedNamespace, authz_to_error_no_audit,
+            },
+        },
+        idempotency::{IdempotencyInfo, IdempotencyKey},
         secrets::SecretStore,
+        storage::storage_layout::{NamespaceNameContext, NamespacePath},
         tasks::{
+            CancelTasksFilter, ScheduleTaskMetadata, TaskEntity, WarehouseTaskEntityId,
             tabular_purge_queue::{TabularPurgePayload, TabularPurgeTask},
-            EntityId, TaskFilter, TaskMetadata,
         },
-        CachePolicy, CatalogNamespaceOps, CatalogStore, CatalogTaskOps, CatalogWarehouseOps,
-        NamedEntity, NamespaceId, ResolvedWarehouse, State, TabularId, Transaction,
     },
-    CONFIG,
 };
 
 pub const UNSUPPORTED_NAMESPACE_PROPERTIES: &[&str] = &[];
@@ -70,56 +83,26 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         // ------------------- AUTHZ -------------------
         let authorizer = state.v1_state.authz;
 
-        let warehouse =
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()).await;
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
+        let event_ctx = create_namespace_or_warehouse_event_context(
+            parent.clone(),
+            request_metadata,
+            state.v1_state.events,
+            warehouse_id,
+            CatalogNamespaceAction::ListNamespaces,
+            CatalogWarehouseAction::ListNamespaces,
+        );
 
-        let [can_use_warehouse, can_list_namespaces, can_list_everything] = authorizer
-            .are_allowed_warehouse_actions_arr(
-                &request_metadata,
-                &[
-                    (&warehouse, CatalogWarehouseAction::CanUse),
-                    (&warehouse, CatalogWarehouseAction::CanListNamespaces),
-                    (&warehouse, CatalogWarehouseAction::CanListEverything),
-                ],
-            )
-            .await?
-            .into_inner();
+        let authz_result = list::authorize_namespace_list::<C, A>(
+            authorizer.clone(),
+            event_ctx.request_metadata(),
+            warehouse_id,
+            parent.as_ref(),
+            state.v1_state.catalog.clone(),
+        )
+        .await;
 
-        if !can_use_warehouse {
-            return Err(AuthZCannotUseWarehouseId::new(warehouse_id).into());
-        }
-        if !can_list_namespaces {
-            return Err(AuthZCannotListNamespaces::new(warehouse_id).into());
-        }
-
-        let mut can_list_everything = can_list_everything;
-        if let Some(parent_ident) = parent {
-            let parent_namespace =
-                C::get_namespace(warehouse_id, parent_ident, state.v1_state.catalog.clone()).await;
-
-            let parent_namespace = authorizer
-                .require_namespace_action(
-                    &request_metadata,
-                    &warehouse,
-                    parent_ident,
-                    parent_namespace,
-                    CatalogNamespaceAction::CanListNamespaces,
-                )
-                .await?;
-            // Rely on short-circuit of `||` to query `namespace:can_list_everything` only if not
-            // `warehouse:can_list_everything`.
-            can_list_everything = can_list_everything
-                || authorizer
-                    .is_allowed_namespace_action(
-                        &request_metadata,
-                        &warehouse,
-                        &parent_namespace,
-                        CatalogNamespaceAction::CanListEverything,
-                    )
-                    .await?
-                    .into_inner();
-        }
+        let (event_ctx, (can_list_everything, warehouse, _parent_namespace)) =
+            event_ctx.emit_authz(authz_result)?;
 
         // ------------------- BUSINESS LOGIC -------------------
         let mut t = C::Transaction::begin_read(state.v1_state.catalog).await?;
@@ -129,9 +112,10 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             |ps, page_token, trx| {
                 let parent = parent.clone();
                 let authorizer = authorizer.clone();
-                let request_metadata = request_metadata.clone();
                 let warehouse = warehouse.clone();
+                let request_metadata = event_ctx.request_metadata().clone();
                 async move {
+                    let request_metadata = &request_metadata;
                     let query = ListNamespacesQuery {
                         page_size: Some(ps),
                         page_token: page_token.into(),
@@ -145,8 +129,11 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
                     // return the correct next page token which is why we do these unholy things here.
                     let list_namespaces =
                         C::list_namespaces(warehouse_id, &query, trx.transaction()).await?;
-                    let (ids, responses, tokens): (Vec<_>, Vec<_>, Vec<_>) =
-                        list_namespaces.into_iter_with_page_tokens().multiunzip();
+                    let parent_namespaces = list_namespaces.parent_namespaces;
+                    let (ids, responses, tokens): (Vec<_>, Vec<_>, Vec<_>) = list_namespaces
+                        .namespaces
+                        .into_iter_with_page_tokens()
+                        .multiunzip();
 
                     let masks = if can_list_everything {
                         // No need to check individual permissions if everything in namespace can
@@ -155,15 +142,18 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
                     } else {
                         authorizer
                             .are_allowed_namespace_actions_vec(
-                                &request_metadata,
+                                request_metadata,
+                                None,
                                 &warehouse,
+                                &parent_namespaces,
                                 &responses
                                     .iter()
-                                    .map(|id| (id, CatalogNamespaceAction::CanGetMetadata))
+                                    .map(|id| (id, CatalogNamespaceAction::IncludeInList))
                                     .collect::<Vec<_>>(),
                             )
-                            .await?
-                            .into_inner()
+                            .await
+                            .map_err(authz_to_error_no_audit)?
+                            .into_allowed()
                     };
 
                     let (next_namespaces, next_ids, next_page_tokens, mask): (
@@ -173,8 +163,8 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
                         Vec<bool>,
                     ) = masks
                         .into_iter()
-                        .zip(responses.into_iter())
-                        .zip(tokens.into_iter())
+                        .zip(responses)
+                        .zip(tokens)
                         .map(|((allowed, namespace), token)| {
                             let namespace_id = namespace.namespace_id();
                             (namespace, namespace_id, token, allowed)
@@ -199,6 +189,8 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             .into_iter()
             .map(|n| (n.namespace_ident().clone(), n.is_protected()))
             .unzip();
+        let namespaces = Arc::new(namespaces);
+
         Ok(ListNamespacesResponse {
             next_page_token,
             namespaces,
@@ -207,6 +199,7 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn create_namespace(
         prefix: Option<Prefix>,
         request: CreateNamespaceRequest,
@@ -219,11 +212,7 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             namespace,
             properties,
         } = &request;
-
-        tracing::debug!("Creating namespace: {:?}", namespace);
-
-        validate_namespace_ident(namespace)?;
-
+        validate_namespace_ident_creation(namespace)?;
         properties
             .as_ref()
             .map(|p| validate_namespace_properties_keys(p.keys()))
@@ -242,40 +231,79 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             .into());
         }
 
-        // ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz;
-
-        let warehouse =
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()).await;
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-
-        let (warehouse, parent_namespace) = if let Some(namespace_parent) = namespace.parent() {
-            let parent_namespace = C::get_namespace(
+        // ------------------- IDEMPOTENCY CHECK -------------------
+        let idempotency_key = request_metadata.idempotency_key().copied();
+        if let Some(ref key) = idempotency_key {
+            let check = C::check_idempotency_key(
                 warehouse_id,
-                &namespace_parent,
+                key,
+                EndpointFlat::CatalogV1CreateNamespace,
                 state.v1_state.catalog.clone(),
             )
-            .await;
-            let parent_namespace = authorizer
-                .require_namespace_action(
-                    &request_metadata,
-                    &warehouse,
-                    namespace_parent,
-                    parent_namespace,
-                    CatalogNamespaceAction::CanCreateNamespace,
+            .await?;
+            if check.is_replay() {
+                let ns = Self::load_namespace_metadata(
+                    NamespaceParameters {
+                        prefix,
+                        namespace: namespace.clone(),
+                    },
+                    GetNamespacePropertiesQuery { return_uuid: false },
+                    state,
+                    request_metadata,
                 )
                 .await?;
-            (warehouse, Some(parent_namespace.namespace_id()))
-        } else {
-            let warehouse = authorizer
-                .require_warehouse_action(
-                    &request_metadata,
-                    warehouse_id,
-                    Ok(Some(warehouse)),
-                    CatalogWarehouseAction::CanCreateNamespace,
-                )
-                .await?;
-            (warehouse, None)
+                return Ok(CreateNamespaceResponse {
+                    namespace: ns.namespace,
+                    properties: ns.properties.map(|arc| (*arc).clone()),
+                });
+            }
+        }
+
+        // ------------------- AUTHZ -------------------
+        let authorizer = state.v1_state.authz.clone();
+
+        let properties_btree: Arc<std::collections::BTreeMap<String, String>> =
+            Arc::new(properties.clone().unwrap_or_default().into_iter().collect());
+
+        let namespace_name = namespace.as_ref().last().cloned().unwrap_or_default();
+
+        let event_ctx = create_namespace_or_warehouse_event_context(
+            namespace.parent().clone(),
+            request_metadata,
+            state.v1_state.events,
+            warehouse_id,
+            CatalogNamespaceAction::CreateNamespace {
+                name: Some(namespace_name.clone()),
+                properties: properties_btree.clone(),
+            },
+            CatalogWarehouseAction::CreateNamespace {
+                name: Some(namespace_name),
+                properties: properties_btree.clone(),
+            },
+        );
+
+        let authz_result = create::authorize_namespace_create::<C, _>(
+            &authorizer,
+            event_ctx.request_metadata(),
+            warehouse_id,
+            namespace,
+            state.v1_state.catalog.clone(),
+            properties_btree,
+        )
+        .await;
+
+        let (event_ctx, (warehouse, parent_namespace)) = event_ctx.emit_authz(authz_result)?;
+
+        let event_ctx = match (&parent_namespace, event_ctx) {
+            (Some(parent_namespace), NamespaceOrWarehouseAPIContext::Namespace(ctx)) => NamespaceOrWarehouseAPIContext::Namespace(ctx
+                .resolve(ResolvedNamespace {
+                    warehouse: warehouse.clone(),
+                    namespace: parent_namespace.namespace.clone(),
+                })),
+            (None, NamespaceOrWarehouseAPIContext::Warehouse(ctx)) => {
+                 NamespaceOrWarehouseAPIContext::Warehouse(ctx.resolve(warehouse.clone()))
+            }
+            _ => return Err(ErrorModel::internal("Inconsistent authorization context after namespace creation authorization. Please report this to the developers.".to_string(), "InconsistentAuthZContext", None).into()),
         };
 
         // ------------------- BUSINESS LOGIC -------------------
@@ -283,32 +311,72 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
 
         let mut namespace_props = NamespaceProperties::try_from_maybe_props(properties.clone())
             .map_err(|e| ErrorModel::bad_request(e.to_string(), e.err_type(), None))?;
-        // Set location if not specified - validate location if specified
-        set_namespace_location_property(&mut namespace_props, &warehouse, namespace_id)?;
+        set_namespace_location_property(
+            &mut namespace_props,
+            &warehouse,
+            namespace,
+            namespace_id,
+            parent_namespace.as_ref(),
+        )?;
         remove_managed_namespace_properties(&mut namespace_props);
 
         let mut request = request;
         request.properties = Some(namespace_props.into());
 
         let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
-        let r = C::create_namespace(warehouse_id, namespace_id, request, t.transaction())
-            .await
-            .map(Arc::new)?;
-        let authz_parent = if let Some(parent_id) = parent_namespace {
-            NamespaceParent::Namespace(parent_id)
+        let r = C::create_namespace(warehouse_id, namespace_id, request, t.transaction()).await?;
+        // Insert idempotency key in the same transaction — atomic with the mutation.
+        if let Some(ref key) = idempotency_key
+            && !C::try_insert_idempotency_key(
+                warehouse_id,
+                &IdempotencyInfo::builder()
+                    .key(*key)
+                    .endpoint(EndpointFlat::CatalogV1CreateNamespace)
+                    .http_status(StatusCode::OK)
+                    .build(),
+                t.transaction(),
+            )
+            .await?
+        {
+            // Concurrent request committed the same key — rollback and replay.
+            t.rollback()
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("Rollback failed after idempotency conflict: {e}");
+                })
+                .ok();
+            return Err(ErrorModel::request_in_progress().into());
+        }
+
+        let authz_parent = if let Some(parent_namespace) = &parent_namespace {
+            NamespaceParent::Namespace(parent_namespace.namespace_id())
         } else {
             NamespaceParent::Warehouse(warehouse_id)
         };
         authorizer
-            .create_namespace(&request_metadata, namespace_id, authz_parent)
+            .create_namespace(event_ctx.request_metadata(), namespace_id, authz_parent)
             .await?;
+
+        let bootstrap_grants = write_bootstrap_grants::<C, A>(
+            &authorizer,
+            event_ctx.request_metadata(),
+            &GrantResource::Namespace {
+                warehouse_id,
+                namespace_id,
+            },
+            t.transaction(),
+        )
+        .await?;
+
         t.commit().await?;
 
-        state
-            .v1_state
-            .hooks
-            .create_namespace(warehouse_id, r.clone(), Arc::new(request_metadata))
-            .await;
+        // Held across the create event below, which consumes the context.
+        let grant_dispatcher = event_ctx.dispatcher().clone();
+        let grant_request_metadata = event_ctx.request_metadata().clone();
+
+        event_ctx.emit_namespace_created_async(r.clone());
+
+        emit_bootstrap_grants_async(&grant_dispatcher, grant_request_metadata, bootstrap_grants);
 
         let r_namespace = r.namespace.clone();
         let mut properties = r_namespace.properties.clone().unwrap_or_default();
@@ -332,34 +400,49 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         validate_namespace_ident(&parameters.namespace)?;
 
         // ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz.clone();
-        let (warehouse, namespace) = tokio::join!(
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone(),),
-            C::get_namespace_cache_aware(
-                warehouse_id,
-                &parameters.namespace,
-                CachePolicy::Skip,
-                state.v1_state.catalog
-            ),
+        let authorizer = state.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_namespace(
+            Arc::new(request_metadata),
+            state.v1_state.events,
+            warehouse_id,
+            parameters.namespace.clone(),
+            CatalogNamespaceAction::GetMetadata,
         );
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-        let namespace = authorizer
-            .require_namespace_action(
-                &request_metadata,
-                &warehouse,
-                parameters.namespace,
-                namespace,
-                CatalogNamespaceAction::CanGetMetadata,
+
+        let authz_result = authorizer
+            .load_and_authorize_namespace_action::<C>(
+                event_ctx.request_metadata(),
+                UserProvidedNamespace {
+                    warehouse_id,
+                    namespace: parameters.namespace.into(),
+                },
+                event_ctx.action().clone(),
+                CachePolicy::Skip,
+                state.v1_state.catalog,
             )
-            .await?;
+            .await;
+
+        let (event_ctx, (warehouse, namespace)) = event_ctx.emit_authz(authz_result)?;
+
+        let event_ctx = event_ctx.resolve(ResolvedNamespace {
+            warehouse,
+            namespace: namespace.namespace,
+        });
+        let namespace = &event_ctx.resolved().namespace;
+        let namespace_ident = namespace.namespace_ident().clone();
 
         // ------------------- BUSINESS LOGIC -------------------
         let namespace_id = namespace.namespace_id();
         let mut properties = namespace.properties().cloned().unwrap_or_default();
         properties.insert(NAMESPACE_ID_PROPERTY.to_string(), namespace_id.to_string());
+        let properties = Arc::new(properties);
+
+        event_ctx.emit_namespace_metadata_loaded_async(properties.clone());
+
         Ok(GetNamespaceResponse {
             properties: Some(properties),
-            namespace: namespace.namespace_ident().clone(),
+            namespace: namespace_ident,
             namespace_uuid: return_uuid.then_some(*namespace_id),
         })
     }
@@ -370,29 +453,37 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         state: ApiContext<State<A, C, S>>,
         request_metadata: RequestMetadata,
     ) -> Result<()> {
-        //  ------------------- VALIDATIONS -------------------
         let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
 
-        //  ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz.clone();
-        let (warehouse, namespace) = tokio::join!(
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone(),),
-            C::get_namespace(warehouse_id, &parameters.namespace, state.v1_state.catalog),
+        let event_ctx = APIEventContext::for_namespace(
+            Arc::new(request_metadata),
+            state.v1_state.events,
+            warehouse_id,
+            parameters.namespace.clone(),
+            CatalogNamespaceAction::GetMetadata,
         );
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-        let _namespace = authorizer
-            .require_namespace_action(
-                &request_metadata,
-                &warehouse,
-                parameters.namespace,
-                namespace,
-                CatalogNamespaceAction::CanGetMetadata,
+
+        let authorizer = state.v1_state.authz;
+        let authz_result = authorizer
+            .load_and_authorize_namespace_action::<C>(
+                event_ctx.request_metadata(),
+                UserProvidedNamespace {
+                    warehouse_id,
+                    namespace: parameters.namespace.into(),
+                },
+                event_ctx.action().clone(),
+                CachePolicy::Skip,
+                state.v1_state.catalog,
             )
-            .await?;
+            .await;
+
+        event_ctx.emit_authz(authz_result)?;
+
         Ok(())
     }
 
     /// Drop a namespace from the catalog. Namespace must be empty.
+    #[allow(clippy::too_many_lines)]
     async fn drop_namespace(
         parameters: NamespaceParameters,
         flags: NamespaceDropFlags,
@@ -415,31 +506,63 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             .into());
         }
 
-        //  ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz.clone();
-        let (warehouse, namespace) = tokio::join!(
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone(),),
-            C::get_namespace(
-                warehouse_id,
-                &parameters.namespace,
-                state.v1_state.catalog.clone()
-            ),
+        // ------------------- AUDIT CONTEXT -------------------
+        // Built before the idempotency check so a served replay can be audited.
+        let idempotency_key = request_metadata.idempotency_key().copied();
+        let event_ctx = APIEventContext::for_namespace(
+            Arc::new(request_metadata.clone()),
+            state.v1_state.events,
+            warehouse_id,
+            parameters.namespace.clone(),
+            CatalogNamespaceAction::Delete {
+                force: flags.force,
+                purge: flags.purge,
+                recursive: flags.recursive,
+            },
         );
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-        let namespace = authorizer
-            .require_namespace_action(
-                &request_metadata,
-                &warehouse,
-                parameters.namespace,
-                namespace,
-                CatalogNamespaceAction::CanDelete,
+
+        // ------------------- IDEMPOTENCY CHECK -------------------
+        if let Some(ref key) = idempotency_key {
+            let check = C::check_idempotency_key(
+                warehouse_id,
+                key,
+                EndpointFlat::CatalogV1DropNamespace,
+                state.v1_state.catalog.clone(),
             )
             .await?;
+            if check.is_replay() {
+                event_ctx.emit_idempotent_replay(*key);
+                return Ok(());
+            }
+        }
+
+        //  ------------------- AUTHZ -------------------
+        let authorizer = state.v1_state.authz;
+
+        let authz_result = authorizer
+            .load_and_authorize_namespace_action::<C>(
+                event_ctx.request_metadata(),
+                UserProvidedNamespace {
+                    warehouse_id,
+                    namespace: parameters.namespace.into(),
+                },
+                event_ctx.action().clone(),
+                CachePolicy::Skip,
+                state.v1_state.catalog.clone(),
+            )
+            .await;
+        let (event_ctx, (warehouse, namespace)) = event_ctx.emit_authz(authz_result)?;
+
+        let event_ctx = event_ctx.resolve(ResolvedNamespace {
+            warehouse: warehouse.clone(),
+            namespace: namespace.namespace.clone(),
+        });
 
         //  ------------------- BUSINESS LOGIC -------------------
         let namespace_id = namespace.namespace_id();
         let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
-        let r = if flags.recursive {
+        if flags.recursive {
+            // recursive drop commits its own transaction
             try_recursive_drop::<_, C>(
                 flags,
                 authorizer,
@@ -447,31 +570,47 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
                 t,
                 namespace_id,
                 &request_metadata,
+                idempotency_key.as_ref(),
             )
-            .await
+            .await?;
         } else {
             C::drop_namespace(warehouse_id, namespace_id, flags, t.transaction()).await?;
+            if let Some(ref key) = idempotency_key
+                && !C::try_insert_idempotency_key(
+                    warehouse_id,
+                    &IdempotencyInfo::builder()
+                        .key(*key)
+                        .endpoint(EndpointFlat::CatalogV1DropNamespace)
+                        .http_status(StatusCode::NO_CONTENT)
+                        .build(),
+                    t.transaction(),
+                )
+                .await?
+            {
+                t.rollback()
+                    .await
+                    .inspect_err(|e| {
+                        tracing::warn!("Rollback failed after idempotency conflict: {e}");
+                    })
+                    .ok();
+                return Err(ErrorModel::request_in_progress().into());
+            }
+            t.commit().await?;
             authorizer
                 .delete_namespace(&request_metadata, namespace_id)
-                .await?;
-            t.commit().await?;
-            Ok(())
-        };
-
-        match r {
-            Ok(()) => {
-                state
-                    .v1_state
-                    .hooks
-                    .drop_namespace(warehouse_id, namespace_id, Arc::new(request_metadata))
-                    .await;
-                Ok(())
-            }
-            Err(err) => Err(err),
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("Failed to delete namespace from authorizer: {}", e.error);
+                })
+                .ok();
         }
+
+        event_ctx.emit_namespace_dropped_async();
+        Ok(())
     }
 
     /// Set or remove properties on a namespace
+    #[allow(clippy::too_many_lines)]
     async fn update_namespace_properties(
         parameters: NamespaceParameters,
         request: UpdateNamespacePropertiesRequest,
@@ -495,31 +634,67 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         let mut updates = NamespaceProperties::try_from_maybe_props(updates.clone())
             .map_err(|e| ErrorModel::bad_request(e.to_string(), e.err_type(), None))?;
         remove_managed_namespace_properties(&mut updates);
+
+        // ------------------- IDEMPOTENCY CHECK -------------------
+        let idempotency_key = request_metadata.idempotency_key().copied();
+        if let Some(ref key) = idempotency_key {
+            let check = C::check_idempotency_key(
+                warehouse_id,
+                key,
+                EndpointFlat::CatalogV1UpdateNamespaceProperties,
+                state.v1_state.catalog.clone(),
+            )
+            .await?;
+            if check.is_replay() {
+                let ns = Self::load_namespace_metadata(
+                    parameters,
+                    GetNamespacePropertiesQuery { return_uuid: false },
+                    state,
+                    request_metadata,
+                )
+                .await?;
+                let properties = ns.properties.map(|arc| (*arc).clone());
+                let (_props, response) = update_namespace_properties(properties, updates, removals);
+                return Ok(response);
+            }
+        }
+
         //  ------------------- AUTHZ -------------------
         let authorizer = state.v1_state.authz;
 
-        let (warehouse, namespace) = tokio::join!(
-            C::get_active_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone(),),
-            C::get_namespace_cache_aware(
-                warehouse_id,
-                &parameters.namespace,
+        let action = CatalogNamespaceAction::UpdateProperties {
+            updated_properties: Arc::new(updates.clone().into_iter().collect()),
+            removed_properties: Arc::new(removals.clone().unwrap_or_default()),
+        };
+        let event_ctx = APIEventContext::for_namespace(
+            Arc::new(request_metadata),
+            state.v1_state.events,
+            warehouse_id,
+            parameters.namespace.clone(),
+            action,
+        );
+
+        let authz_result = authorizer
+            .load_and_authorize_namespace_action::<C>(
+                event_ctx.request_metadata(),
+                UserProvidedNamespace {
+                    warehouse_id,
+                    namespace: parameters.namespace.into(),
+                },
+                event_ctx.action().clone(),
                 CachePolicy::Skip,
                 state.v1_state.catalog.clone(),
-            ),
-        );
-        let warehouse = authorizer.require_warehouse_presence(warehouse_id, warehouse)?;
-
-        let namespace = authorizer
-            .require_namespace_action(
-                &request_metadata,
-                &warehouse,
-                parameters.namespace,
-                namespace,
-                CatalogNamespaceAction::CanUpdateProperties,
             )
-            .await?;
+            .await;
+
+        let (event_ctx, (warehouse, namespace)) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(ResolvedNamespace {
+            warehouse,
+            namespace: namespace.namespace,
+        });
 
         //  ------------------- BUSINESS LOGIC -------------------
+        let namespace = &event_ctx.resolved().namespace;
         let namespace_id = namespace.namespace_id();
 
         let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
@@ -531,20 +706,34 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             updated_properties,
             t.transaction(),
         )
-        .await
-        .map(Arc::new)?;
+        .await?;
+
+        // Insert idempotency key in the same transaction.
+        if let Some(ref key) = idempotency_key
+            && !C::try_insert_idempotency_key(
+                warehouse_id,
+                &IdempotencyInfo::builder()
+                    .key(*key)
+                    .endpoint(EndpointFlat::CatalogV1UpdateNamespaceProperties)
+                    .http_status(StatusCode::OK)
+                    .build(),
+                t.transaction(),
+            )
+            .await?
+        {
+            // Concurrent request won — rollback and replay.
+            t.rollback()
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("Rollback failed after idempotency conflict: {e}");
+                })
+                .ok();
+            return Err(ErrorModel::request_in_progress().into());
+        }
+
         t.commit().await?;
 
-        state
-            .v1_state
-            .hooks
-            .update_namespace_properties(
-                warehouse_id,
-                updated_namespace,
-                Arc::new(r.clone()),
-                Arc::new(request_metadata),
-            )
-            .await;
+        event_ctx.emit_namespace_properties_updated_async(updated_namespace, Arc::new(r.clone()));
 
         Ok(r)
     }
@@ -558,6 +747,7 @@ async fn try_recursive_drop<A: Authorizer, C: CatalogStore>(
     mut t: <C as CatalogStore>::Transaction,
     namespace_id: NamespaceId,
     request_metadata: &RequestMetadata,
+    idempotency_key: Option<&IdempotencyKey>,
 ) -> Result<()> {
     if matches!(
         warehouse.tabular_delete_profile,
@@ -573,21 +763,29 @@ async fn try_recursive_drop<A: Authorizer, C: CatalogStore>(
 
         C::cancel_scheduled_tasks(
             None,
-            TaskFilter::TaskIds(drop_info.open_tasks),
+            &[],
+            CancelTasksFilter::TaskIds(drop_info.open_tasks),
             false,
             t.transaction(),
         )
         .await?;
+        let project_id = &warehouse.project_id;
 
         if flags.purge {
             for (tabular_id, tabular_location, tabular_ident) in &drop_info.child_tables {
+                if tabular_id.is_generic_table() {
+                    continue;
+                }
                 TabularPurgeTask::schedule_task::<C>(
-                    TaskMetadata {
-                        warehouse_id: warehouse.warehouse_id,
-                        entity_id: EntityId::from(*tabular_id),
+                    ScheduleTaskMetadata {
+                        project_id: project_id.clone(),
                         parent_task_id: None,
-                        schedule_for: None,
-                        entity_name: tabular_ident.clone().into_name_parts(),
+                        scheduled_for: None,
+                        entity: TaskEntity::EntityInWarehouse {
+                            entity_name: tabular_ident.clone().into_name_parts(),
+                            warehouse_id: warehouse.warehouse_id,
+                            entity_id: WarehouseTaskEntityId::from(*tabular_id),
+                        },
                     },
                     TabularPurgePayload {
                         tabular_location: tabular_location.to_string(),
@@ -597,6 +795,31 @@ async fn try_recursive_drop<A: Authorizer, C: CatalogStore>(
                 .await?;
             }
         }
+        // The recursive drop reaches this point with a single un-committed
+        // transaction, so the key goes in atomically here exactly as it does on the
+        // non-recursive path. Without it a retried recursive drop re-executes and
+        // 404s on the already-gone namespace instead of replaying the 204.
+        if let Some(key) = idempotency_key
+            && !C::try_insert_idempotency_key(
+                warehouse.warehouse_id,
+                &IdempotencyInfo::builder()
+                    .key(*key)
+                    .endpoint(EndpointFlat::CatalogV1DropNamespace)
+                    .http_status(StatusCode::NO_CONTENT)
+                    .build(),
+                t.transaction(),
+            )
+            .await?
+        {
+            t.rollback()
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("Rollback failed after idempotency conflict: {e}");
+                })
+                .ok();
+            return Err(ErrorModel::request_in_progress().into());
+        }
+
         // commit before starting the purge tasks so that we cannot end in the situation where
         // data is deleted but the transaction is not committed, meaning dangling pointers.
         t.commit().await?;
@@ -635,6 +858,18 @@ async fn try_recursive_drop<A: Authorizer, C: CatalogStore>(
                         .inspect_err(|err| {
                             tracing::error!(
                                 "Failed to delete view '{tabular_ident}' with id '{view_id}' from authorizer after recursive namespace drop: {}",
+                                err.error
+                            );
+                        })
+                        .ok();
+                }
+                TabularId::GenericTable(generic_table_id) => {
+                    authorizer
+                        .delete_generic_table(warehouse.warehouse_id, generic_table_id)
+                        .await
+                        .inspect_err(|err| {
+                            tracing::error!(
+                                "Failed to delete generic table '{tabular_ident}' with id '{generic_table_id}' from authorizer after recursive namespace drop: {}",
                                 err.error
                             );
                         })
@@ -707,7 +942,7 @@ where
 pub(crate) fn validate_namespace_ident(namespace: &NamespaceIdent) -> Result<()> {
     if namespace.len() > MAX_NAMESPACE_DEPTH as usize {
         return Err(ErrorModel::bad_request(
-            format!("Namespace exceeds maximum depth of {MAX_NAMESPACE_DEPTH}",),
+            format!("Namespace exceeds maximum depth of {MAX_NAMESPACE_DEPTH}"),
             "NamespaceDepthExceeded".to_string(),
             None,
         )
@@ -737,6 +972,23 @@ pub(crate) fn validate_namespace_ident(namespace: &NamespaceIdent) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn validate_namespace_ident_creation(namespace: &NamespaceIdent) -> Result<()> {
+    validate_namespace_ident(namespace)?;
+
+    // Deny a "+" in in namespace, since some clients (spark, trino) encode space as "+" in URLs and supporting
+    // space is more important. Other clients properly encode space as "%20".
+    if namespace.as_ref().iter().any(|part| part.contains('+')) {
+        return Err(ErrorModel::bad_request(
+            "Namespace cannot contain '+' character.",
+            "InvalidNamespace",
+            None,
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn remove_managed_namespace_properties(namespace_props: &mut NamespaceProperties) {
     namespace_props.remove_untyped(NAMESPACE_ID_PROPERTY);
     namespace_props.remove_untyped(MANAGED_ACCESS_PROPERTY);
@@ -745,7 +997,9 @@ fn remove_managed_namespace_properties(namespace_props: &mut NamespaceProperties
 fn set_namespace_location_property(
     namespace_props: &mut NamespaceProperties,
     warehouse: &ResolvedWarehouse,
+    namespace_ident: &NamespaceIdent,
     namespace_id: NamespaceId,
+    namespace_parents: Option<&NamespaceHierarchy>,
 ) -> Result<()> {
     let mut location = namespace_props.get_location();
 
@@ -760,9 +1014,28 @@ fn set_namespace_location_property(
             .require_allowed_location(&location)?;
         location
     } else {
+        let namespace_name = namespace_ident.last().ok_or_else(|| {
+            ErrorModel::internal("Namespace must have a name", "NamespaceNameMissing", None)
+        })?;
+        let namespace_name_context = NamespaceNameContext {
+            name: namespace_name.clone(),
+            uuid: namespace_id.into(),
+        };
+        let mut namespace_name_contexts = if let Some(parent) = namespace_parents {
+            let mut contexts = vec![NamespaceNameContext::try_from(&parent.namespace)?];
+            for ancestor in &parent.parents {
+                contexts.push(NamespaceNameContext::try_from(ancestor)?);
+            }
+            contexts.reverse();
+            contexts
+        } else {
+            Vec::new()
+        };
+        namespace_name_contexts.push(namespace_name_context);
+        let namespace_path = NamespacePath::new(namespace_name_contexts);
         warehouse
             .storage_profile
-            .default_namespace_location(namespace_id)?
+            .default_namespace_location(&namespace_path)?
     };
 
     namespace_props.insert(&location);
@@ -843,465 +1116,42 @@ fn namespace_location_may_not_change(
     Ok(())
 }
 
+/// Helper function to create event context for either namespace or warehouse actions
+fn create_namespace_or_warehouse_event_context(
+    namespace: Option<NamespaceIdent>,
+    request_metadata: RequestMetadata,
+    events: EventDispatcher,
+    warehouse_id: crate::service::WarehouseId,
+    namespace_action: CatalogNamespaceAction,
+    warehouse_action: CatalogWarehouseAction,
+) -> NamespaceOrWarehouseAPIContext<Unresolved, Unresolved> {
+    match namespace {
+        Some(parent_ident) => APIEventContext::for_namespace(
+            Arc::new(request_metadata),
+            events,
+            warehouse_id,
+            parent_ident,
+            namespace_action,
+        )
+        .into(),
+        None => APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            events,
+            warehouse_id,
+            warehouse_action,
+        )
+        .into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
 
-    use std::{collections::HashSet, hash::RandomState};
-
-    use iceberg::NamespaceIdent;
-    use iceberg_ext::catalog::rest::CreateNamespaceRequest;
-    use sqlx::PgPool;
-
-    use crate::{
-        api::{
-            iceberg::{
-                types::{PageToken, Prefix},
-                v1::{
-                    namespace::{NamespaceDropFlags, NamespaceService},
-                    NamespaceParameters,
-                },
-            },
-            management::v1::{
-                namespace::NamespaceManagementService, warehouse::TabularDeleteProfile,
-                ApiServer as ManagementApiServer,
-            },
-            ApiContext,
-        },
-        implementations::postgres::{
-            namespace::get_namespace_by_name, PostgresBackend, SecretsState,
-        },
-        request_metadata::RequestMetadata,
-        server::{test::impl_pagination_tests, CatalogServer},
-        service::{
-            authz::{tests::HidingAuthorizer, AllowAllAuthorizer},
-            ListNamespacesQuery, NamespaceId, State, UserId,
-        },
-    };
-
-    async fn ns_paginate_test_setup(
-        pool: PgPool,
-        number_of_namespaces: usize,
-        hide_ranges: &[(usize, usize)],
-    ) -> (
-        ApiContext<State<HidingAuthorizer, PostgresBackend, SecretsState>>,
-        Option<Prefix>,
-    ) {
-        let prof = crate::server::test::memory_io_profile();
-
-        let authz = HidingAuthorizer::new();
-        // Prevent hidden namespaces from becoming visible through `can_list_everything`.
-        authz.block_can_list_everything();
-
-        let (ctx, warehouse) = crate::server::test::setup(
-            pool.clone(),
-            prof,
-            None,
-            authz.clone(),
-            TabularDeleteProfile::Hard {},
-            Some(UserId::new_unchecked("oidc", "test-user-id")),
-        )
-        .await;
-
-        for n in 0..number_of_namespaces {
-            let ns = format!("{n}");
-            let ns = CatalogServer::create_namespace(
-                Some(Prefix(warehouse.warehouse_id.to_string())),
-                CreateNamespaceRequest {
-                    namespace: NamespaceIdent::new(ns),
-                    properties: None,
-                },
-                ctx.clone(),
-                RequestMetadata::new_unauthenticated(),
-            )
-            .await
-            .unwrap();
-            for (range_start, range_end) in hide_ranges {
-                if n >= *range_start && n < *range_end {
-                    authz.hide(&format!(
-                        "namespace:{}",
-                        get_namespace_by_name(
-                            warehouse.warehouse_id,
-                            &ns.namespace,
-                            &ctx.v1_state.catalog.read_pool(),
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .namespace_id()
-                    ));
-                }
-            }
-        }
-        (ctx, Some(Prefix(warehouse.warehouse_id.to_string())))
-    }
-
-    impl_pagination_tests!(
-        namespace,
-        ns_paginate_test_setup,
-        CatalogServer,
-        ListNamespacesQuery,
-        namespaces,
-        |ns| ns.inner()[0].clone()
-    );
-
-    #[sqlx::test]
-    async fn cannot_drop_protected_namespace(pool: sqlx::PgPool) {
-        let prof = crate::server::test::memory_io_profile();
-        let (ctx, warehouse) = crate::server::test::setup(
-            pool.clone(),
-            prof,
-            None,
-            AllowAllAuthorizer::default(),
-            TabularDeleteProfile::Hard {},
-            Some(UserId::new_unchecked("oidc", "test-user-id")),
-        )
-        .await;
-        let ns = CatalogServer::create_namespace(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            CreateNamespaceRequest {
-                namespace: NamespaceIdent::new("ns".to_string()),
-                properties: None,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        let ns_id = NamespaceId::from(
-            *CatalogServer::list_namespaces(
-                Some(Prefix(warehouse.warehouse_id.to_string())),
-                ListNamespacesQuery {
-                    page_token: PageToken::NotSpecified,
-                    page_size: Some(1),
-                    parent: None,
-                    return_uuids: true,
-                    return_protection_status: true,
-                },
-                ctx.clone(),
-                RequestMetadata::new_unauthenticated(),
-            )
-            .await
-            .unwrap()
-            .namespace_uuids
-            .unwrap()
-            .first()
-            .unwrap(),
-        );
-        ManagementApiServer::set_namespace_protection(
-            ns_id,
-            warehouse.warehouse_id,
-            true,
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-
-        let e = CatalogServer::drop_namespace(
-            NamespaceParameters {
-                prefix: Some(Prefix(warehouse.warehouse_id.to_string())),
-                namespace: ns.namespace.clone(),
-            },
-            NamespaceDropFlags {
-                recursive: false,
-                force: false,
-                purge: false,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(e.error.code, http::StatusCode::CONFLICT);
-
-        ManagementApiServer::set_namespace_protection(
-            ns_id,
-            warehouse.warehouse_id,
-            false,
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-
-        CatalogServer::drop_namespace(
-            NamespaceParameters {
-                prefix: Some(Prefix(warehouse.warehouse_id.to_string())),
-                namespace: ns.namespace.clone(),
-            },
-            NamespaceDropFlags {
-                recursive: false,
-                force: false,
-                purge: false,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-    }
-
-    #[sqlx::test]
-    async fn test_list_namespaces(pool: PgPool) {
-        let prof = crate::server::test::memory_io_profile();
-
-        let authz = HidingAuthorizer::new();
-
-        let (ctx, warehouse) = crate::server::test::setup(
-            pool.clone(),
-            prof,
-            None,
-            authz.clone(),
-            TabularDeleteProfile::Hard {},
-            Some(UserId::new_unchecked("oidc", "test-user-id")),
-        )
-        .await;
-
-        // Create parent namespace.
-        let parent_ns_name = "parent-ns".to_string();
-        let _ = CatalogServer::create_namespace(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            CreateNamespaceRequest {
-                namespace: NamespaceIdent::new(parent_ns_name.clone()),
-                properties: None,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-
-        // Create child namespaces.
-        for n in 0..10 {
-            let namespace =
-                NamespaceIdent::from_vec(vec![parent_ns_name.clone(), format!("ns-{n}")]).unwrap();
-            let _ = CatalogServer::create_namespace(
-                Some(Prefix(warehouse.warehouse_id.to_string())),
-                CreateNamespaceRequest {
-                    namespace,
-                    properties: None,
-                },
-                ctx.clone(),
-                RequestMetadata::new_unauthenticated(),
-            )
-            .await
-            .unwrap();
-        }
-
-        // By default `HidingAuthorizer` allows everything, meaning the quick check path in
-        // `list_namespaces` will be hit since `can_list_everything: true`.
-        let all = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(11),
-                parent: Some(NamespaceIdent::new(parent_ns_name.clone())),
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(all.namespaces.len(), 10);
-
-        // Block `can_list_everything` to hit alternative code path.
-        ctx.v1_state.authz.block_can_list_everything();
-        let all = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(11),
-                parent: Some(NamespaceIdent::new(parent_ns_name)),
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(all.namespaces.len(), 10);
-    }
-
-    #[sqlx::test]
-    async fn test_ns_pagination(pool: sqlx::PgPool) {
-        let prof = crate::server::test::memory_io_profile();
-
-        let authz = HidingAuthorizer::new();
-        // Prevent hidden namespaces from becoming visible through `can_list_everything`.
-        authz.block_can_list_everything();
-
-        let (ctx, warehouse) = crate::server::test::setup(
-            pool.clone(),
-            prof,
-            None,
-            authz.clone(),
-            TabularDeleteProfile::Hard {},
-            Some(UserId::new_unchecked("oidc", "test-user-id")),
-        )
-        .await;
-        for n in 0..10 {
-            let ns = format!("ns-{n}");
-            let _ = CatalogServer::create_namespace(
-                Some(Prefix(warehouse.warehouse_id.to_string())),
-                CreateNamespaceRequest {
-                    namespace: NamespaceIdent::new(ns),
-                    properties: None,
-                },
-                ctx.clone(),
-                RequestMetadata::new_unauthenticated(),
-            )
-            .await
-            .unwrap();
-        }
-
-        let all = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(11),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(all.namespaces.len(), 10);
-
-        let _ = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(10),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(all.namespaces.len(), 10);
-
-        let first_six = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(6),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(first_six.namespaces.len(), 6);
-        let first_six_items: HashSet<String, RandomState> = first_six
-            .namespaces
-            .into_iter()
-            .map(|ns| ns.to_url_string())
-            .collect();
-        for i in 0..6 {
-            assert!(first_six_items.contains(&format!("ns-{i}")));
-        }
-
-        let next_four = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::Present(first_six.next_page_token.unwrap()),
-                page_size: Some(6),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        let next_four_items: HashSet<String, RandomState> = next_four
-            .namespaces
-            .into_iter()
-            .map(|ns| ns.to_url_string())
-            .collect();
-        for i in 6..10 {
-            assert!(next_four_items.contains(&format!("ns-{i}")));
-        }
-
-        let mut ids = all.namespace_uuids.unwrap();
-        ids.sort();
-        for i in ids.iter().take(6).skip(4) {
-            authz.hide(&format!("namespace:{i}"));
-        }
-
-        let page = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::NotSpecified,
-                page_size: Some(5),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(page.namespaces.len(), 5);
-        assert!(page.next_page_token.is_some());
-
-        let page_items: HashSet<String, RandomState> = page
-            .namespaces
-            .into_iter()
-            .map(|ns| ns.to_url_string())
-            .collect();
-
-        for i in 0..5 {
-            let ns_id = if i > 3 { i + 2 } else { i };
-            assert!(page_items.contains(&format!("ns-{ns_id}")));
-        }
-        let next_page = CatalogServer::list_namespaces(
-            Some(Prefix(warehouse.warehouse_id.to_string())),
-            ListNamespacesQuery {
-                page_token: PageToken::Present(page.next_page_token.unwrap()),
-                page_size: Some(5),
-                parent: None,
-                return_uuids: true,
-                return_protection_status: true,
-            },
-            ctx.clone(),
-            RequestMetadata::new_unauthenticated(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(next_page.namespaces.len(), 3);
-
-        let next_page_items: HashSet<String, RandomState> = next_page
-            .namespaces
-            .into_iter()
-            .map(|ns| ns.to_url_string())
-            .collect();
-
-        for i in 7..10 {
-            assert!(next_page_items.contains(&format!("ns-{i}")));
-        }
-    }
+    use super::*;
 
     #[test]
     fn test_update_ns_properties() {
-        use super::*;
         let previous_properties = HashMap::from_iter(vec![
             ("key1".to_string(), "value1".to_string()),
             ("key2".to_string(), "value2".to_string()),
@@ -1333,7 +1183,6 @@ mod tests {
 
     #[test]
     fn test_update_ns_properties_empty_removal() {
-        use super::*;
         let previous_properties = HashMap::from_iter(vec![]);
         let updates = NamespaceProperties::from_props_unchecked(vec![]);
         let removals = Some(vec![]);
